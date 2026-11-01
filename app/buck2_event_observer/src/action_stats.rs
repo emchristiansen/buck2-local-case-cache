@@ -22,7 +22,8 @@ use crate::last_command_execution_kind::get_last_command_execution_kind;
 /// gives the total number of actions. `local_actions` + `remote_actions`
 /// provides the total number of actually executed actions while
 /// `cached_actions` provides number of actions which we found
-/// in the action cache.  `fallback_actions` provides the number of actions
+/// in the action cache. Local test-result reuse has its own counter and never
+/// increments either execution counter. `fallback_actions` provides the number of actions
 /// that had its command run more than once (hence, using fallback to run).
 ///
 /// These stats only track executions/commands.
@@ -33,6 +34,7 @@ pub struct ActionStats {
     pub cached_actions: u64,
     pub fallback_actions: u64,
     pub remote_dep_file_cached_actions: u64,
+    pub local_test_result_cached_actions: u64,
     pub excess_cache_misses: u64,
 }
 
@@ -48,7 +50,7 @@ impl ActionStats {
         let rate = total_cache_hit_rate(
             self.local_actions,
             self.remote_actions,
-            self.cached_actions,
+            self.cached_actions + self.local_test_result_cached_actions,
             self.remote_dep_file_cached_actions,
         ) * 100f64;
         let rate = if rate == 100.0 || rate == 0.0 {
@@ -61,7 +63,9 @@ impl ActionStats {
     }
 
     pub fn total_cached_actions(&self) -> u64 {
-        self.cached_actions + self.remote_dep_file_cached_actions
+        self.cached_actions
+            + self.remote_dep_file_cached_actions
+            + self.local_test_result_cached_actions
     }
 
     pub fn total_executed_actions(&self) -> u64 {
@@ -73,6 +77,7 @@ impl ActionStats {
             + self.remote_actions
             + self.cached_actions
             + self.remote_dep_file_cached_actions
+            + self.local_test_result_cached_actions
     }
 
     pub fn update(&mut self, action: &buck2_data::ActionExecutionEnd) {
@@ -95,6 +100,9 @@ impl ActionStats {
             }
             LastCommandExecutionKind::RemoteDepFileCached => {
                 self.remote_dep_file_cached_actions += 1;
+            }
+            LastCommandExecutionKind::LocalTestResultCached => {
+                self.local_test_result_cached_actions += 1;
             }
             LastCommandExecutionKind::NoCommand => {}
         }
@@ -120,6 +128,13 @@ impl fmt::Display for ActionStats {
             self.remote_actions,
             self.local_actions
         );
+        if self.local_test_result_cached_actions > 0 {
+            action_stats_message += format!(
+                ". Local test-result reuse: {}",
+                self.local_test_result_cached_actions
+            )
+            .as_str();
+        }
         if self.fallback_actions > 0 {
             action_stats_message += format!(
                 ". Fallback: {}/{}",
@@ -157,6 +172,36 @@ pub fn was_fallback_action(action: &buck2_data::ActionExecutionEnd) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_test_result_reuse_is_counted_separately_from_remote_cache_and_children() {
+        let mut stats = super::ActionStats::default();
+        let action = buck2_data::ActionExecutionEnd {
+            kind: buck2_data::ActionKind::Run as i32,
+            commands: vec![buck2_data::CommandExecution {
+                details: Some(buck2_data::CommandExecutionDetails {
+                    command_kind: Some(buck2_data::CommandExecutionKind {
+                        command: Some(
+                            buck2_data::command_execution_kind::Command::LocalTestResultCache(
+                                buck2_data::LocalTestResultCache::default(),
+                            ),
+                        ),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        stats.update(&action);
+        assert_eq!(stats.local_test_result_cached_actions, 1);
+        assert_eq!(stats.local_actions, 0);
+        assert_eq!(stats.remote_actions, 0);
+        assert_eq!(stats.cached_actions, 0);
+        assert_eq!(stats.remote_dep_file_cached_actions, 0);
+        assert_eq!(stats.total_cached_actions(), 1);
+        assert_eq!(stats.total_executed_actions(), 0);
+    }
+
     use buck2_data::ActionExecutionEnd;
     use buck2_data::ActionKind;
 

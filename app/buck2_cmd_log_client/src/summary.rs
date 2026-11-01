@@ -42,6 +42,7 @@ struct Stats {
     // TODO(yurysamkevich): split by RE platform - mac/windows/linux once available in log
     total_remote_actions: u64,
     total_cached_actions: u64,
+    total_local_test_result_cache_hits: u64,
     total_other_actions: u64,
     total_targets_analysed: u64,
     peak_process_memory_bytes: Option<u64>,
@@ -74,6 +75,9 @@ impl Stats {
                         Ok(ActionExecutionKind::Local) => self.total_local_actions += 1,
                         Ok(ActionExecutionKind::Remote) => self.total_remote_actions += 1,
                         Ok(ActionExecutionKind::ActionCache) => self.total_cached_actions += 1,
+                        Ok(ActionExecutionKind::LocalTestResultCache) => {
+                            self.total_local_test_result_cache_hits += 1;
+                        }
                         _ => self.total_other_actions += 1,
                     }
                 }
@@ -175,6 +179,13 @@ impl Display for Stats {
         writeln!(f, "- Local actions: {}", self.total_local_actions)?;
         writeln!(f, "- Remote actions: {}", self.total_remote_actions)?;
         writeln!(f, "- Cached actions: {}", self.total_cached_actions)?;
+        if self.total_local_test_result_cache_hits > 0 {
+            writeln!(
+                f,
+                "- Local test-result reuse: {}",
+                self.total_local_test_result_cache_hits
+            )?;
+        }
         writeln!(f, "- Other actions: {}", self.total_other_actions)?;
         writeln!(f)?;
 

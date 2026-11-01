@@ -202,6 +202,17 @@ pub(crate) enum OwnedTestInfo {
 }
 
 impl OwnedTestInfo {
+    fn requests_local_case_result_caching(&self) -> bool {
+        match self {
+            Self::External(_) => false,
+            Self::Internal(info) => info
+                .as_ref()
+                .value()
+                .as_ref()
+                .supports_test_execution_caching(),
+        }
+    }
+
     fn supports_test_execution_caching(&self) -> bool {
         match self {
             Self::External(info) => info
@@ -595,6 +606,11 @@ impl<'a> BuckTestOrchestrator<'a> {
         } = key;
         let fs = dice.get_artifact_fs().await?;
         let test_info = Self::get_test_info(dice, &test_target, internal_runner_config).await?;
+        crate::local_result_cache::require_local_case_support(
+            stage.as_ref(),
+            test_info.requests_local_case_result_caching(),
+            disable_test_execution_caching,
+        )?;
         let effective_test_execution_caching =
             test_info.supports_test_execution_caching() && !disable_test_execution_caching;
         let disable_local_network_isolation =

@@ -110,6 +110,10 @@ pub struct InternalRunnerTestInfo<'v> {
     /// Defaults to `True`.
     run_from_project_root: ValueOfUnchecked<'v, bool>,
 
+    /// Permission to request the strict local exact-case result path. It is not
+    /// remote action-cache permission or proof that the case is eligible.
+    supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
+
     /// Default executor to use to run tests. If none is
     /// passed we will default to the execution platform.
     default_executor: Option<ValueTyped<'v, StarlarkCommandExecutorConfig>>,
@@ -215,6 +219,14 @@ impl<'v> InternalRunnerTestInfo<'v> {
             .unwrap()
             .into_option()
             .unwrap_or(true)
+    }
+
+    pub fn supports_test_execution_caching(&self) -> bool {
+        NoneOr::<bool>::unpack_value(self.supports_test_execution_caching.get())
+            .unwrap()
+            .unwrap()
+            .into_option()
+            .unwrap_or(false)
     }
 
     pub fn default_executor(&self) -> Option<&'v StarlarkCommandExecutorConfig> {
@@ -542,6 +554,8 @@ fn validate_internal_runner_test_info<'v>(
     })?;
     NoneOr::<bool>::unpack_value(info.run_from_project_root.get())?
         .internal_error("`run_from_project_root` must be a bool if provided")?;
+    NoneOr::<bool>::unpack_value(info.supports_test_execution_caching.get())?
+        .internal_error("`supports_test_execution_caching` must be a bool if provided")?;
 
     // Both parse_test_listing and parse_test_result are required callables.
     let ptl = info.parse_test_listing.get();
@@ -592,6 +606,7 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(default = NoneType)] local_resources: Value<'v>,
         #[starlark(default = NoneType)] required_local_resources: Value<'v>,
         #[starlark(default = NoneOr::None)] worker: NoneOr<ValueTyped<'v, WorkerInfo<'v>>>,
+        #[starlark(default = NoneType)] supports_test_execution_caching: Value<'v>,
     ) -> starlark::Result<InternalRunnerTestInfo<'v>> {
         let res = InternalRunnerTestInfo {
             test_type: ValueOfUnchecked::new(r#type),
@@ -602,6 +617,7 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             contacts: ValueOfUnchecked::new(contacts),
             use_project_relative_paths: ValueOfUnchecked::new(use_project_relative_paths),
             run_from_project_root: ValueOfUnchecked::new(run_from_project_root),
+            supports_test_execution_caching: ValueOfUnchecked::new(supports_test_execution_caching),
             default_executor: default_executor.into_option(),
             executor_overrides: ValueOfUnchecked::new(executor_overrides),
             local_resources: ValueOfUnchecked::new(local_resources),

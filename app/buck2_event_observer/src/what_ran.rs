@@ -226,6 +226,8 @@ pub enum CommandReproducer {
     CacheQuery(buck2_data::CacheQuery),
     CacheHit(buck2_data::CacheHit),
     LocalDepFileCacheHit,
+    LocalTestResultCacheQuery(buck2_data::LocalTestResultCacheQuery),
+    LocalTestResultCache(buck2_data::LocalTestResultCache),
     ReExecute(buck2_data::ReExecute),
     LocalExecute(buck2_data::LocalExecute),
     WorkerExecute(buck2_data::WorkerExecute),
@@ -246,6 +248,8 @@ impl CommandReproducer {
                 }
             }
             Self::LocalDepFileCacheHit => "dep_file".to_owned(),
+            Self::LocalTestResultCacheQuery(..) => "local_test_result_cache_query".to_owned(),
+            Self::LocalTestResultCache(..) => "local_test_result_cache".to_owned(),
             Self::ReExecute(execute) => executor_with_platform(execute),
             Self::LocalExecute(..) => "local".to_owned(),
             Self::WorkerExecute(..) => "worker".to_owned(),
@@ -262,6 +266,16 @@ impl CommandReproducer {
                 &span.data
         {
             match &executor_stage.stage {
+                Some(buck2_data::executor_stage_start::Stage::LocalTestResultCacheQuery(query))
+                    if options.emit_cache_queries =>
+                {
+                    return Some(CommandReproducer::LocalTestResultCacheQuery(query.clone()));
+                }
+                Some(buck2_data::executor_stage_start::Stage::LocalTestResultCache(reused))
+                    if !options.skip_cache_hits =>
+                {
+                    return Some(CommandReproducer::LocalTestResultCache(reused.clone()));
+                }
                 Some(buck2_data::executor_stage_start::Stage::CacheQuery(cache_hit))
                     if options.emit_cache_queries =>
                 {
@@ -317,6 +331,20 @@ impl fmt::Display for CommandReproducer {
                 write!(formatter, "{}", cache_hit.action_digest)
             }
             CommandReproducer::LocalDepFileCacheHit => Ok(()),
+            CommandReproducer::LocalTestResultCacheQuery(query) => write!(
+                formatter,
+                "action={} key={} current_attempt={}",
+                query.action_digest, query.cache_key, query.current_attempt
+            ),
+            CommandReproducer::LocalTestResultCache(reused) => write!(
+                formatter,
+                "action={} key={} origin_attempt={} entry_manifest={} current_attempt={}",
+                reused.action_digest,
+                reused.cache_key,
+                reused.origin_attempt,
+                reused.entry_manifest,
+                reused.current_attempt
+            ),
             CommandReproducer::ReExecute(re_execute) => {
                 write!(formatter, "{}", re_execute.action_digest)
             }

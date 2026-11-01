@@ -395,6 +395,22 @@ impl WhatRanOutputWriter for OutputFormatWithWriter<'_> {
                         }
                     },
                     CommandReproducer::LocalDepFileCacheHit => JsonReproducer::LocalDepFileCache,
+                    CommandReproducer::LocalTestResultCacheQuery(query) => {
+                        JsonReproducer::LocalTestResultCacheQuery {
+                            digest: &query.action_digest,
+                            cache_key: &query.cache_key,
+                            current_attempt: &query.current_attempt,
+                        }
+                    }
+                    CommandReproducer::LocalTestResultCache(reused) => {
+                        JsonReproducer::LocalTestResultCache {
+                            digest: &reused.action_digest,
+                            cache_key: &reused.cache_key,
+                            origin_attempt: &reused.origin_attempt,
+                            entry_manifest: &reused.entry_manifest,
+                            current_attempt: &reused.current_attempt,
+                        }
+                    }
                     CommandReproducer::ReExecute(re_execute) => {
                         if re_execute.persistent_worker {
                             JsonReproducer::ReWorker {
@@ -543,6 +559,18 @@ mod json_reproducer {
             action_key: Option<&'a str>,
         },
         LocalDepFileCache,
+        LocalTestResultCacheQuery {
+            digest: &'a str,
+            cache_key: &'a str,
+            current_attempt: &'a str,
+        },
+        LocalTestResultCache {
+            digest: &'a str,
+            cache_key: &'a str,
+            origin_attempt: &'a str,
+            entry_manifest: &'a str,
+            current_attempt: &'a str,
+        },
         Re {
             digest: &'a str,
             platform_properties: BuckIndexMap<&'a str, &'a str>,
@@ -589,6 +617,26 @@ impl<'a> From<WhatRanOutputCommandExtra<'a>> for JsonExtra<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_test_result_reproducer_preserves_original_and_current_provenance()
+    -> buck2_error::Result<()> {
+        let command = JsonReproducer::LocalTestResultCache {
+            digest: "action",
+            cache_key: "key",
+            origin_attempt: "original",
+            entry_manifest: "entry-manifest",
+            current_attempt: "current",
+        };
+        let actual = serde_json::to_value(&command)?;
+        assert_eq!(actual["executor"], "LocalTestResultCache");
+        assert_eq!(actual["details"]["digest"], "action");
+        assert_eq!(actual["details"]["cache_key"], "key");
+        assert_eq!(actual["details"]["origin_attempt"], "original");
+        assert_eq!(actual["details"]["entry_manifest"], "entry-manifest");
+        assert_eq!(actual["details"]["current_attempt"], "current");
+        Ok(())
+    }
 
     fn make_base_command() -> JsonCommand<'static> {
         let command = Cow::Owned(vec!["some".to_owned(), "command".to_owned()]);

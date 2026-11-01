@@ -42,6 +42,68 @@ fn freeze_provider(starlark_code: &str) -> buck2_error::Result<OwnedInternalRunn
 mod tests {
     use super::*;
 
+    #[test]
+    fn internal_cache_permission_is_not_inferred_from_rust_type() -> buck2_error::Result<()> {
+        let info = freeze_provider(indoc!(
+            r#"
+        exported_info = InternalRunnerTestInfo(
+            type = "rust",
+            parse_test_listing = lambda stdout: [],
+            parse_test_result = lambda stdout, stderr, exit_code: [],
+            listing_command = ["binary", "--list"],
+        )
+        "#
+        ))?;
+        assert!(
+            !info
+                .as_ref()
+                .value()
+                .as_ref()
+                .supports_test_execution_caching()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn internal_cache_permission_requires_explicit_opt_in() -> buck2_error::Result<()> {
+        let info = freeze_provider(indoc!(
+            r#"
+        exported_info = InternalRunnerTestInfo(
+            type = "rust",
+            parse_test_listing = lambda stdout: [],
+            parse_test_result = lambda stdout, stderr, exit_code: [],
+            listing_command = ["binary", "--list"],
+            supports_test_execution_caching = True,
+        )
+        "#
+        ))?;
+        assert!(
+            info.as_ref()
+                .value()
+                .as_ref()
+                .supports_test_execution_caching()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn internal_cache_permission_rejects_non_boolean_values() {
+        assert!(
+            freeze_provider(indoc!(
+                r#"
+            exported_info = InternalRunnerTestInfo(
+                type = "rust",
+                parse_test_listing = lambda stdout: [],
+                parse_test_result = lambda stdout, stderr, exit_code: [],
+                listing_command = ["binary", "--list"],
+                supports_test_execution_caching = "true",
+            )
+            "#
+            ))
+            .is_err()
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Construction: both callbacks are required alongside `type`
     // ---------------------------------------------------------------------------

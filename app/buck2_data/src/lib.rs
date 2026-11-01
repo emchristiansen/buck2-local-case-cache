@@ -92,6 +92,9 @@ pub fn get_action_digest(commands: &[CommandExecution]) -> Option<String> {
                         command_execution_kind::Command::OmittedLocalCommand(
                             omitted_local_command,
                         ) => Some(omitted_local_command.action_digest.to_owned()),
+                        command_execution_kind::Command::LocalTestResultCache(reused) => {
+                            Some(reused.action_digest.to_owned())
+                        }
                         _ => None,
                     };
                 }

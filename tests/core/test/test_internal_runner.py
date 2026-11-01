@@ -53,3 +53,28 @@ async def test_internal_test_executor_timeout(buck: Buck) -> None:
         ),
         stderr_regex="Timeout: ",
     )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_internal_provider_without_cache_permission(buck: Buck) -> None:
+    await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        ":internal_default_pass",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_internal_cache_request_refuses_before_listing_or_test(buck: Buck) -> None:
+    await expect_failure(
+        buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            ":internal_cache_unsupported",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        ),
+        stderr_regex="Local exact-case result reuse refused",
+    )

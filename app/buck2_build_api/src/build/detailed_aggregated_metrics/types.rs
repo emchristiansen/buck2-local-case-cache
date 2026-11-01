@@ -100,6 +100,7 @@ pub struct AggregatedBuildMetrics {
     pub local_executions: f64,
     pub remote_executions: f64,
     pub remote_cache_hits: f64,
+    pub local_test_result_cache_hits: f64,
 
     pub analysis_retained_memory: f64,
     pub declared_actions: f64,
@@ -117,6 +118,7 @@ impl ToProtoMessage for AggregatedBuildMetrics {
             local_executions: self.local_executions,
             remote_executions: self.remote_executions,
             remote_cache_hits: self.remote_cache_hits,
+            local_test_result_cache_hits: self.local_test_result_cache_hits,
             analysis_retained_memory: self.analysis_retained_memory,
             declared_actions: self.declared_actions,
         }
@@ -212,6 +214,9 @@ impl TopLevelTargetAggregatedData {
             | ActionExecutionKind::LocalActionCache => {
                 // ignore
             }
+            ActionExecutionKind::LocalTestResultCache => {
+                // No child consumed local or remote memory during this reuse.
+            }
         }
     }
 }
@@ -241,7 +246,9 @@ impl ToProtoMessage for TopLevelTargetAggregatedData {
 impl AggregatedBuildMetrics {
     fn aggregate_execution(&mut self, factor: f64, ev: &ActionExecutionMetrics, when: BuiltWhen) {
         // Accumulate metrics computed over the full graph.
-        self.full_graph_execution_time_ms += factor * (ev.execution_time_ms as f64);
+        if ev.execution_kind != ActionExecutionKind::LocalTestResultCache {
+            self.full_graph_execution_time_ms += factor * (ev.execution_time_ms as f64);
+        }
         self.full_graph_output_size_bytes += factor * (ev.output_size_bytes as f64);
 
         if let BuiltWhen::ThisBuild = when {
@@ -260,6 +267,9 @@ impl AggregatedBuildMetrics {
                 buck2_data::ActionExecutionKind::ActionCache
                 | buck2_data::ActionExecutionKind::RemoteDepFileCache => {
                     self.remote_cache_hits += factor;
+                }
+                buck2_data::ActionExecutionKind::LocalTestResultCache => {
+                    self.local_test_result_cache_hits += factor;
                 }
                 buck2_data::ActionExecutionKind::NotSet
                 | buck2_data::ActionExecutionKind::Simple

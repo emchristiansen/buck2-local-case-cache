@@ -941,6 +941,8 @@ message AggregatedBuildMetrics {
 
   double analysis_retained_memory = 8;
   double declared_actions = 10;
+  // Reused local test results, with no new local or remote execution.
+  double local_test_result_cache_hits = 11;
 }
 
 message TopLevelTargetCriticalPath {
@@ -1962,6 +1964,8 @@ enum ActionExecutionKind {
   ACTION_EXECUTION_KIND_LOCAL_ACTION_CACHE = 10;
   // This action was executed remotely via a persistent worker.
   ACTION_EXECUTION_KIND_REMOTE_WORKER = 11;
+  // A semantically confirmed local test result was reused; no child executed.
+  ACTION_EXECUTION_KIND_LOCAL_TEST_RESULT_CACHE = 12;
 }
 
 // A name for a particular action, suitable for offline analytics and user
@@ -2025,7 +2029,24 @@ message CommandExecutionKind {
     WorkerInitCommand worker_init_command = 4;
     // The command, if executed by a local worker.
     WorkerCommand worker_command = 5;
+    // Explicit local test-result reuse; never a RemoteCommand cache event.
+    LocalTestResultCache local_test_result_cache = 6;
   }
+}
+
+message LocalTestResultCacheQuery {
+  string action_digest = 1;
+  string cache_key = 2;
+  string current_attempt = 3;
+}
+
+message LocalTestResultCache {
+  string action_digest = 1;
+  string cache_key = 2;
+  string origin_attempt = 3;
+  // Immutable entry manifest, binding full raw/output and original confirmation.
+  string entry_manifest = 4;
+  string current_attempt = 5;
 }
 
 // Serialization of CommandExecutionMetadata
@@ -2477,6 +2498,8 @@ message ExecutorStageStart {
     CacheQuery cache_query = 22;
     CacheHit cache_hit = 23;
     PrepareAction prepare = 24;
+    LocalTestResultCacheQuery local_test_result_cache_query = 25;
+    LocalTestResultCache local_test_result_cache = 26;
   }
 }
 
@@ -3042,6 +3065,8 @@ message InvocationRecord {
   uint64 run_remote_count = 11;
   // Count of actions that downloaded action cache
   uint64 run_action_cache_count = 12;
+  // Local test-result reuse, distinct from execution and remote action cache.
+  optional uint64 run_local_test_result_cache_count = 761;
   // Count of actions that were skipped. Actions are usually skipped due to a
   // dep-files hit.
   uint64 run_skipped_count = 13;

@@ -19,6 +19,7 @@ pub(crate) mod internal_runner;
 pub(crate) mod local_resource_api;
 pub mod local_resource_registry;
 pub(crate) mod local_resource_setup;
+pub(crate) mod local_result_cache;
 pub mod orchestrator;
 pub(crate) mod remote_storage;
 pub mod session;

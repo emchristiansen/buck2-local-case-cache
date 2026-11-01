@@ -59,6 +59,16 @@ pub enum CommandExecutionKind {
     RemoteDepFileCache {
         details: RemoteCommandExecutionDetails,
     },
+    /// An immutable, semantically confirmed local test result was reused.
+    /// This carries provenance only, not a fabricated executed command.
+    #[display("local_test_result_cache")]
+    LocalTestResultCache {
+        digest: ActionDigest,
+        cache_key: String,
+        origin_attempt: String,
+        entry_manifest: String,
+        current_attempt: String,
+    },
     /// This action would have executed via a local worker but failed during worker initialization.
     #[display("worker_init")]
     LocalWorkerInit {
@@ -88,6 +98,9 @@ impl CommandExecutionKind {
             },
             Self::ActionCache { .. } => buck2_data::ActionExecutionKind::ActionCache,
             Self::RemoteDepFileCache { .. } => buck2_data::ActionExecutionKind::RemoteDepFileCache,
+            Self::LocalTestResultCache { .. } => {
+                buck2_data::ActionExecutionKind::LocalTestResultCache
+            }
         }
     }
 
@@ -180,6 +193,20 @@ impl CommandExecutionKind {
                     materialized_outputs_for_failed_actions: Vec::new(),
                 })
             }
+
+            Self::LocalTestResultCache {
+                digest,
+                cache_key,
+                origin_attempt,
+                entry_manifest,
+                current_attempt,
+            } => Command::LocalTestResultCache(buck2_data::LocalTestResultCache {
+                action_digest: digest.to_string(),
+                cache_key: cache_key.clone(),
+                origin_attempt: origin_attempt.clone(),
+                entry_manifest: entry_manifest.clone(),
+                current_attempt: current_attempt.clone(),
+            }),
 
             Self::LocalWorkerInit { command, env } => {
                 Command::WorkerInitCommand(buck2_data::WorkerInitCommand {

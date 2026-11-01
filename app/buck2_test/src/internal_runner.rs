@@ -49,6 +49,7 @@ pub async fn run_internal_test(
     provider: &OwnedInternalRunnerTestInfo,
     timeout: Duration,
 ) -> buck2_error::Result<()> {
+    crate::local_result_cache::require_internal_provider_support(provider)?;
     let target_handle = spec.target.handle;
     let suite = spec.target.target.clone();
 

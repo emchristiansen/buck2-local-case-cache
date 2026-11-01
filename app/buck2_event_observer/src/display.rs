@@ -910,6 +910,16 @@ impl ActionErrorDisplay<'_> {
                 Some(Command::LocalCommand(local_command)) => {
                     append!("Local command: {}", command_to_string(local_command));
                 }
+                Some(Command::LocalTestResultCache(reused)) => {
+                    append!(
+                        "Local test-result reuse: action={} key={} origin_attempt={} entry_manifest={} current_attempt={}",
+                        reused.action_digest,
+                        reused.cache_key,
+                        reused.origin_attempt,
+                        reused.entry_manifest,
+                        reused.current_attempt
+                    );
+                }
                 Some(Command::WorkerCommand(worker_command)) => {
                     append!(
                         "Local worker command: {}",
@@ -1077,6 +1087,7 @@ fn failure_reason_for_command_execution(
             Some(Command::LocalCommand(..)) | Some(Command::OmittedLocalCommand(..)) => "Local ",
             Some(Command::WorkerInitCommand(..)) => "Local Worker Initialization ",
             Some(Command::WorkerCommand(..)) => "Local Worker ",
+            Some(Command::LocalTestResultCache(..)) => "Local Test-Result Reuse ",
             None => "",
         }
     } else {

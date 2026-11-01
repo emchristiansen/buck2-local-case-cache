@@ -14,3 +14,16 @@ python_test(
     name = "timeout",
     script = "import time; time.sleep(60)",
 )
+
+python_test(
+    name = "internal_default_pass",
+    internal = True,
+    script = "import sys; sys.exit(0)",
+)
+
+python_test(
+    name = "internal_cache_unsupported",
+    internal = True,
+    local_case_cache = True,
+    script = "raise AssertionError('strict test child was launched')",
+)

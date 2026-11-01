@@ -308,6 +308,16 @@ impl CommandExecutionResult {
         )
     }
 
+    /// Local test-result reuse is neither a local child nor a remote cache hit.
+    pub fn was_local_test_result_cache_hit(&self) -> bool {
+        matches!(
+            self.report.status,
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::LocalTestResultCache { .. },
+            }
+        )
+    }
+
     /// Resolves the output path as used by execution, a stable path it can be
     /// accessed at without holding a lock, and the artifact value.
     ///

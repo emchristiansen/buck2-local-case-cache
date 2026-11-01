@@ -133,6 +133,7 @@ pub struct InvocationRecorder {
     dep_file_db_writes_queued: u64,
     run_remote_count: u64,
     run_action_cache_count: u64,
+    run_local_test_result_cache_count: u64,
     run_remote_dep_file_cache_count: u64,
     run_skipped_count: u64,
     run_fallback_count: u64,
@@ -363,6 +364,7 @@ impl InvocationRecorder {
             dep_file_db_writes_queued: 0,
             run_remote_count: 0,
             run_action_cache_count: 0,
+            run_local_test_result_cache_count: 0,
             run_remote_dep_file_cache_count: 0,
             run_skipped_count: 0,
             run_fallback_count: 0,
@@ -1054,6 +1056,7 @@ impl InvocationRecorder {
             run_local_count: self.run_local_count,
             run_remote_count: self.run_remote_count,
             run_action_cache_count: self.run_action_cache_count,
+            run_local_test_result_cache_count: Some(self.run_local_test_result_cache_count),
             run_remote_dep_file_cache_count: self.run_remote_dep_file_cache_count,
             cache_hit_rate: total_cache_hit_rate(
                 self.run_local_count,
@@ -1598,6 +1601,9 @@ impl InvocationRecorder {
                 }
                 LastCommandExecutionKind::Cached => {
                     self.run_action_cache_count += 1;
+                }
+                LastCommandExecutionKind::LocalTestResultCached => {
+                    self.run_local_test_result_cache_count += 1;
                 }
                 LastCommandExecutionKind::RemoteDepFileCached => {
                     self.run_remote_dep_file_cache_count += 1;

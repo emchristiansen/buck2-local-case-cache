@@ -1627,6 +1627,8 @@ async fn test_target<'a, 'e>(
                 return Ok(None);
             }
 
+            crate::local_result_cache::require_internal_provider_support(&internal_provider)?;
+
             let handle = build_configured_target_handle(
                 target.dupe(),
                 driver_state.session,

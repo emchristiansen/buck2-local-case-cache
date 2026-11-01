@@ -89,6 +89,7 @@ pub fn extract_interval(end: &buck2_data::ActionExecutionEnd) -> Option<ActionIn
         // Cache hits and no-command actions do not occupy execution capacity.
         LastCommandExecutionKind::Cached
         | LastCommandExecutionKind::RemoteDepFileCached
+        | LastCommandExecutionKind::LocalTestResultCached
         | LastCommandExecutionKind::NoCommand => return None,
     }
 
@@ -264,6 +265,18 @@ mod tests {
         assert_eq!(r.executed_action_count, 2);
         assert_eq!(r.total_active_duration_us, 0);
         assert!(r.percentiles.iter().all(|&(_, level)| level == 0));
+    }
+
+    #[test]
+    fn local_test_result_reuse_has_no_child_interval() {
+        let mut action = local_action(1, 9);
+        let details = action.commands[0].details.as_mut().unwrap();
+        details.command_kind.as_mut().unwrap().command = Some(
+            buck2_data::command_execution_kind::Command::LocalTestResultCache(
+                buck2_data::LocalTestResultCache::default(),
+            ),
+        );
+        assert_eq!(extract_interval(&action), None);
     }
 
     fn local_action(start_s: i64, exec_s: i64) -> buck2_data::ActionExecutionEnd {
