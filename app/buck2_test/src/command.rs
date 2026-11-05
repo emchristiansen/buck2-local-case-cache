@@ -24,6 +24,7 @@ use buck2_build_api::build::BuildTargetResult;
 use buck2_build_api::build::BuildTargetResultBuilder;
 use buck2_build_api::build::ConfiguredBuildEventVariant;
 use buck2_build_api::build::ProvidersToBuild;
+use buck2_build_api::build::TestArtifacts;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::maybe_stream_build_reports;
@@ -1539,7 +1540,14 @@ async fn build_target_result(
     // 1. It's a test (aka it produces a TestInfo provider) and it is not skipped by label filtering
     // 2. --build-default-info is requested
     // 3. --build-run-info is requested and the target produces a RunInfo
-    if let Some(test_info) = OwnedTestInfo::select(&providers, internal_runner_config)? {
+    // Build the test artifacts of the provider `OwnedTestInfo::select` chooses, which is the one
+    // `test_target` runs and the orchestrator expands.
+    let test_info = OwnedTestInfo::select(&providers, internal_runner_config)?;
+    let tests = match &test_info {
+        Some(test_info) => TestArtifacts::Selected(test_info.kind()),
+        None => TestArtifacts::None,
+    };
+    if let Some(test_info) = test_info {
         let skip_build_based_on_labels = !label_filtering.build_filtered_targets
             && label_filtering.is_excluded(test_info.labels());
         if skip_build_based_on_labels {
@@ -1574,7 +1582,7 @@ async fn build_target_result(
                     default: build_default_info,
                     default_other: build_default_info,
                     run: build_run_info,
-                    tests: true,
+                    tests,
                 },
                 BuildConfiguredLabelOptions {
                     skippable: false,

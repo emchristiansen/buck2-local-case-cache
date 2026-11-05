@@ -1,4 +1,4 @@
-load(":python_test.bzl", "provider_pair_test", "python_test")
+load(":python_test.bzl", "provider_artifact_pair_test", "provider_pair_test", "python_test")
 
 python_test(
     name = "trivial_pass",
@@ -31,4 +31,8 @@ python_test(
 provider_pair_test(
     name = "provider_pair",
     expected = read_config("provider_pair", "expected", ""),
+)
+
+provider_artifact_pair_test(
+    name = "provider_artifact_pair",
 )

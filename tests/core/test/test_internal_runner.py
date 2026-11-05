@@ -10,7 +10,10 @@
 # pyre-strict
 
 
+import re
+
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.api.buck_result import BuckResult
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test, env
 
@@ -98,13 +101,33 @@ async def test_internal_cache_request_with_literal_tool_executes_normally(
     assert "argv[0] `fbpython` is found through the working directory or PATH" in result.stderr
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+_EXACTLY_ONE_PASS = (
+    "Tests finished: Pass 1. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
+    "Infra Failure 0. Build failure 0"
+)
+
+
+def _plain_stderr(result: BuckResult) -> str:
+    return _ANSI_ESCAPE.sub("", result.stderr)
+
+
+def assert_exactly_one_pass(result: BuckResult) -> None:
+    """The run reported exactly one result, a pass: no failure, skip, omission or listing or
+    build failure, and not zero or several results."""
+    stderr = _plain_stderr(result)
+    assert _EXACTLY_ONE_PASS in stderr, stderr
+    assert "NO TESTS RAN" not in stderr, stderr
+
+
 @buck_test()
 @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
 async def test_provider_pair_runner_disabled_runs_external(buck: Buck) -> None:
     # The executor spec and its expansion both come from the External provider: its command
     # runs with its own environment, and the Internal-only `INTERNAL_ONLY` is neither a
     # dangling handle nor set.
-    await buck.test(
+    result = await buck.test(
         "-c",
         "test.use_internal_runner=false",
         "-c",
@@ -112,12 +135,13 @@ async def test_provider_pair_runner_disabled_runs_external(buck: Buck) -> None:
         ":provider_pair",
         test_executor=INTERNAL_TEST_EXECUTOR,
     )
+    assert_exactly_one_pass(result)
 
 
 @buck_test()
 @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
 async def test_provider_pair_unselected_framework_runs_external(buck: Buck) -> None:
-    await buck.test(
+    result = await buck.test(
         "-c",
         "test.use_internal_runner=rust",
         "-c",
@@ -125,6 +149,7 @@ async def test_provider_pair_unselected_framework_runs_external(buck: Buck) -> N
         ":provider_pair",
         test_executor=INTERNAL_TEST_EXECUTOR,
     )
+    assert_exactly_one_pass(result)
 
 
 @buck_test()
@@ -132,7 +157,7 @@ async def test_provider_pair_unselected_framework_runs_external(buck: Buck) -> N
 async def test_provider_pair_runner_enabled_runs_internal(buck: Buck) -> None:
     # The fixture's External command fails when Internal is expected, so passing proves the
     # Internal provider ran.
-    await buck.test(
+    result = await buck.test(
         "-c",
         "test.use_internal_runner=true",
         "-c",
@@ -140,6 +165,108 @@ async def test_provider_pair_runner_enabled_runs_internal(buck: Buck) -> None:
         ":provider_pair",
         test_executor=INTERNAL_TEST_EXECUTOR,
     )
+    assert_exactly_one_pass(result)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_pair_wrong_provider_fails(buck: Buck) -> None:
+    # Control for the fixture: running the other provider than the expected one fails.
+    await expect_failure(
+        buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            "provider_pair.expected=external",
+            ":provider_pair",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        ),
+    )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_pair_labels_come_from_the_selected_provider(buck: Buck) -> None:
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=false",
+        "-c",
+        "provider_pair.expected=external",
+        ":provider_pair",
+        "--include",
+        "external_provider",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert_exactly_one_pass(result)
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        "provider_pair.expected=internal",
+        ":provider_pair",
+        "--include",
+        "internal_provider",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert_exactly_one_pass(result)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_exactly_one_pass_rejects_a_run_without_results(buck: Buck) -> None:
+    # With the runner disabled the External provider's labels apply, so including only the
+    # Internal provider's label runs nothing; the assertion must reject that run.
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=false",
+        "-c",
+        "provider_pair.expected=external",
+        ":provider_pair",
+        "--include",
+        "internal_provider",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert "NO TESTS RAN" in _plain_stderr(result)
+    try:
+        assert_exactly_one_pass(result)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a run without results was accepted as exactly one pass")
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_artifact_pair_runner_disabled_builds_only_external_inputs(
+    buck: Buck,
+) -> None:
+    # The Internal provider's input action always fails: the run passes only if the build
+    # builds the External provider's distinct input and not the Internal provider's.
+    for runner in ["false", "rust"]:
+        result = await buck.test(
+            "-c",
+            f"test.use_internal_runner={runner}",
+            ":provider_artifact_pair",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+        assert "internal_only_input" not in _plain_stderr(result)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_artifact_pair_runner_enabled_builds_internal_inputs(
+    buck: Buck,
+) -> None:
+    for config in [["-c", "test.use_internal_runner=true"], []]:
+        await expect_failure(
+            buck.test(
+                *config,
+                ":provider_artifact_pair",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+            stderr_regex="internal_only_input",
+        )
 
 
 @buck_test()

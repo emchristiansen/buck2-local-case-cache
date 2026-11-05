@@ -30,10 +30,12 @@ use crate::analysis::calculation::RuleAnalysisCalculation;
 use crate::artifact_groups::ArtifactGroup;
 use crate::build::BuildProviderType;
 use crate::build::ProvidersToBuild;
+use crate::build::TestArtifacts;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
 use crate::interpreter::rule_defs::provider::test_provider::test_provider_from_collection;
+use crate::interpreter::rule_defs::provider::test_provider::test_provider_of_kind;
 
 /// Gets the list of outputs for a top-level build/run/install/test/etc target.
 pub async fn get_outputs_for_top_level_target(
@@ -95,13 +97,16 @@ pub async fn get_outputs_for_top_level_target(
                     }
                 }
             }
-            if providers_to_build.tests {
-                if let Some(test_provider) = test_provider_from_collection(collection) {
-                    let mut artifact_visitor = SimpleCommandLineArtifactVisitor::new();
-                    test_provider.visit_artifacts(&mut artifact_visitor)?;
-                    for input in artifact_visitor.inputs {
-                        outputs.push((input, BuildProviderType::Test));
-                    }
+            let test_provider = match providers_to_build.tests {
+                TestArtifacts::None => None,
+                TestArtifacts::Preferred => test_provider_from_collection(collection),
+                TestArtifacts::Selected(kind) => test_provider_of_kind(collection, kind),
+            };
+            if let Some(test_provider) = test_provider {
+                let mut artifact_visitor = SimpleCommandLineArtifactVisitor::new();
+                test_provider.visit_artifacts(&mut artifact_visitor)?;
+                for input in artifact_visitor.inputs {
+                    outputs.push((input, BuildProviderType::Test));
                 }
             }
             Ok(MaybeCompatible::Compatible(Arc::new(outputs)))

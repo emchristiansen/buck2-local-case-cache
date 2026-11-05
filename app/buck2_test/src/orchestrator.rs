@@ -52,6 +52,7 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_
 use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_info::OwnedLocalResourceInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::worker_info::WorkerInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
+use buck2_build_api::interpreter::rule_defs::provider::test_provider::TestProviderKind;
 use buck2_build_api::interpreter::rule_defs::required_test_local_resource::StarlarkRequiredTestLocalResource;
 use buck2_build_api::keep_going::KeepGoing;
 use buck2_build_api::materialize::invocation_re_use_case;
@@ -255,6 +256,14 @@ impl OwnedTestInfo {
             }
             (None, Some(external)) => Ok(Some(Self::External(external))),
             (None, None) => Ok(None),
+        }
+    }
+
+    /// Which provider this is.
+    pub(crate) fn kind(&self) -> TestProviderKind {
+        match self {
+            Self::External(_) => TestProviderKind::External,
+            Self::Internal(_) => TestProviderKind::Internal,
         }
     }
 
