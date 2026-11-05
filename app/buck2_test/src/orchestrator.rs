@@ -29,6 +29,7 @@ use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
 use buck2_build_api::actions::execute::dice_data::DiceHasCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::GetReClient;
+use buck2_build_api::actions::execute::dice_data::LocalExecution;
 use buck2_build_api::actions::impls::run_action_knobs::HasRunActionKnobs;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::artifact_groups::ArtifactGroup;
@@ -171,6 +172,7 @@ use dice::Key;
 use dice::NoValueSerialize;
 use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
+use dice_futures::spawn::spawn_dropcancel;
 use display_container::fmt_container;
 use display_container::fmt_keyed_container;
 use dupe::Dupe;
@@ -495,10 +497,8 @@ impl<'a> BuckTestOrchestrator<'a> {
             outputs,
             command_execution,
             local_case,
-        } = prepare_and_execute(
-            &mut self.dice.dupe().ctx(),
-            self.cancellations,
-            TestExecutionKey {
+        } = {
+            let key = TestExecutionKey {
                 test_target,
                 cmd: Arc::new(cmd),
                 env: Arc::new(env),
@@ -510,12 +510,52 @@ impl<'a> BuckTestOrchestrator<'a> {
                 timeout,
                 host_sharing_requirements: host_sharing_requirements.into(),
                 disable_test_execution_caching,
-            },
-            self.liveliness_observer.dupe(),
-            &self.internal_runner_config,
-            local_case_request,
-        )
-        .await?;
+            };
+            match local_case_request {
+                Some(local_case_request @ LocalCaseRequest::Track { .. }) => {
+                    // A tracked case holds its store generation from before its child starts
+                    // until settlement. Cancelling the test command drops this future, so the
+                    // case runs as its own task with a real cancellation context: on
+                    // cancellation the task stays alive inside `execute_local_case`'s critical
+                    // section, the executor kills the child and returns its collected streams,
+                    // and the generation is settled with them rather than abandoned.
+                    let dice = self.dice.dupe();
+                    let liveliness_observer = self.liveliness_observer.dupe();
+                    let internal_runner_config = self.internal_runner_config.clone();
+                    let data = self.dice.per_transaction_data();
+                    spawn_dropcancel(
+                        move |cancellations| {
+                            async move {
+                                prepare_and_execute(
+                                    &mut dice.dupe().ctx(),
+                                    cancellations,
+                                    key,
+                                    liveliness_observer,
+                                    &internal_runner_config,
+                                    Some(local_case_request),
+                                )
+                                .await
+                            }
+                            .boxed()
+                        },
+                        &*data.spawner,
+                        data,
+                    )
+                    .await
+                }
+                local_case_request => {
+                    prepare_and_execute(
+                        &mut self.dice.dupe().ctx(),
+                        self.cancellations,
+                        key,
+                        self.liveliness_observer.dupe(),
+                        &self.internal_runner_config,
+                        local_case_request,
+                    )
+                    .await
+                }
+            }
+        }?;
 
         Self::require_alive(self.liveliness_observer.dupe()).await?;
 
@@ -699,7 +739,6 @@ impl<'a> BuckTestOrchestrator<'a> {
             .executor()
             .is_local_execution_possible(executor_preference)
         {
-            let setup_local_resources_executor = Self::get_local_executor(dice, fs)?;
             let simple_stage = stage.as_ref().into();
 
             let available_resources: BuckMutMap<_, _> =
@@ -715,16 +754,23 @@ impl<'a> BuckTestOrchestrator<'a> {
                 )
                 .await?
             };
-            // If some timeout is neeeded, use the same value as for the test itself which is better than nothing.
-            Self::setup_local_resources(
-                dice,
-                cancellation,
-                required_providers,
-                setup_local_resources_executor,
-                timeout,
-                liveliness_observer.dupe(),
-            )
-            .await?
+            if required_providers.is_empty() {
+                // No setup command runs, so no local executor is needed. Resource setup is not
+                // a test command, and is never admitted to run locally under `--remote-only`.
+                vec![]
+            } else {
+                let setup_local_resources_executor = Self::get_local_executor(dice, fs)?;
+                // If some timeout is neeeded, use the same value as for the test itself which is better than nothing.
+                Self::setup_local_resources(
+                    dice,
+                    cancellation,
+                    required_providers,
+                    setup_local_resources_executor,
+                    timeout,
+                    liveliness_observer.dupe(),
+                )
+                .await?
+            }
         } else {
             vec![]
         };
@@ -1541,14 +1587,20 @@ impl BuckTestOrchestrator<'_> {
             LocalCaseStart::Begun(pending) => pending,
         };
 
-        let result = executor
-            .exec_cmd(manager, prepared_command, cancellation)
-            .await;
-        // A local exit-0 success is captured for confirmation; anything else, including a
-        // cancelled child, records the generation as unsuccessful with the exact raw streams the
-        // executor returned.
-        let outcome = settle_execution(pending, &result.report).await;
-        (result, outcome)
+        // Execution and settlement form one critical section: a cancelled case is not dropped
+        // between them, so its child is killed and the streams it already wrote are settled into
+        // the generation. A local exit-0 success is captured for confirmation; anything else,
+        // including a cancelled child, records the generation as unsuccessful with the exact raw
+        // streams the executor returned.
+        cancellation
+            .critical_section(|| async move {
+                let result = executor
+                    .exec_cmd(manager, prepared_command, cancellation)
+                    .await;
+                let outcome = settle_execution(pending, &result.report).await;
+                (result, outcome)
+            })
+            .await
     }
 
     /// Materialize the input-tree executables a constrained case launches and check their `#!`
@@ -1960,6 +2012,7 @@ impl BuckTestOrchestrator<'_> {
         executor_config: &CommandExecutorConfig,
         stage: &TestStage,
         supports_test_execution_caching: bool,
+        local_execution: LocalExecution,
     ) -> buck2_error::Result<CommandExecutor> {
         let CommandExecutorResponse {
             executor,
@@ -1968,7 +2021,7 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader,
             output_trees_download_config: _,
-        } = dice.get_command_executor_from_dice(fs, executor_config)?;
+        } = dice.get_command_executor_from_dice(fs, executor_config, local_execution)?;
 
         let (cache_uploader, action_cache_checker) = match stage {
             TestStage::Listing { .. } => (cache_uploader, action_cache_checker),
@@ -2017,7 +2070,7 @@ impl BuckTestOrchestrator<'_> {
             remote_dep_file_cache_checker: _,
             cache_uploader: _,
             output_trees_download_config: _,
-        } = dice.get_command_executor_from_dice(fs, &executor_config)?;
+        } = dice.get_command_executor_from_dice(fs, &executor_config, LocalExecution::ByStrategy)?;
         let executor = CommandExecutor::new(
             executor,
             Arc::new(NoOpCommandOptionalExecutor {}),
@@ -2063,6 +2116,53 @@ impl BuckTestOrchestrator<'_> {
         ))
     }
 
+    /// `[test] local_internal_cases`: whether an `InternalRunnerTestInfo` test whose provider
+    /// explicitly selects the local executor may use it under `--remote-only`. Absent means
+    /// `false`; any value other than `true` or `false` is refused.
+    async fn local_internal_cases(dice: &mut DiceComputations<'_>) -> buck2_error::Result<bool> {
+        let cell_resolver = dice.get_cell_resolver().await?;
+        let value = dice
+            .get_legacy_config_property(
+                cell_resolver.root_cell(),
+                BuckconfigKeyRef {
+                    section: "test",
+                    property: "local_internal_cases",
+                },
+            )
+            .await?;
+        match value.as_ref().map(|v| v.to_string()).as_deref() {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(other) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "[test] local_internal_cases must be `true` or `false`, not `{}`",
+                other
+            )),
+        }
+    }
+
+    /// The local-execution admission for one test command. Only the listing or case command of
+    /// an `InternalRunnerTestInfo` test whose provider explicitly selected the local executor
+    /// (its `default_executor` or the named override), under `[test] local_internal_cases`,
+    /// is admitted. A platform-derived fallback executor, an External test and the option alone
+    /// never are.
+    fn local_execution_for_test(
+        test_info: &OwnedTestInfo,
+        provider_executor: Option<&CommandExecutorConfig>,
+        local_internal_cases: bool,
+    ) -> LocalExecution {
+        match (test_info, provider_executor) {
+            (
+                OwnedTestInfo::Internal(_),
+                Some(CommandExecutorConfig {
+                    executor: Executor::Local(_),
+                    ..
+                }),
+            ) if local_internal_cases => LocalExecution::AdmittedInternalTest,
+            _ => LocalExecution::ByStrategy,
+        }
+    }
+
     async fn get_test_executor(
         dice: &mut DiceComputations<'_>,
         test_target: &ConfiguredProvidersLabel,
@@ -2103,9 +2203,15 @@ impl BuckTestOrchestrator<'_> {
             },
         };
 
+        let provider_executor = resolved_executor_override.as_ref().map(|a| &***a);
+        let local_execution = Self::local_execution_for_test(
+            test_info,
+            provider_executor,
+            Self::local_internal_cases(dice).await?,
+        );
         let executor_config = Self::executor_config_with_remote_cache_override(
             node,
-            resolved_executor_override.as_ref().map(|a| &***a),
+            provider_executor,
             stage,
             supports_test_execution_caching,
         )?;
@@ -2116,6 +2222,7 @@ impl BuckTestOrchestrator<'_> {
             &executor_config,
             stage,
             supports_test_execution_caching,
+            local_execution,
         )
         .buck_error_context("Error constructing CommandExecutor")?;
 

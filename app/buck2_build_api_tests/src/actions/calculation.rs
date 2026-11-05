@@ -26,6 +26,7 @@ use buck2_build_api::actions::calculation::ActionCalculation;
 use buck2_build_api::actions::calculation::command_details;
 use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
 use buck2_build_api::actions::execute::dice_data::HasCommandExecutor;
+use buck2_build_api::actions::execute::dice_data::LocalExecution;
 use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
 use buck2_build_api::actions::execute::dice_data::SetInvalidationTrackingConfig;
 use buck2_build_api::actions::execute::dice_data::SetReClient;
@@ -221,6 +222,7 @@ async fn make_default_dice_state(
             &self,
             artifact_fs: &ArtifactFs,
             _config: &CommandExecutorConfig,
+            _local: LocalExecution,
         ) -> buck2_error::Result<CommandExecutorResponse> {
             let executor = Arc::new(DryRunExecutor::new(
                 self.dry_run_tracker.dupe(),

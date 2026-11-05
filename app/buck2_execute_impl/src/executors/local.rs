@@ -66,6 +66,7 @@ use buck2_execute::execute::request::CommandExecutionOutputRef;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::request::NetworkAccess;
+use buck2_execute::execute::result::CommandCancellationReason;
 use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
@@ -1247,6 +1248,21 @@ impl PreparedCommandExecutor for LocalExecutor {
         )
         .await;
         manager.start_waiting_category(WaitingCategory::Unknown);
+
+        // A caller may keep this task alive through cancellation, with a critical section around
+        // execution and the handling of its result. A command cancelled while it was queued
+        // still never starts its child.
+        if cancellations.is_cancelled() {
+            return manager.cancel(
+                CommandExecutionKind::Local {
+                    digest: prepared_action.digest(),
+                    command: request.all_args_vec(),
+                    env: request.env().clone(),
+                },
+                CommandCancellationReason::NotSpecified,
+                CommandExecutionMetadata::empty(TimeSpan::empty_now()),
+            );
+        }
 
         // If we start running something, we don't want this task to get dropped, because if we do
         // we might interfere with e.g. clean up.

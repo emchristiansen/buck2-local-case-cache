@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
 use buck2_build_api::actions::execute::dice_data::HasCommandExecutor;
+use buck2_build_api::actions::execute::dice_data::LocalExecution;
 use buck2_cli_proto::client_context::HostPlatformOverride;
 use buck2_cli_proto::common_build_options::ExecutionStrategy;
 use buck2_core::buck2_env;
@@ -191,7 +192,11 @@ impl HasCommandExecutor for CommandExecutorFactory {
         &self,
         artifact_fs: &ArtifactFs,
         executor_config: &CommandExecutorConfig,
+        local_execution: LocalExecution,
     ) -> buck2_error::Result<CommandExecutorResponse> {
+        let local_banned =
+            local_execution_banned(self.strategy, local_execution, &executor_config.executor)?;
+
         // 30GB is the max RE can currently support.
         const DEFAULT_RE_MAX_INPUT_FILE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
@@ -223,7 +228,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 tracing::warn!("Cargo build detected: disabling remote execution and caching!")
             });
 
-            if self.strategy.ban_local() {
+            if local_banned {
                 return Err(ExecutorCompatibilityError::LocalIncompatible(self.strategy).into());
             }
 
@@ -272,7 +277,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
         let response = match &executor_config.executor {
             Executor::None => None,
             Executor::Local(local) => {
-                if self.strategy.ban_local() {
+                if local_banned {
                     None
                 } else {
                     Some(CommandExecutorResponse {
@@ -489,6 +494,35 @@ impl HasCommandExecutor for CommandExecutorFactory {
     }
 }
 
+/// Whether the local executor is banned for one command. Only an admitted Internal test command
+/// that selected `Executor::Local` may run locally under `--remote-only`; `NoExecution` (dry runs)
+/// still runs nothing, and every other strategy already permits local execution.
+fn local_execution_banned(
+    strategy: ExecutionStrategy,
+    local_execution: LocalExecution,
+    executor: &Executor,
+) -> buck2_error::Result<bool> {
+    match local_execution {
+        LocalExecution::ByStrategy => Ok(strategy.ban_local()),
+        LocalExecution::AdmittedInternalTest => {
+            if !matches!(executor, Executor::Local(_)) {
+                return Err(buck2_error::internal_error!(
+                    "an admitted Internal test command must select the local executor, not {:?}",
+                    executor
+                ));
+            }
+            Ok(match strategy {
+                ExecutionStrategy::RemoteOnly => false,
+                ExecutionStrategy::NoExecution => true,
+                ExecutionStrategy::Default
+                | ExecutionStrategy::LocalOnly
+                | ExecutionStrategy::HybridPreferLocal
+                | ExecutionStrategy::HybridPreferRemote => false,
+            })
+        }
+    }
+}
+
 trait ExecutionStrategyExt {
     fn ban_local(&self) -> bool;
     fn ban_remote(&self) -> bool;
@@ -589,5 +623,78 @@ fn get_default_path_separator(host_platform: HostPlatformOverride) -> PathSepara
         HostPlatformOverride::MacOs => PathSeparatorKind::Unix,
         HostPlatformOverride::Windows => PathSeparatorKind::Windows,
         HostPlatformOverride::DefaultPlatform => PathSeparatorKind::system_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_build_api::actions::execute::dice_data::LocalExecution;
+    use buck2_cli_proto::common_build_options::ExecutionStrategy;
+    use buck2_core::execution_types::executor_config::Executor;
+    use buck2_core::execution_types::executor_config::LocalExecutorOptions;
+
+    use super::ExecutionStrategyExt;
+    use super::local_execution_banned;
+
+    const STRATEGIES: [ExecutionStrategy; 6] = [
+        ExecutionStrategy::Default,
+        ExecutionStrategy::LocalOnly,
+        ExecutionStrategy::RemoteOnly,
+        ExecutionStrategy::HybridPreferLocal,
+        ExecutionStrategy::NoExecution,
+        ExecutionStrategy::HybridPreferRemote,
+    ];
+
+    fn local() -> Executor {
+        Executor::Local(LocalExecutorOptions::default())
+    }
+
+    #[test]
+    fn without_admission_the_strategy_alone_decides() {
+        for strategy in STRATEGIES {
+            assert_eq!(
+                local_execution_banned(strategy, LocalExecution::ByStrategy, &local()).unwrap(),
+                strategy.ban_local(),
+                "{strategy:?}"
+            );
+        }
+        assert!(
+            local_execution_banned(
+                ExecutionStrategy::RemoteOnly,
+                LocalExecution::ByStrategy,
+                &local()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_admitted_internal_test_overrides_remote_only_and_nothing_else() {
+        for strategy in STRATEGIES {
+            let banned =
+                local_execution_banned(strategy, LocalExecution::AdmittedInternalTest, &local())
+                    .unwrap();
+            assert_eq!(
+                banned,
+                strategy == ExecutionStrategy::NoExecution,
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_admission_for_another_executor_kind_is_refused() {
+        for strategy in STRATEGIES {
+            let err = local_execution_banned(
+                strategy,
+                LocalExecution::AdmittedInternalTest,
+                &Executor::None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:?}").contains("must select the local executor"),
+                "{err:?}"
+            );
+        }
     }
 }
