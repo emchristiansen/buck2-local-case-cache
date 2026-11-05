@@ -672,6 +672,175 @@ def parse_result(stdout, stderr, exit_code):
         Ok(())
     }
 
+    /// Each `fresh_dir_env` name is a variable name that nothing else sets.
+    #[test]
+    fn test_fresh_dir_env_validation() -> buck2_error::Result<()> {
+        let mut tester = tester();
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = ["1FRESH"],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `1FRESH` is not a valid environment variable name",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = ["FRESH-DIR"],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `FRESH-DIR` is not a valid environment variable name",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = [""],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `` is not a valid environment variable name",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = ["PWD"],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `PWD` is set by the executor",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = ["FRESH", "OTHER", "FRESH"],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `FRESH` is declared more than once",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {"HOME": "/home"},
+                    fresh_dir_env = ["HOME"],
+                )
+            "#
+            ),
+            "`fresh_dir_env` entry `HOME` is also a key of `env`",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = "FRESH",
+                )
+            "#
+            ),
+            "fresh_dir_env",
+        );
+        tester.run_starlark_bzl_test_expecting_error(
+            indoc!(
+                r#"
+            def test():
+                InternalRunnerTestInfo(
+                    type = "custom",
+                    parse_test_listing = lambda stdout: [],
+                    parse_test_result = lambda stdout, stderr, exit_code: [],
+                    listing_command = ["binary", "--list"],
+                    env = {},
+                    fresh_dir_env = [1],
+                )
+            "#
+            ),
+            "fresh_dir_env",
+        );
+        Ok(())
+    }
+
+    /// The declared names, in declaration order; none by default. `TMPDIR` and `HOME` are
+    /// allowed: the request environment replaces what the executor set.
+    #[test]
+    fn test_fresh_dir_env_accessor() -> buck2_error::Result<()> {
+        let info = freeze_provider(indoc!(
+            r#"
+        exported_info = InternalRunnerTestInfo(
+            type = "custom",
+            parse_test_listing = lambda stdout: [],
+            parse_test_result = lambda stdout, stderr, exit_code: [],
+            listing_command = ["binary", "--list"],
+            env = {"OTHER": "1"},
+            fresh_dir_env = ["TMPDIR", "HOME", "_X9"],
+        )
+        "#
+        ))?;
+        assert_eq!(
+            info.as_ref().value().as_ref().fresh_dir_env().collect::<Vec<_>>(),
+            ["TMPDIR", "HOME", "_X9"]
+        );
+        let info = freeze_provider(indoc!(
+            r#"
+        exported_info = InternalRunnerTestInfo(
+            type = "custom",
+            parse_test_listing = lambda stdout: [],
+            parse_test_result = lambda stdout, stderr, exit_code: [],
+            listing_command = ["binary", "--list"],
+        )
+        "#
+        ))?;
+        assert_eq!(info.as_ref().value().as_ref().fresh_dir_env().count(), 0);
+        Ok(())
+    }
+
     #[test]
     fn test_labels_validation() -> buck2_error::Result<()> {
         let mut tester = tester();

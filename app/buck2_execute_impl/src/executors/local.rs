@@ -1416,6 +1416,12 @@ pub async fn materialize_inputs(
         }
     }
 
+    if scratch.path.is_none() && !scratch.subdirectories.is_empty() {
+        return Err(buck2_error::internal_error!(
+            "Scratch subdirectories requested for an action without a scratch path"
+        ));
+    }
+
     // No producer declares these symlinks, so the consumer does, as it always has. A
     // materializer that takes the requested values as the truth about disk ignores this
     // declaration and creates the symlink from the pair in the request instead.
@@ -1452,12 +1458,6 @@ pub async fn materialize_inputs(
         Err(e) => return Err(e.into()),
     };
 
-    if scratch.path.is_none() && !scratch.subdirectories.is_empty() {
-        return Err(buck2_error::internal_error!(
-            "Scratch subdirectories requested for an action without a scratch path"
-        ));
-    }
-
     Ok(MaterializedInputPaths {
         scratch,
         paths,
@@ -1473,7 +1473,8 @@ pub struct ScratchPath {
     subdirectories: Vec<ForwardRelativePathBuf>,
 }
 
-/// Make the scratch path an empty directory, holding only its requested empty subdirectories.
+/// Make the scratch path an empty directory, holding only its requested empty subdirectories,
+/// which are owner-only, as a directory made by `mkdtemp` is.
 pub async fn prep_scratch_path(
     scratch_path: &ScratchPath,
     artifact_fs: &ArtifactFs,
@@ -1485,7 +1486,15 @@ pub async fn prep_scratch_path(
     let path = artifact_fs.fs().resolve(path);
     async_fs_util::create_dir_all(&path).await?;
     for subdirectory in &scratch_path.subdirectories {
-        async_fs_util::create_dir_all(path.join(subdirectory)).await?;
+        let subdirectory = path.join(subdirectory);
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder
+            .create(&subdirectory)
+            .await
+            .with_buck_error_context(|| format!("creating scratch subdirectory `{subdirectory}`"))?;
     }
     Ok(())
 }
@@ -2113,6 +2122,216 @@ mod tests {
             }
             _ => panic!("the cancelled result lost the child's streams"),
         }
+        Ok(())
+    }
+
+    /// Run `request` to completion through `exec_request`, as `exec_cmd` runs it.
+    #[cfg(unix)]
+    async fn run_request(
+        executor: &LocalExecutor,
+        request: &CommandExecutionRequest,
+    ) -> CommandExecutionResult {
+        use buck2_build_signals::env::WaitingData;
+        use buck2_events::dispatch::with_dispatcher_async;
+        use buck2_execute::execute::claim::MutexClaimManager;
+
+        let digest_config = DigestConfig::testing_default();
+        with_dispatcher_async(EventDispatcher::null(), async move {
+            let manager = CommandExecutionManager::new(
+                Box::new(MutexClaimManager::new()),
+                EventDispatcher::null(),
+                NoopLivelinessObserver::create(),
+                WaitingData::new(),
+            );
+            let digest = ActionDigest::empty(digest_config.cas_digest_config());
+            CancellationContext::testing()
+                .with_structured_cancellation(|cancellation| async move {
+                    executor
+                        .exec_request(
+                            &digest,
+                            request,
+                            manager,
+                            cancellation,
+                            CancellationContext::testing(),
+                            digest_config,
+                            &[],
+                            None,
+                        )
+                        .await
+                })
+                .await
+        })
+        .await
+    }
+
+    /// A request's scratch subdirectories: the executor removes the scratch path with everything
+    /// a previous run left in it, recreates it holding exactly the requested subdirectories, empty
+    /// and owner-only, and sets `TMPDIR` to it before the request's own environment, which names
+    /// the subdirectories. `determined_local_environment` describes that environment exactly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_prepares_scratch_subdirectories() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use buck2_core::category::CategoryRef;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+        use buck2_core::fs::buck_out_path::BuckOutScratchPath;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_hash::BuckIndexSet;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let digest_config = DigestConfig::testing_default();
+        let scratch = BuckOutScratchPath::new(
+            BaseDeferredKey::TargetLabel(ConfiguredTargetLabel::testing_parse(
+                "cell//pkg:case",
+                ConfigurationData::testing_new(),
+            )),
+            CategoryRef::new("local_case_fresh")?,
+            Some("case"),
+            ForwardRelativePathBuf::new("test".to_owned())?,
+            false,
+        )?;
+        let scratch_abs = executor.artifact_fs.fs().resolve(
+            &executor
+                .artifact_fs
+                .buck_out_path_resolver()
+                .resolve_scratch(&scratch)?,
+        );
+        let fresh_a = scratch_abs.join(ForwardRelativePath::new("0")?);
+        let fresh_b = scratch_abs.join(ForwardRelativePath::new("1")?);
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::ScratchPath(scratch)],
+            BuckIndexSet::default(),
+            &executor.artifact_fs,
+            digest_config,
+            None,
+        )?;
+        // Passes only with exactly the two subdirectories, both empty, in `TMPDIR` = the scratch
+        // path; then leaves files behind in both.
+        let script = r#"set -e
+s=$1
+test "$TMPDIR" = "$s"
+test "$FRESH_A" = "$s/0"
+test "$FRESH_B" = "$s/1"
+set -- "$s"/* "$s"/.[!.]*
+test "$*" = "$s/0 $s/1 $s/.[!.]*"
+set -- "$FRESH_A"/* "$FRESH_A"/.[!.]* "$FRESH_B"/* "$FRESH_B"/.[!.]*
+test "$*" = "$FRESH_A/* $FRESH_A/.[!.]* $FRESH_B/* $FRESH_B/.[!.]*"
+: > "$FRESH_A/left"
+: > "$s/.stale"
+printf ran
+"#;
+        let env = [
+            ("FRESH_A".to_owned(), fresh_a.to_string()),
+            ("FRESH_B".to_owned(), fresh_b.to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let request = CommandExecutionRequest::new(
+            vec![],
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                "sh".to_owned(),
+                scratch_abs.to_string(),
+            ],
+            paths,
+            env,
+        )
+        .with_skip_resource_control()
+        .with_scratch_subdirectories(vec![
+            ForwardRelativePathBuf::new("0".to_owned())?,
+            ForwardRelativePathBuf::new("1".to_owned())?,
+        ]);
+
+        // Something an earlier run left behind.
+        fs_util::create_dir_all(&fresh_a)?;
+        fs_util::write(fresh_a.join(ForwardRelativePath::new("earlier")?), "x")
+            .map_err(|e| e.categorize_internal())?;
+
+        for run in 0..2 {
+            let result = run_request(&executor, &request).await;
+            match &result.report.std_streams {
+                CommandStdStreams::Local { stdout, stderr } => assert_eq!(
+                    (stdout.as_slice(), result.report.exit_code),
+                    (b"ran".as_slice(), Some(0)),
+                    "run {run}: {}",
+                    String::from_utf8_lossy(stderr)
+                ),
+                _ => panic!("run {run} has no local streams"),
+            }
+            assert_matches!(
+                result.report.status,
+                CommandExecutionStatus::Success { .. }
+            );
+            for fresh in [&fresh_a, &fresh_b] {
+                let mode = std::fs::metadata(fresh)?.permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "run {run}: {fresh}");
+            }
+        }
+
+        // The executor's environment for this request, given its scratch path: `TMPDIR` first,
+        // then the request's own variables. Without the scratch path it is not determined.
+        let request = request
+            .with_local_environment_inheritance(EnvironmentInheritance::empty())
+            .with_omit_local_invocation_identity_env(true);
+        assert_eq!(determined_local_environment(&request, &root, None), None);
+        let described = determined_local_environment(&request, &root, Some(&scratch_abs))
+            .expect("the environment is determined given the scratch path");
+        let expected: Vec<(OsString, OsString)> = [
+            ("TMPDIR", scratch_abs.to_string()),
+            ("FRESH_A", fresh_a.to_string()),
+            ("FRESH_B", fresh_b.to_string()),
+            ("PWD", root.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let mut sorted_described = described.clone();
+        sorted_described.sort();
+        let mut sorted_expected = expected;
+        sorted_expected.sort();
+        assert_eq!(sorted_described, sorted_expected);
+        let position = |name: &str| described.iter().position(|(k, _)| k == name);
+        assert!(position("TMPDIR") < position("FRESH_A"), "{described:?}");
+        Ok(())
+    }
+
+    /// Subdirectories without a scratch path to hold them are refused before any input is
+    /// materialized, and no child starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_refuses_subdirectories_without_scratch() -> buck2_error::Result<()> {
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_hash::BuckIndexSet;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let marker = root.as_path().join("started");
+        let paths = CommandExecutionPaths::new(
+            vec![],
+            BuckIndexSet::default(),
+            &executor.artifact_fs,
+            DigestConfig::testing_default(),
+            None,
+        )?;
+        let request = CommandExecutionRequest::new(
+            vec![],
+            vec!["sh".to_owned(), "-c".to_owned(), ": > started".to_owned()],
+            paths,
+            Default::default(),
+        )
+        .with_skip_resource_control()
+        .with_scratch_subdirectories(vec![ForwardRelativePathBuf::new("0".to_owned())?]);
+        let result = run_request(&executor, &request).await;
+        assert_matches!(result.report.status, CommandExecutionStatus::Error { .. });
+        assert!(!marker.exists());
         Ok(())
     }
 

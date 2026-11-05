@@ -154,3 +154,76 @@ async def test_internal_only_provider_with_runner_disabled_is_refused(buck: Buck
         ),
         stderr_regex="does not select test type `custom`, and the target has no `ExternalRunnerTestInfo`",
     )
+
+
+FRESH_DIRS_ONE_PASS = (
+    "Tests finished: Pass 1. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
+    "Infra Failure 0. Build failure 0"
+)
+
+
+def _assert_one_fresh_dirs_pass(stderr: str) -> None:
+    # Exactly one passing result: a run that reports no result, or any other count, fails.
+    assert FRESH_DIRS_ONE_PASS in stderr, stderr
+    assert "NO TESTS RAN" not in stderr, stderr
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_gives_each_run_new_empty_directories(buck: Buck) -> None:
+    # The case fails unless TMPDIR holds exactly its two declared directories, each empty and
+    # owner-only, and it leaves files in them; so the second run passes only if they were
+    # removed and recreated before it.
+    for _ in range(2):
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            ":internal_fresh_dirs",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        _assert_one_fresh_dirs_pass(result.stderr)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
+    buck: Buck,
+) -> None:
+    # Each run holds its files for a while before checking them; a concurrent run of the same
+    # case that removed or reused the case's directories in between would fail one of them.
+    import asyncio
+
+    results = await asyncio.gather(
+        *(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                "fresh_dirs.hold=3",
+                ":internal_fresh_dirs",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            )
+            for _ in range(2)
+        )
+    )
+    for result in results:
+        _assert_one_fresh_dirs_pass(result.stderr)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_no_result_control(buck: Buck) -> None:
+    # The assertion rejects a run that reports no result.
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        ":internal_fresh_dirs",
+        "--include",
+        "no_such_label",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    try:
+        _assert_one_fresh_dirs_pass(result.stderr)
+    except AssertionError:
+        return
+    raise AssertionError("a run without results was accepted")

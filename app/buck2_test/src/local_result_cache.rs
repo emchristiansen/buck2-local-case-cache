@@ -2556,6 +2556,101 @@ mod tests {
         assert_eq!(state["success_generation"], 5, "{state}");
     }
 
+    /// A tracked case keeps its fresh-directory scratch path from before its child runs until its
+    /// generation is published or rejected, through capture and confirmation. Another key of the
+    /// same case (the same scratch path), tracked or not, cannot take the path, and so cannot
+    /// remove it, in between; the path's lease is free once the generation is settled.
+    #[test]
+    fn a_tracked_case_holds_its_scratch_path_until_its_generation_is_settled() {
+        use buck2_core::cells::CellResolver;
+        use buck2_core::cells::cell_root_path::CellRootPathBuf;
+        use buck2_core::cells::name::CellName;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+        use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+        use buck2_core::fs::project::ProjectRootTemp;
+        use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+        use buck2_core::provider::label::ConfiguredProvidersLabel;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use dupe::Dupe;
+
+        let root = Root::new("scratch-lease");
+        let path = root.0.to_str().unwrap().to_owned();
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = ArtifactFs::new(
+            CellResolver::testing_with_name_and_path(
+                CellName::testing_new("cell"),
+                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".into())),
+            ),
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            temp.path().dupe(),
+        );
+        let target = ConfiguredProvidersLabel::new(
+            ConfiguredTargetLabel::testing_parse("cell//pkg:t", ConfigurationData::testing_new()),
+            Default::default(),
+        );
+        let stage = TestStage::Testing {
+            suite: "suite".to_owned(),
+            testcases: vec!["module::case".to_owned()],
+            variant: None,
+            repeat_count: None,
+        };
+        let fresh =
+            FreshDirs::for_stage(&target, &stage, ["FRESH_A"], &fs).unwrap().unwrap();
+        // Two keys of one case: the second differs only in an unrelated variable.
+        let key = Material::new().key();
+        let mut other = Material::new();
+        other.env.push((OsString::from("OTHER"), OsString::from("1")));
+        let other = other.key();
+        assert_ne!(key.digest(), other.digest());
+
+        on_one_blocking_thread(async move {
+            let short = Duration::from_millis(200);
+            for confirmed in [true, false] {
+                let pending = begun(&path, &key, false, "holder")
+                    .await
+                    .holding(fresh.lease().await);
+                // The other key's own lease is free, but the scratch path is not.
+                let other_pending = begun(&path, &other, false, "other-key").await;
+                assert!(
+                    tokio::time::timeout(short, fresh.lease()).await.is_err(),
+                    "the scratch path was free while its holder's child could run"
+                );
+                // A local exit-0 success is captured; the path stays held until it is settled.
+                let outcome = settle_execution(pending, &succeeded(b"ok")).await;
+                assert!(
+                    tokio::time::timeout(short, fresh.lease()).await.is_err(),
+                    "the scratch path was free before the captured generation was settled"
+                );
+                let confirmation = if confirmed {
+                    Ok(pass("module::case"))
+                } else {
+                    Err(NotConfirmed::NotPass)
+                };
+                settle_fresh(outcome.take(), confirmation).await;
+                let lease = tokio::time::timeout(short, fresh.lease())
+                    .await
+                    .expect("the settled generation kept its scratch path");
+                drop(lease);
+                drop(other_pending);
+            }
+            // A failed child records its generation unsuccessful, which also frees the path.
+            let pending = begun(&path, &key, false, "failing")
+                .await
+                .holding(fresh.lease().await);
+            assert!(tokio::time::timeout(short, fresh.lease()).await.is_err());
+            assert!(
+                settle_execution(pending, &failed())
+                    .await
+                    .take()
+                    .is_some_and(|r| matches!(r, LocalCaseResult::Unsuccessful))
+            );
+            tokio::time::timeout(short, fresh.lease())
+                .await
+                .expect("the unsuccessful generation kept its scratch path");
+        });
+    }
+
     #[test]
     fn an_unconfirmed_fresh_capture_publishes_nothing_and_keeps_its_raw() {
         let root = Root::new("unconfirmed");
@@ -2856,6 +2951,166 @@ mod tests {
         let (earlier, case) = candidate().constrain(make(args.clone()), facts(), None, |_| true);
         assert!(case.is_err());
         assert_eq!(legacy_policy(&earlier), legacy_policy(&make(args)));
+        // Neither touched the store.
+        assert!(!cache_root.exists());
+    }
+
+    /// The only scratch path a case may carry is the engine's own fresh-directory scratch path,
+    /// set up exactly as the engine sets it up for that case. The key then records the
+    /// environment the executor installs: `TMPDIR` set to that path, then each declared name set
+    /// to its directory. Any other scratch path keeps the case out of the store.
+    #[test]
+    fn only_the_engines_fresh_scratch_path_is_admitted_and_keyed() {
+        use buck2_common::file_ops::metadata::FileMetadata;
+        use buck2_common::file_ops::metadata::TrackedFileDigest;
+        use buck2_core::cells::CellResolver;
+        use buck2_core::cells::cell_root_path::CellRootPathBuf;
+        use buck2_core::cells::name::CellName;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+        use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+        use buck2_core::fs::project::ProjectRootTemp;
+        use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+        use buck2_core::provider::label::ConfiguredProvidersLabel;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use buck2_directory::directory::entry::DirectoryEntry;
+        use buck2_execute::digest_config::DigestConfig;
+        use buck2_execute::directory::ActionDirectoryMember;
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+        use buck2_execute::execute::request::CommandExecutionInput;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use dupe::Dupe;
+
+        let temp = ProjectRootTemp::new().unwrap();
+        let project = temp.path();
+        let digest_config = DigestConfig::testing_default();
+        let fs = ArtifactFs::new(
+            CellResolver::testing_with_name_and_path(
+                CellName::testing_new("cell"),
+                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".into())),
+            ),
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            project.dupe(),
+        );
+        let target = ConfiguredProvidersLabel::new(
+            ConfiguredTargetLabel::testing_parse("cell//pkg:t", ConfigurationData::testing_new()),
+            Default::default(),
+        );
+        let stage = |case: &str| TestStage::Testing {
+            suite: "suite".to_owned(),
+            testcases: vec![case.to_owned()],
+            variant: None,
+            repeat_count: None,
+        };
+        let names = ["FRESH_A", "FRESH_B"];
+        let fresh = FreshDirs::for_stage(&target, &stage("module::case"), names, &fs)
+            .unwrap()
+            .unwrap();
+        let foreign = FreshDirs::for_stage(&target, &stage("module::other"), names, &fs)
+            .unwrap()
+            .unwrap();
+        let store = std::fs::canonicalize("/bin/sh").unwrap();
+        assert!(
+            store.starts_with("/nix/store"),
+            "the test needs a Nix store host"
+        );
+        let store = store.parent().unwrap().to_str().unwrap().to_owned();
+        let script = "buck-out/v2/gen/t/runner";
+        let body = b"#!/bin/sh\necho\n";
+        // The request the orchestrator builds for a case whose scratch path is `scratch`.
+        let make = |scratch: &FreshDirs| {
+            let runner = CommandExecutionInput::IncrementalRemoteOutput(
+                ProjectRelativePathBuf::unchecked_new(script.to_owned()),
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                    digest: TrackedFileDigest::from_content(
+                        body,
+                        digest_config.cas_digest_config(),
+                    ),
+                    is_executable: true,
+                })),
+            );
+            let paths = CommandExecutionPaths::new(
+                vec![runner, scratch.input()],
+                Default::default(),
+                &fs,
+                digest_config,
+                None,
+            )
+            .unwrap();
+            let mut env: sorted_vector_map::SortedVectorMap<String, String> =
+                scratch.env().unwrap().into_iter().collect();
+            env.insert("PATH".to_owned(), store.clone());
+            CommandExecutionRequest::new(
+                vec![],
+                vec![script.to_owned(), "module::case".to_owned()],
+                paths,
+                env,
+            )
+            .with_local_environment_inheritance(EnvironmentInheritance::empty())
+            .with_executor_preference(ExecutorPreference::LocalPreferred)
+            .with_scratch_subdirectories(scratch.subdirectories())
+        };
+        let facts = || RequestFacts {
+            project_fs: project,
+            buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
+        };
+        let cache_root = project.root().as_path().join("cache-root");
+        let candidate = || LocalCaseCandidate {
+            root: cache_root.to_str().unwrap().to_owned(),
+            reuse: true,
+            case: Material::new().case,
+        };
+
+        // Another case's scratch path, or a scratch path without the engine's setup, is refused
+        // and the request given back unchanged.
+        let (refused, case) =
+            candidate().constrain(make(&foreign), facts(), Some(&fresh), |_| true);
+        assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
+        assert_eq!(refused.executor_preference(), ExecutorPreference::LocalPreferred);
+        let (_, case) = candidate().constrain(make(&fresh), facts(), None, |_| true);
+        assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
+
+        let (constrained, case) =
+            candidate().constrain(make(&fresh), facts(), Some(&fresh), |_| true);
+        let case = case.expect("the engine's own fresh scratch path is admitted");
+        assert_eq!(
+            constrained.executor_preference(),
+            ExecutorPreference::LocalRequired
+        );
+        let action_digest =
+            ActionDigest::from_content(b"action", digest_config.cas_digest_config());
+        let working_directory = project.resolve(constrained.working_directory());
+        let key = case
+            .key(
+                &constrained,
+                PreparedFacts {
+                    action_digest: &action_digest,
+                    working_directory: &working_directory,
+                    network_access: "None".to_owned(),
+                    digest_config: digest_config.cas_digest_config(),
+                },
+            )
+            .unwrap();
+        // The recorded environment, in installation order.
+        let mut expected = KeyRecord::default();
+        let scratch = fresh.absolute().to_string();
+        let env = fresh.env().unwrap();
+        for (name, value) in [
+            ("TMPDIR", scratch.as_str()),
+            ("FRESH_A", env[0].1.as_str()),
+            ("FRESH_B", env[1].1.as_str()),
+            ("PATH", store.as_str()),
+        ] {
+            expected.field("env_name", name.as_bytes());
+            expected.field("env_value", value.as_bytes());
+        }
+        assert!(
+            key.record
+                .windows(expected.0.len())
+                .any(|window| window == expected.0.as_slice()),
+            "the key does not record TMPDIR and the fresh directories in installation order"
+        );
+        assert_eq!(env[0].1, format!("{scratch}/0"));
         // Neither touched the store.
         assert!(!cache_root.exists());
     }

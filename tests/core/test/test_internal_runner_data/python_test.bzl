@@ -15,10 +15,16 @@ def _impl(ctx):
             InternalRunnerTestInfo(
                 type = "custom",
                 command = ["fbpython", "-c", ctx.attrs.script],
-                listing_command = ["fbpython", "-c", "print('case')"],
+                # Listing gets no fresh directories.
+                listing_command = [
+                    "fbpython",
+                    "-c",
+                    "import os; assert not any(n in os.environ for n in {}); print('case')".format(ctx.attrs.fresh_dir_env),
+                ],
                 parse_test_listing = parse_internal_listing,
                 parse_test_result = parse_internal_result,
                 supports_test_execution_caching = ctx.attrs.local_case_cache,
+                fresh_dir_env = ctx.attrs.fresh_dir_env,
             ),
         ]
     return [
@@ -32,6 +38,7 @@ def _impl(ctx):
 python_test = rule(
     impl = _impl,
     attrs = {
+        "fresh_dir_env": attrs.list(attrs.string(), default = []),
         "internal": attrs.bool(default = False),
         "local_case_cache": attrs.bool(default = False),
         "script": attrs.string(),

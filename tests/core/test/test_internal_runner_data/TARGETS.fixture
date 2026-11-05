@@ -32,3 +32,32 @@ provider_pair_test(
     name = "provider_pair",
     expected = read_config("provider_pair", "expected", ""),
 )
+
+# Each declared name gets a new, empty, owner-only directory of its own inside the case's TMPDIR,
+# which holds nothing else. The case leaves files in both and, if asked, waits before checking
+# that nothing removed them, so a second run passes only if they were removed before it, and a
+# concurrent run of the same case passes only if it never shares the case's directories.
+python_test(
+    name = "internal_fresh_dirs",
+    fresh_dir_env = ["FRESH_A", "FRESH_B"],
+    internal = True,
+    script = """
+import os, stat, time
+tmp = os.environ["TMPDIR"]
+fresh = [os.environ["FRESH_A"], os.environ["FRESH_B"]]
+assert os.path.isabs(tmp), tmp
+assert fresh == [os.path.join(tmp, "0"), os.path.join(tmp, "1")], (tmp, fresh)
+assert sorted(os.listdir(tmp)) == ["0", "1"], os.listdir(tmp)
+for d in fresh:
+    assert os.listdir(d) == [], (d, os.listdir(d))
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700, (d, oct(os.stat(d).st_mode))
+token = str(os.getpid())
+for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
+    with open(path, "w") as f:
+        f.write(token)
+time.sleep({hold})
+for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
+    with open(path) as f:
+        assert f.read() == token, path
+""".format(hold = read_config("fresh_dirs", "hold", "0")),
+)

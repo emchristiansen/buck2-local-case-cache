@@ -198,3 +198,237 @@ impl std::fmt::Debug for ScratchLease {
         f.write_str("ScratchLease")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use buck2_core::cells::CellResolver;
+    use buck2_core::cells::cell_root_path::CellRootPathBuf;
+    use buck2_core::cells::name::CellName;
+    use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+    use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_execute::digest_config::DigestConfig;
+    use buck2_execute::execute::request::CommandExecutionPaths;
+    use sorted_vector_map::SortedVectorMap;
+
+    use super::*;
+
+    fn artifact_fs(temp: &ProjectRootTemp) -> ArtifactFs {
+        ArtifactFs::new(
+            CellResolver::testing_with_name_and_path(
+                CellName::testing_new("cell"),
+                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".into())),
+            ),
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            temp.path().dupe(),
+        )
+    }
+
+    fn target(name: &str) -> ConfiguredProvidersLabel {
+        ConfiguredProvidersLabel::new(
+            ConfiguredTargetLabel::testing_parse(
+                &format!("cell//pkg:{name}"),
+                ConfigurationData::testing_new(),
+            ),
+            Default::default(),
+        )
+    }
+
+    fn testing(cases: &[&str], variant: Option<&str>) -> TestStage {
+        TestStage::Testing {
+            suite: "suite".to_owned(),
+            testcases: cases.iter().map(|c| (*c).to_owned()).collect(),
+            variant: variant.map(str::to_owned),
+            repeat_count: None,
+        }
+    }
+
+    fn fresh(
+        fs: &ArtifactFs,
+        target_name: &str,
+        stage: &TestStage,
+        names: &[&str],
+    ) -> Option<FreshDirs> {
+        FreshDirs::for_stage(&target(target_name), stage, names.iter().copied(), fs).unwrap()
+    }
+
+    /// The request the orchestrator builds for `fresh`: its scratch input, its subdirectories and
+    /// its variables, plus an unrelated variable.
+    fn request_for(
+        fs: &ArtifactFs,
+        fresh: &FreshDirs,
+        extra_inputs: Vec<CommandExecutionInput>,
+    ) -> CommandExecutionRequest {
+        let mut env: SortedVectorMap<String, String> = fresh.env().unwrap().into_iter().collect();
+        env.insert("OTHER".to_owned(), "1".to_owned());
+        let inputs = std::iter::once(fresh.input()).chain(extra_inputs).collect();
+        let paths = CommandExecutionPaths::new(
+            inputs,
+            Default::default(),
+            fs,
+            DigestConfig::testing_default(),
+            None,
+        )
+        .unwrap();
+        CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
+            .with_scratch_subdirectories(fresh.subdirectories())
+    }
+
+    #[test]
+    fn listing_and_undeclared_names_get_no_fresh_directories() {
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let listing = TestStage::Listing {
+            suite: "suite".to_owned(),
+            cacheable: true,
+        };
+        assert!(fresh(&fs, "t", &listing, &["FRESH_A"]).is_none());
+        assert!(fresh(&fs, "t", &testing(&["a"], None), &[]).is_none());
+    }
+
+    /// Name `i` gets the absolute directory `<scratch>/<i>` inside the engine's scratch path; the
+    /// path is a function of target, suite, cases and variant, the same for the same case and
+    /// different for any other.
+    #[test]
+    fn each_name_gets_its_own_directory_inside_a_per_case_scratch_path() {
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let a = fresh(&fs, "t", &testing(&["a"], None), &["FRESH_A", "FRESH_B"]).unwrap();
+        let scratch = a.absolute().to_string();
+        assert!(
+            scratch.starts_with(&temp.path().root().to_string()),
+            "{scratch}"
+        );
+        assert_eq!(
+            a.env().unwrap(),
+            vec![
+                ("FRESH_A".to_owned(), format!("{scratch}/0")),
+                ("FRESH_B".to_owned(), format!("{scratch}/1")),
+            ]
+        );
+        assert_eq!(
+            a.subdirectories(),
+            vec![
+                ForwardRelativePathBuf::new("0".to_owned()).unwrap(),
+                ForwardRelativePathBuf::new("1".to_owned()).unwrap(),
+            ]
+        );
+
+        let same = fresh(&fs, "t", &testing(&["a"], None), &["FRESH_A", "FRESH_B"]).unwrap();
+        assert_eq!(same.absolute(), a.absolute());
+        // The scratch path does not depend on the names, only their directories do.
+        let renamed = fresh(&fs, "t", &testing(&["a"], None), &["OTHER"]).unwrap();
+        assert_eq!(renamed.absolute(), a.absolute());
+
+        let others = [
+            fresh(&fs, "t", &testing(&["b"], None), &["FRESH_A"]).unwrap(),
+            fresh(&fs, "t", &testing(&["a"], Some("v")), &["FRESH_A"]).unwrap(),
+            fresh(&fs, "t", &testing(&["a", "b"], None), &["FRESH_A"]).unwrap(),
+            fresh(&fs, "u", &testing(&["a"], None), &["FRESH_A"]).unwrap(),
+        ];
+        for (i, other) in others.iter().enumerate() {
+            assert_ne!(other.absolute(), a.absolute(), "{i}");
+            for (j, another) in others.iter().enumerate().skip(i + 1) {
+                assert_ne!(other.absolute(), another.absolute(), "{i} {j}");
+            }
+        }
+    }
+
+    /// Admission accepts exactly the engine's own scratch path, subdirectories and values; any
+    /// other scratch path, or the same one set up differently, is refused.
+    #[test]
+    fn admits_only_the_engines_own_scratch_setup() {
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let names = ["FRESH_A", "FRESH_B"];
+        let a = fresh(&fs, "t", &testing(&["a"], None), &names).unwrap();
+        let b = fresh(&fs, "t", &testing(&["b"], None), &names).unwrap();
+        assert!(a.admits(&request_for(&fs, &a, vec![])));
+
+        // Another case's scratch path, with values naming it.
+        assert!(!a.admits(&request_for(&fs, &b, vec![])));
+        // A second scratch input.
+        assert!(!a.admits(&request_for(&fs, &a, vec![b.input()])));
+        // No scratch input at all.
+        let paths =
+            CommandExecutionPaths::new(vec![], Default::default(), &fs, DigestConfig::testing_default(), None)
+                .unwrap();
+        let env: SortedVectorMap<String, String> = a.env().unwrap().into_iter().collect();
+        let bare = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
+            .with_scratch_subdirectories(a.subdirectories());
+        assert!(!a.admits(&bare));
+        // Missing, extra or reordered subdirectories.
+        let request = request_for(&fs, &a, vec![]);
+        assert!(!a.admits(&request.with_scratch_subdirectories(vec![])));
+        let mut extra = a.subdirectories();
+        extra.push(ForwardRelativePathBuf::new("2".to_owned()).unwrap());
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_subdirectories(extra)));
+        let mut reordered = a.subdirectories();
+        reordered.reverse();
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_subdirectories(reordered)));
+        // A value that names another directory, or a missing name.
+        for (name, value) in [("FRESH_A", Some("/elsewhere".to_owned())), ("FRESH_B", None)] {
+            let mut env: SortedVectorMap<String, String> = a.env().unwrap().into_iter().collect();
+            match value {
+                Some(value) => {
+                    env.insert(name.to_owned(), value);
+                }
+                None => {
+                    env.remove(name);
+                }
+            }
+            let paths = CommandExecutionPaths::new(
+                vec![a.input()],
+                Default::default(),
+                &fs,
+                DigestConfig::testing_default(),
+                None,
+            )
+            .unwrap();
+            let request = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
+                .with_scratch_subdirectories(a.subdirectories());
+            assert!(!a.admits(&request), "{name}");
+        }
+    }
+
+    /// The lease of one scratch path is exclusive: a second holder waits until the first is
+    /// dropped, whoever asks; a different path's lease does not wait.
+    #[tokio::test]
+    async fn the_scratch_lease_excludes_every_other_holder_of_the_same_path() {
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let a = fresh(&fs, "t", &testing(&["a"], None), &["FRESH_A"]).unwrap();
+        // The same case, as another key (here, other names) would set it up.
+        let a_again = fresh(&fs, "t", &testing(&["a"], None), &["OTHER"]).unwrap();
+        let b = fresh(&fs, "t", &testing(&["b"], None), &["FRESH_A"]).unwrap();
+
+        let first = a.lease().await;
+        let short = Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(short, a_again.lease()).await.is_err(),
+            "a second holder of the same scratch path did not wait"
+        );
+        let other = tokio::time::timeout(short, b.lease())
+            .await
+            .expect("another case's scratch path waited");
+
+        let waiter = tokio::spawn(async move { a_again.lease().await });
+        tokio::time::sleep(short).await;
+        assert!(!waiter.is_finished(), "the waiter got the lease early");
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the waiter never got the released lease")
+            .unwrap();
+        drop((second, other));
+        // Released paths are forgotten once nobody holds or waits for them.
+        let c = fresh(&fs, "t", &testing(&["c"], None), &["FRESH_A"]).unwrap();
+        let _c = c.lease().await;
+        let active = ACTIVE_SCRATCH.lock().unwrap();
+        assert!(active.get(&a.scratch_path).is_none());
+        assert!(active.get(&c.scratch_path).is_some());
+    }
+}
