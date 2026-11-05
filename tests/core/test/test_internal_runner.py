@@ -10,6 +10,7 @@
 # pyre-strict
 
 
+import asyncio
 import re
 
 from buck2.tests.e2e_util.api.buck import Buck
@@ -89,16 +90,28 @@ async def test_internal_cache_request_with_literal_tool_executes_normally(
     buck: Buck,
 ) -> None:
     # `fbpython` is found through PATH, so the command is not bound to its declared inputs:
-    # the case is ineligible and executes normally instead of being reused.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        "-c",
-        f"test.local_case_result_cache_root={buck.cwd / 'local-case-store'}",
-        ":internal_cache_request",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert "argv[0] `fbpython` is found through the working directory or PATH" in result.stderr
+    # the case is ineligible and executes normally instead of being reused. Which unbound input
+    # the closure check reports first depends on the host's PATH, so any of them will do; a
+    # second run is not served from the store either.
+    store = buck.cwd / "local-case-store"
+    for _ in range(2):
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            f"test.local_case_result_cache_root={store}",
+            ":internal_cache_request",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+        stderr = _plain_stderr(result)
+        assert re.search(
+            r"Local case result reuse unavailable for \S*:internal_cache_request\b.*: "
+            r"the command is not bound: .+; the case executes normally",
+            stderr,
+        ), stderr
+        assert "Local test-result reuse" not in stderr, stderr
+    assert not (store / "v1").exists() or not any((store / "v1").iterdir())
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -283,18 +296,6 @@ async def test_internal_only_provider_with_runner_disabled_is_refused(buck: Buck
     )
 
 
-FRESH_DIRS_ONE_PASS = (
-    "Tests finished: Pass 1. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
-    "Infra Failure 0. Build failure 0"
-)
-
-
-def _assert_one_fresh_dirs_pass(stderr: str) -> None:
-    # Exactly one passing result: a run that reports no result, or any other count, fails.
-    assert FRESH_DIRS_ONE_PASS in stderr, stderr
-    assert "NO TESTS RAN" not in stderr, stderr
-
-
 @buck_test()
 @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
 async def test_fresh_dir_env_gives_each_run_new_empty_directories(buck: Buck) -> None:
@@ -308,7 +309,7 @@ async def test_fresh_dir_env_gives_each_run_new_empty_directories(buck: Buck) ->
             ":internal_fresh_dirs",
             test_executor=INTERNAL_TEST_EXECUTOR,
         )
-        _assert_one_fresh_dirs_pass(result.stderr)
+        assert_exactly_one_pass(result)
 
 
 @buck_test()
@@ -318,8 +319,6 @@ async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
 ) -> None:
     # Each run holds its files for a while before checking them; a concurrent run of the same
     # case that removed or reused the case's directories in between would fail one of them.
-    import asyncio
-
     results = await asyncio.gather(
         *(
             buck.test(
@@ -334,23 +333,4 @@ async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
         )
     )
     for result in results:
-        _assert_one_fresh_dirs_pass(result.stderr)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_no_result_control(buck: Buck) -> None:
-    # The assertion rejects a run that reports no result.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        ":internal_fresh_dirs",
-        "--include",
-        "no_such_label",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    try:
-        _assert_one_fresh_dirs_pass(result.stderr)
-    except AssertionError:
-        return
-    raise AssertionError("a run without results was accepted")
+        assert_exactly_one_pass(result)
