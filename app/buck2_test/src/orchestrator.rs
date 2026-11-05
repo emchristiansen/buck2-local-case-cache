@@ -72,6 +72,7 @@ use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutTestPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::fs::project::ProjectRoot;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::EndOfTestResults;
@@ -103,6 +104,7 @@ use buck2_execute::execute::command_executor::CommandExecutor;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::manager::CommandExecutionManager;
+use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::request::CommandExecutionInput;
@@ -118,10 +120,13 @@ use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
+use buck2_execute::execute::output::CommandStdStreams;
+use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::target::CommandExecutionTarget;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
+use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute_impl::executors::local::EnvironmentBuilder;
 use buck2_execute_impl::executors::local::apply_local_execution_environment;
 use buck2_execute_impl::executors::local::create_output_dirs;
@@ -181,6 +186,20 @@ use pagable::pagable_typetag;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::command::InternalRunnerConfig;
+use crate::internal_runner::InternalTestOrchestrator;
+use crate::local_result_cache::ConstrainedCase;
+use crate::local_result_cache::LocalCaseAdmission;
+use crate::local_result_cache::LocalCaseGap;
+use crate::local_result_cache::LocalCaseOutcome;
+use crate::local_result_cache::LocalCaseResult;
+use crate::local_result_cache::LocalCaseStore;
+use crate::local_result_cache::PendingCase;
+use crate::local_result_cache::ReusedCase;
+use crate::local_result_cache::LocalCaseRequest;
+use crate::local_result_cache::Lookup;
+use crate::local_result_cache::ExecutionRecord;
+use crate::local_result_cache::PreparedFacts;
+use crate::local_result_cache::RequestFacts;
 use crate::local_resource_api::LocalResourcesSetupResult;
 use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::local_resource_setup::TestStageSimple;
@@ -461,7 +480,8 @@ impl<'a> BuckTestOrchestrator<'a> {
         executor_override: Option<ExecutorConfigOverride>,
         required_local_resources: RequiredLocalResources,
         disable_test_execution_caching: bool,
-    ) -> Result<ExecutionResult2, ExecuteError> {
+        local_case_request: Option<LocalCaseRequest>,
+    ) -> Result<(ExecutionResult2, LocalCaseOutcome), ExecuteError> {
         Self::require_alive(self.liveliness_observer.dupe()).await?;
 
         let test_target = self.session.get(test_target)?;
@@ -477,6 +497,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             execution_kind,
             outputs,
             command_execution,
+            local_case,
         } = prepare_and_execute(
             &mut self.dice.dupe().ctx(),
             self.cancellations,
@@ -495,6 +516,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             },
             self.liveliness_observer.dupe(),
             &self.internal_runner_config,
+            local_case_request,
         )
         .await?;
 
@@ -569,19 +591,22 @@ impl<'a> BuckTestOrchestrator<'a> {
         // here to hold the lease over.
         drop(response.lease);
 
-        Ok(ExecutionResult2 {
-            status,
-            stdout,
-            stderr,
-            outputs: output_map,
-            start_time: timing.start_time,
-            execution_time: timing.execution_time,
-            execution_details: ExecutionDetails {
-                execution_kind: execution_kind.map(|k| k.to_proto(false)),
+        Ok((
+            ExecutionResult2 {
+                status,
+                stdout,
+                stderr,
+                outputs: output_map,
+                start_time: timing.start_time,
+                execution_time: timing.execution_time,
+                execution_details: ExecutionDetails {
+                    execution_kind: execution_kind.map(|k| k.to_proto(false)),
+                },
+                max_memory_used_bytes: timing.execution_stats.and_then(|s| s.memory_peak),
+                command_execution,
             },
-            max_memory_used_bytes: timing.execution_stats.and_then(|s| s.memory_peak),
-            command_execution,
-        })
+            local_case,
+        ))
     }
 
     async fn prepare_and_execute_no_dice(
@@ -590,6 +615,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         liveliness_observer: Arc<dyn LivelinessObserver>,
         cancellation: &CancellationContext,
         internal_runner_config: &InternalRunnerConfig,
+        local_case_request: Option<LocalCaseRequest>,
     ) -> Result<ExecuteData, ExecuteError> {
         let TestExecutionKey {
             test_target,
@@ -606,11 +632,24 @@ impl<'a> BuckTestOrchestrator<'a> {
         } = key;
         let fs = dice.get_artifact_fs().await?;
         let test_info = Self::get_test_info(dice, &test_target, internal_runner_config).await?;
-        crate::local_result_cache::require_local_case_support(
+        let local_case_admission = LocalCaseAdmission::for_stage(
             stage.as_ref(),
+            &test_target.to_string(),
             test_info.requests_local_case_result_caching(),
             disable_test_execution_caching,
-        )?;
+            Self::local_case_result_cache_root(dice).await?.as_deref(),
+            local_case_request.as_ref(),
+        );
+        if let LocalCaseAdmission::Refused(gap) = &local_case_admission {
+            // Before executor preparation, resource setup or a child.
+            return Err(ExecuteError::Error(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Local case result reuse refused {} ({}) before execution: {}",
+                test_target,
+                stage,
+                gap
+            )));
+        }
         let effective_test_execution_caching =
             test_info.supports_test_execution_caching() && !disable_test_execution_caching;
         let disable_local_network_isolation =
@@ -711,6 +750,44 @@ impl<'a> BuckTestOrchestrator<'a> {
         )
         .boxed()
         .await?;
+        let (execution_request, local_case) = match local_case_admission {
+            LocalCaseAdmission::NotRequested => (execution_request, None),
+            LocalCaseAdmission::Ineligible(gap) => {
+                Self::report_local_case_gap(&test_target, &stage, gap);
+                (execution_request, None)
+            }
+            LocalCaseAdmission::Refused(_) => {
+                return Err(ExecuteError::Error(internal_error!(
+                    "refused local case reached request construction"
+                )));
+            }
+            LocalCaseAdmission::Candidate(candidate) => {
+                let (request, constrained) = candidate.constrain(
+                    execution_request,
+                    RequestFacts {
+                        project_fs: fs.fs(),
+                        buck_out: fs
+                            .buck_out_path_resolver()
+                            .root()
+                            .iter()
+                            .map(|c| c.as_str().to_owned())
+                            .collect(),
+                    },
+                    |preference| {
+                        test_executor
+                            .executor()
+                            .is_local_execution_possible(preference)
+                    },
+                );
+                match constrained {
+                    Ok(case) => (request, Some(case)),
+                    Err(gap) => {
+                        Self::report_local_case_gap(&test_target, &stage, gap);
+                        (request, None)
+                    }
+                }
+            }
+        };
         let result = Self::execute_request(
             dice,
             cancellation,
@@ -721,6 +798,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             liveliness_observer.dupe(),
             test_executor.re_cache_enabled(),
             effective_test_execution_caching,
+            local_case,
         )
         .boxed()
         .await?;
@@ -810,6 +888,7 @@ impl Key for TestExecutionKey {
                         Arc::new(observer),
                         cancellations,
                         &config,
+                        None,
                     )
                     .await
                 }
@@ -839,6 +918,7 @@ async fn prepare_and_execute(
     key: TestExecutionKey,
     liveliness_observer: Arc<dyn LivelinessObserver>,
     internal_runner_config: &InternalRunnerConfig,
+    local_case_request: Option<LocalCaseRequest>,
 ) -> Result<ExecuteData, ExecuteError> {
     let execute_on_dice = match key.stage.as_ref() {
         TestStage::Listing { cacheable, .. } => *cacheable,
@@ -861,6 +941,7 @@ async fn prepare_and_execute(
             liveliness_observer,
             cancellation,
             internal_runner_config,
+            local_case_request,
         )
         .await?)
     }
@@ -905,6 +986,29 @@ impl Display for TestExecutionKey {
     }
 }
 
+/// The first step of a constrained case, taken under its key's lease.
+enum LocalCaseStart {
+    Hit(ReusedCase),
+    Begun(PendingCase),
+}
+
+/// Timing for a reused result: it waited for no child, so it has no execution interval of its
+/// own. The original execution time remains in the entry's manifest.
+fn reuse_timing() -> CommandExecutionMetadata {
+    CommandExecutionMetadata {
+        time_span: buck2_util::time_span::TimeSpan::empty_now(),
+        execution_time: Duration::ZERO,
+        start_time: std::time::SystemTime::now(),
+        execution_stats: None,
+        input_materialization_duration: Duration::ZERO,
+        hashing_duration: Duration::ZERO,
+        hashed_artifacts_count: 0,
+        queue_duration: None,
+        suspend_duration: None,
+        suspend_count: None,
+    }
+}
+
 struct PreparedLocalResourceSetupContext {
     pub target: ConfiguredTargetLabel,
     pub execution_request: CommandExecutionRequest,
@@ -929,6 +1033,88 @@ enum ExecuteError {
     Cancelled(Cancelled),
 }
 
+impl BuckTestOrchestrator<'_> {
+    /// Execute one request, returning the local case reuse or captured success for the internal
+    /// runner alongside the ordinary response.
+    async fn execute_with_local_case(
+        &self,
+        stage: TestStage,
+        test_target: ConfiguredTargetHandle,
+        cmd: Vec<ArgValue>,
+        env: SortedVectorMap<String, ArgValue>,
+        timeout: Duration,
+        host_sharing_requirements: HostSharingRequirements,
+        pre_create_dirs: Vec<DeclaredOutput>,
+        executor_override: Option<ExecutorConfigOverride>,
+        required_local_resources: RequiredLocalResources,
+        disable_test_execution_caching: bool,
+        local_case_request: Option<LocalCaseRequest>,
+    ) -> buck2_error::Result<(ExecuteResponse, LocalCaseOutcome)> {
+        let res = BuckTestOrchestrator::execute2(
+            self,
+            stage,
+            test_target,
+            cmd,
+            env,
+            timeout,
+            host_sharing_requirements,
+            pre_create_dirs,
+            executor_override,
+            required_local_resources,
+            disable_test_execution_caching,
+            local_case_request,
+        )
+        .await;
+
+        match res {
+            Ok((r, local_case)) => Ok((ExecuteResponse::Result(r), local_case)),
+            Err(ExecuteError::Cancelled(cancelled)) => Ok((
+                ExecuteResponse::Cancelled(match cancelled.reason {
+                    Some(CancellationReason::NotSpecified) => {
+                        Some(buck2_test_api::data::CancellationReason::NotSpecified)
+                    }
+                    Some(CancellationReason::ReQueueTimeout) => {
+                        Some(buck2_test_api::data::CancellationReason::ReQueueTimeout)
+                    }
+                    None => None,
+                }),
+                LocalCaseOutcome::default(),
+            )),
+            Err(ExecuteError::Error(e)) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+impl InternalTestOrchestrator for BuckTestOrchestrator<'_> {
+    async fn execute_case(
+        &self,
+        stage: TestStage,
+        test_target: ConfiguredTargetHandle,
+        cmd: Vec<ArgValue>,
+        env: SortedVectorMap<String, ArgValue>,
+        timeout: Duration,
+        required_local_resources: RequiredLocalResources,
+        disable_test_execution_caching: bool,
+        local_case: Option<LocalCaseRequest>,
+    ) -> buck2_error::Result<(ExecuteResponse, LocalCaseOutcome)> {
+        self.execute_with_local_case(
+            stage,
+            test_target,
+            cmd,
+            env,
+            timeout,
+            HostSharingRequirements::default(),
+            Vec::new(),
+            None,
+            required_local_resources,
+            disable_test_execution_caching,
+            local_case,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl TestOrchestrator for BuckTestOrchestrator<'_> {
     async fn execute2(
@@ -944,36 +1130,24 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
         required_local_resources: RequiredLocalResources,
         disable_test_execution_caching: bool,
     ) -> buck2_error::Result<ExecuteResponse> {
-        let res = BuckTestOrchestrator::execute2(
-            self,
-            stage,
-            test_target,
-            cmd,
-            env,
-            timeout,
-            host_sharing_requirements,
-            pre_create_dirs,
-            executor_override,
-            required_local_resources,
-            disable_test_execution_caching,
-        )
-        .await;
-
-        match res {
-            Ok(r) => Ok(ExecuteResponse::Result(r)),
-            Err(ExecuteError::Cancelled(cancelled)) => {
-                Ok(ExecuteResponse::Cancelled(match cancelled.reason {
-                    Some(CancellationReason::NotSpecified) => {
-                        Some(buck2_test_api::data::CancellationReason::NotSpecified)
-                    }
-                    Some(CancellationReason::ReQueueTimeout) => {
-                        Some(buck2_test_api::data::CancellationReason::ReQueueTimeout)
-                    }
-                    None => None,
-                }))
-            }
-            Err(ExecuteError::Error(e)) => Err(e),
-        }
+        // Only the internal runner can confirm a captured local case; dropping it here records
+        // its generation as unsuccessful.
+        let (response, _local_case) = self
+            .execute_with_local_case(
+                stage,
+                test_target,
+                cmd,
+                env,
+                timeout,
+                host_sharing_requirements,
+                pre_create_dirs,
+                executor_override,
+                required_local_resources,
+                disable_test_execution_caching,
+                None,
+            )
+            .await?;
+        Ok(response)
     }
 
     async fn report_test_result(&self, r: TestResult) -> buck2_error::Result<()> {
@@ -1226,9 +1400,268 @@ struct ExecuteData {
     pub execution_kind: Option<CommandExecutionKind>,
     pub outputs: Vec<(BuckOutTestPath, ArtifactValue)>,
     pub command_execution: Option<buck2_data::CommandExecution>,
+    /// Local case reuse or captured success for the internal runner; empty otherwise.
+    pub local_case: LocalCaseOutcome,
 }
 
 impl BuckTestOrchestrator<'_> {
+    /// The explicitly configured private root for local case results, if any.
+    async fn local_case_result_cache_root(
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<Option<String>> {
+        let cell_resolver = dice.get_cell_resolver().await?;
+        Ok(dice
+            .get_legacy_config_property(
+                cell_resolver.root_cell(),
+                BuckconfigKeyRef {
+                    section: "test",
+                    property: "local_case_result_cache_root",
+                },
+            )
+            .await?
+            .map(|root| root.to_string()))
+    }
+
+    fn report_local_case_gap(
+        test_target: &ConfiguredProvidersLabel,
+        stage: &TestStage,
+        gap: LocalCaseGap,
+    ) {
+        tracing::warn!(
+            "Local case result reuse unavailable for {} ({}): {}; the case executes normally",
+            test_target,
+            stage,
+            gap
+        );
+    }
+
+    /// Serve a constrained case from the local store, or execute it and capture its success
+    /// for confirmation by the internal runner.
+    ///
+    /// A hit never reaches `exec_cmd`, so no test child starts. A launched input-tree script
+    /// whose `#!` interpreter is not bound makes the case ineligible: it executes normally and
+    /// publishes nothing. A key, materialization or store failure is the case's error and starts
+    /// no child.
+    async fn execute_local_case(
+        test_target_label: &ConfiguredProvidersLabel,
+        stage: &TestStage,
+        materializer: &dyn Materializer,
+        local_case: ConstrainedCase,
+        executor: &CommandExecutor,
+        manager: CommandExecutionManager,
+        prepared_command: &PreparedCommand<'_, '_>,
+        cancellation: &CancellationContext,
+        project_fs: &ProjectRoot,
+        current_attempt: String,
+    ) -> (CommandExecutionResult, LocalCaseOutcome) {
+        let request = prepared_command.request;
+        let action_digest = prepared_command.prepared_action.digest();
+        let working_directory = project_fs.resolve(request.working_directory());
+        let key = match local_case.key(
+            request,
+            PreparedFacts {
+                action_digest: &action_digest,
+                working_directory: &working_directory,
+                network_access: format!(
+                    "{:?}; disable_local_network_isolation={}",
+                    prepared_command.prepared_action.network_access,
+                    request.disable_local_network_isolation()
+                ),
+                digest_config: prepared_command.digest_config.cas_digest_config(),
+            },
+        ) {
+            Ok(key) => key,
+            Err(gap) => {
+                return (
+                    manager.error(
+                        "local_case_result_key",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Environment,
+                            "Local case result key could not be built for an admitted case: {gap}"
+                        ),
+                    ),
+                    LocalCaseOutcome::default(),
+                );
+            }
+        };
+
+        let launched = local_case.launch().executables();
+        if !launched.is_empty() {
+            if let Err(e) = materializer
+                .ensure_materialized(launched, MaterializationPurpose::IntermediateOnly)
+                .await
+            {
+                return (
+                    manager.error("local_case_launch_materialization", e),
+                    LocalCaseOutcome::default(),
+                );
+            }
+        }
+        let launch = local_case.launch().clone();
+        match tokio::task::spawn_blocking(move || launch.verify()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => {
+                Self::report_local_case_gap(
+                    test_target_label,
+                    stage,
+                    LocalCaseGap::UnboundCommandFile(why),
+                );
+                return (
+                    executor
+                        .exec_cmd(manager, prepared_command, cancellation)
+                        .await,
+                    LocalCaseOutcome::default(),
+                );
+            }
+            Err(e) => {
+                return (
+                    manager.error(
+                        "local_case_launch_check",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Environment,
+                            "Local case launch check did not complete: {e}"
+                        ),
+                    ),
+                    LocalCaseOutcome::default(),
+                );
+            }
+        }
+
+        let query = buck2_data::LocalTestResultCacheQuery {
+            action_digest: key.action_digest().to_owned(),
+            cache_key: key.digest().to_owned(),
+            current_attempt: current_attempt.clone(),
+        };
+        let root = local_case.root().to_owned();
+        let reuse = local_case.reuse();
+        let attempt = current_attempt.clone();
+        // One blocking step opens the store, waits for the key's lease and either returns a
+        // verified hit or durably begins the next generation; the lease then stays with the
+        // returned hit or pending attempt. If this future is dropped first, the blocking step
+        // still finishes and its result is dropped, which releases the lease and records any
+        // begun generation as abandoned.
+        let lookup = executor_stage_async(
+            query,
+            tokio::task::spawn_blocking(move || {
+                let store = LocalCaseStore::open(&root)?;
+                let guard = store.lease(&key)?;
+                let guard = if reuse {
+                    match guard.lookup()? {
+                        Lookup::Hit(reused) => return buck2_error::Ok(LocalCaseStart::Hit(reused)),
+                        Lookup::Miss(guard) => guard,
+                    }
+                } else {
+                    guard
+                };
+                Ok(LocalCaseStart::Begun(guard.begin(&attempt)?))
+            }),
+        )
+        .await;
+        let lookup = match lookup {
+            Ok(Ok(start)) => start,
+            Ok(Err(e)) => {
+                return (
+                    manager.error("local_case_result_store", e),
+                    LocalCaseOutcome::default(),
+                );
+            }
+            Err(e) => {
+                return (
+                    manager.error(
+                        "local_case_result_store",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Environment,
+                            "Local case result store step did not complete: {e}"
+                        ),
+                    ),
+                    LocalCaseOutcome::default(),
+                );
+            }
+        };
+        let pending = match lookup {
+            LocalCaseStart::Hit(reused) => {
+                let provenance = reused.provenance().clone();
+                let execution_kind = CommandExecutionKind::LocalTestResultCache {
+                    digest: action_digest.dupe(),
+                    cache_key: provenance.cache_key.clone(),
+                    origin_attempt: provenance.origin_attempt.clone(),
+                    entry_manifest: provenance.entry_manifest.clone(),
+                    current_attempt: current_attempt.clone(),
+                };
+                let std_streams = CommandStdStreams::Local {
+                    stdout: reused.stdout().to_vec(),
+                    stderr: reused.stderr().to_vec(),
+                };
+                let result = executor_stage_async(
+                    buck2_data::LocalTestResultCache {
+                        action_digest: provenance.action_digest,
+                        cache_key: provenance.cache_key,
+                        origin_attempt: provenance.origin_attempt,
+                        entry_manifest: provenance.entry_manifest,
+                        current_attempt,
+                    },
+                    async move {
+                        manager.claim().await.success(
+                            execution_kind,
+                            BuckIndexMap::default(),
+                            std_streams,
+                            reuse_timing(),
+                        )
+                    },
+                )
+                .await;
+                return (result, LocalCaseOutcome::new(LocalCaseResult::Reused(reused)));
+            }
+            LocalCaseStart::Begun(pending) => pending,
+        };
+
+        let result = executor
+            .exec_cmd(manager, prepared_command, cancellation)
+            .await;
+        let outcome = match (&result.report.status, &result.report.std_streams) {
+            (
+                CommandExecutionStatus::Success {
+                    execution_kind: CommandExecutionKind::Local { .. },
+                },
+                CommandStdStreams::Local { stdout, stderr },
+            ) if result.report.exit_code == Some(0) => LocalCaseOutcome::new(
+                LocalCaseResult::Captured(pending.capture(ExecutionRecord {
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                    status: result.report.status.to_string(),
+                    exit_code: result.report.exit_code,
+                    start_time: result.report.timing.start_time,
+                    execution_time: result.report.timing.execution_time,
+                })),
+            ),
+            _ => {
+                let reason = format!("execution did not succeed locally: {}", result.report.status);
+                // Keep the exact raw streams of a failed, timed-out or errored execution with
+                // its generation. Streams that are not local bytes are not available here.
+                let record = match &result.report.std_streams {
+                    CommandStdStreams::Local { stdout, stderr } => Some(ExecutionRecord {
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                        status: result.report.status.to_string(),
+                        exit_code: result.report.exit_code,
+                        start_time: result.report.timing.start_time,
+                        execution_time: result.report.timing.execution_time,
+                    }),
+                    _ => None,
+                };
+                match tokio::task::spawn_blocking(move || pending.reject(&reason, record.as_ref()))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("Recording unsuccessful local case failed: {e:#}"),
+                    Err(e) => tracing::warn!("Recording unsuccessful local case failed: {e:#}"),
+                }
+                LocalCaseOutcome::default()
+            }
+        };
+        (result, outcome)
+    }
+
     fn executor_preference(
         opts: TestSessionOptions,
         test_supports_re: bool,
@@ -1260,8 +1693,10 @@ impl BuckTestOrchestrator<'_> {
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
         supports_test_execution_caching: bool,
+        local_case: Option<ConstrainedCase>,
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
+        let project_fs = executor.fs().fs().dupe();
         let manager = CommandExecutionManager::new(
             Box::new(MutexClaimManager::new()),
             events.dupe(),
@@ -1269,6 +1704,7 @@ impl BuckTestOrchestrator<'_> {
             WaitingData::new(),
         );
         let digest_config = dice.global_data().get_digest_config();
+        let materializer = dice.per_transaction_data().get_materializer_handle();
 
         let test_target = TestTarget {
             target: test_target_label.target(),
@@ -1287,6 +1723,8 @@ impl BuckTestOrchestrator<'_> {
             prepared_action: &prepared_action,
             digest_config,
         };
+
+        let mut local_case_outcome = LocalCaseOutcome::default();
 
         // instrument execution with a span.
         // TODO(brasselsprouts): migrate this into the executor to get better accuracy.
@@ -1369,9 +1807,27 @@ impl BuckTestOrchestrator<'_> {
                 let start = TestRunStart {
                     suite: test_suite.clone(),
                 };
+                let local_case_outcome = &mut local_case_outcome;
+                let current_attempt = events.trace_id().to_string();
                 events
                     .span_async(start, async move {
-                        let result = if supports_test_execution_caching {
+                        let result = if let Some(local_case) = local_case {
+                            let (result, outcome) = Self::execute_local_case(
+                                test_target_label,
+                                stage,
+                                &*materializer,
+                                local_case,
+                                executor,
+                                manager,
+                                &prepared_command,
+                                cancellation,
+                                &project_fs,
+                                current_attempt,
+                            )
+                            .await;
+                            *local_case_outcome = outcome;
+                            result
+                        } else if supports_test_execution_caching {
                             match executor
                                 .action_cache(manager, &prepared_command, cancellation)
                                 .await
@@ -1453,6 +1909,7 @@ impl BuckTestOrchestrator<'_> {
                 execution_kind: Some(execution_kind),
                 outputs,
                 command_execution,
+                local_case: local_case_outcome,
             },
             CommandExecutionStatus::Failure { execution_kind }
             | CommandExecutionStatus::WorkerFailure { execution_kind } => ExecuteData {
@@ -1465,6 +1922,7 @@ impl BuckTestOrchestrator<'_> {
                 execution_kind: Some(execution_kind),
                 outputs,
                 command_execution,
+                local_case: local_case_outcome,
             },
             CommandExecutionStatus::TimedOut {
                 duration,
@@ -1477,6 +1935,7 @@ impl BuckTestOrchestrator<'_> {
                 execution_kind: Some(execution_kind),
                 outputs,
                 command_execution,
+                local_case: local_case_outcome,
             },
             CommandExecutionStatus::Error {
                 error,
@@ -1492,6 +1951,7 @@ impl BuckTestOrchestrator<'_> {
                 execution_kind,
                 outputs,
                 command_execution,
+                local_case: local_case_outcome,
             },
             CommandExecutionStatus::Cancelled {
                 execution_kind: _,

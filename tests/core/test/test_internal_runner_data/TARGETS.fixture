@@ -22,8 +22,8 @@ python_test(
 )
 
 python_test(
-    name = "internal_cache_unsupported",
+    name = "internal_cache_request",
     internal = True,
     local_case_cache = True,
-    script = "raise AssertionError('strict test child was launched')",
+    script = "import sys; sys.exit(0)",
 )

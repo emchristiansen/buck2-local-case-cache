@@ -99,7 +99,6 @@ use buck2_server_ctx::tpx_experiment_util::get_tpx_experiments;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStatus;
 use buck2_test_api::protocol::TestExecutor;
-use buck2_test_api::protocol::TestOrchestrator;
 use dice::DiceTransaction;
 use dice::LinearRecomputeDiceComputations;
 use dice_futures::cancellation::CancellationContext;
@@ -115,6 +114,7 @@ use futures::stream::TryStreamExt;
 use itertools::Itertools;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::internal_runner::InternalTestOrchestrator;
 use crate::downward_api::BuckTestDownwardApi;
 use crate::executor_launcher::ExecutorLaunch;
 use crate::executor_launcher::ExecutorLauncher;
@@ -1014,7 +1014,8 @@ struct TestDriverState<'a, 'e> {
     global_cfg_options: &'a GlobalCfgOptions,
     session: &'a Arc<TestSession>,
     test_executor: &'a Arc<dyn TestExecutor + 'e>,
-    internal_orchestrator: &'a tokio::sync::OnceCell<Arc<dyn TestOrchestrator + Send + Sync>>,
+    internal_orchestrator:
+        &'a tokio::sync::OnceCell<Arc<dyn InternalTestOrchestrator + Send + Sync>>,
     internal_test_status_sender: &'a mpsc::UnboundedSender<buck2_error::Result<ExecutorMessage>>,
     liveliness_observer: &'a Arc<dyn LivelinessObserver>,
     cell_resolver: &'a CellResolver,
@@ -1627,8 +1628,6 @@ async fn test_target<'a, 'e>(
                 return Ok(None);
             }
 
-            crate::local_result_cache::require_internal_provider_support(&internal_provider)?;
-
             let handle = build_configured_target_handle(
                 target.dupe(),
                 driver_state.session,
@@ -1651,7 +1650,7 @@ async fn test_target<'a, 'e>(
                     .await
                     .buck_error_context("Failed to create internal BuckTestOrchestrator")?;
                     Ok::<_, buck2_error::Error>(
-                        Arc::new(orchestrator) as Arc<dyn TestOrchestrator + Send + Sync>
+                        Arc::new(orchestrator) as Arc<dyn InternalTestOrchestrator + Send + Sync>
                     )
                 })
                 .await?;

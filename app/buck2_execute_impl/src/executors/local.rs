@@ -677,8 +677,10 @@ impl LocalExecutor {
             })
         }));
         let daemon_id = self.daemon_id.to_string();
-        env.push(("BUCK2_DAEMON_UUID", StrOrOsStr::from(&*daemon_id)));
-        env.push(("BUCK_BUILD_ID", StrOrOsStr::from(build_id)));
+        if !request.omit_local_invocation_identity_env() {
+            env.push(("BUCK2_DAEMON_UUID", StrOrOsStr::from(&*daemon_id)));
+            env.push(("BUCK_BUILD_ID", StrOrOsStr::from(build_id)));
+        }
 
         let liveliness_observer = manager.inner.liveliness_observer.dupe().and(cancellation);
 
@@ -1628,6 +1630,65 @@ pub fn apply_local_execution_environment(
         builder.set(key, val);
     }
     builder.set("PWD", working_directory.as_path());
+}
+
+/// The complete environment, in installation order with later keys replacing earlier ones, that
+/// the local executor installs for `request` running in `working_directory` (absolute).
+///
+/// Only requests whose environment is fully determined by the request are described: the
+/// inheritance must clear the daemon environment, and the request must have no scratch path, no
+/// local resources and no worker, and must omit the invocation identity variables. Any other
+/// request returns `None`, since part of its child environment is chosen during execution.
+pub fn determined_local_environment(
+    request: &CommandExecutionRequest,
+    working_directory: &AbsPath,
+) -> Option<Vec<(OsString, OsString)>> {
+    let inheritance = request.local_environment_inheritance()?;
+    if !inheritance.clear()
+        || !request.omit_local_invocation_identity_env()
+        || !request.required_local_resources().is_empty()
+        || request.worker().is_some()
+        || request
+            .inputs()
+            .iter()
+            .any(|input| matches!(input, CommandExecutionInput::ScratchPath(..)))
+    {
+        return None;
+    }
+    let mut recorded = RecordedEnvironment::default();
+    apply_local_execution_environment(
+        &mut recorded,
+        working_directory,
+        request.env().iter(),
+        Some(inheritance),
+    );
+    Some(recorded.0)
+}
+
+#[derive(Default)]
+struct RecordedEnvironment(Vec<(OsString, OsString)>);
+
+impl EnvironmentBuilder for RecordedEnvironment {
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn set<K, V>(&mut self, key: K, val: V)
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
+        self.remove(key.as_ref());
+        self.0
+            .push((key.as_ref().to_os_string(), val.as_ref().to_os_string()));
+    }
+
+    fn remove<K>(&mut self, key: K)
+    where
+        K: AsRef<OsStr>,
+    {
+        self.0.retain(|(k, _)| k.as_os_str() != key.as_ref());
+    }
 }
 
 pub trait EnvironmentBuilder {

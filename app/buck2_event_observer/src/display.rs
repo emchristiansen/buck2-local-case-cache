@@ -654,6 +654,8 @@ pub fn display_executor_stage(
             }
         }
         Stage::CacheHit(..) => "re_download",
+        Stage::LocalTestResultCacheQuery(..) => "local_test_result_cache_query",
+        Stage::LocalTestResultCache(..) => "local_test_result_cache",
         Stage::Re(re) => {
             use buck2_data::re_stage::Stage;
 
@@ -744,7 +746,11 @@ pub fn is_active_execution_stage(event: &BuckEvent) -> bool {
                 | None => false,
             }
         }
-        Stage::Prepare(..) | Stage::CacheQuery(..) | Stage::CacheHit(..) => false,
+        Stage::Prepare(..)
+        | Stage::CacheQuery(..)
+        | Stage::CacheHit(..)
+        | Stage::LocalTestResultCacheQuery(..)
+        | Stage::LocalTestResultCache(..) => false,
     }
 }
 

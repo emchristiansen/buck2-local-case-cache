@@ -68,13 +68,31 @@ async def test_internal_provider_without_cache_permission(buck: Buck) -> None:
 
 @buck_test()
 @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_cache_request_refuses_before_listing_or_test(buck: Buck) -> None:
-    await expect_failure(
-        buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            ":internal_cache_unsupported",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-        stderr_regex="Local exact-case result reuse refused",
+async def test_internal_cache_request_without_root_executes_normally(buck: Buck) -> None:
+    # Reuse needs an explicitly configured store; without one the case runs and nothing is
+    # published.
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        ":internal_cache_request",
+        test_executor=INTERNAL_TEST_EXECUTOR,
     )
+    assert "no [test] local_case_result_cache_root is configured" in result.stderr
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_internal_cache_request_with_literal_tool_executes_normally(
+    buck: Buck,
+) -> None:
+    # `fbpython` is found through PATH, so the command is not bound to its declared inputs:
+    # the case is ineligible and executes normally instead of being reused.
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        f"test.local_case_result_cache_root={buck.cwd / 'local-case-store'}",
+        ":internal_cache_request",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert "argv[0] `fbpython` is found through the working directory or PATH" in result.stderr

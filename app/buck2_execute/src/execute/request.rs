@@ -413,6 +413,12 @@ pub struct CommandExecutionRequest {
     /// ignoring the inherited `network_access` policy; no effect on RE. Set by the test
     /// orchestrator's `disable_local_network_isolation`, which explains the rationale.
     disable_local_network_isolation: bool,
+
+    /// When set, the local executor does not add the per-daemon and per-invocation identifiers
+    /// (`BUCK2_DAEMON_UUID`, `BUCK_BUILD_ID`) to the child environment. A local test-result
+    /// reuse contract sets this so that the child's actual environment is exactly the
+    /// environment its reuse key records.
+    omit_local_invocation_identity_env: bool,
 }
 
 impl CommandExecutionRequest {
@@ -452,6 +458,7 @@ impl CommandExecutionRequest {
             skip_resource_control: false,
             network_access: None,
             disable_local_network_isolation: false,
+            omit_local_invocation_identity_env: false,
         }
     }
 
@@ -758,6 +765,15 @@ impl CommandExecutionRequest {
 
     pub fn disable_local_network_isolation(&self) -> bool {
         self.disable_local_network_isolation
+    }
+
+    pub fn with_omit_local_invocation_identity_env(mut self, omit: bool) -> Self {
+        self.omit_local_invocation_identity_env = omit;
+        self
+    }
+
+    pub fn omit_local_invocation_identity_env(&self) -> bool {
+        self.omit_local_invocation_identity_env
     }
 }
 

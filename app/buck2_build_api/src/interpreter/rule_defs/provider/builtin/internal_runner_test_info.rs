@@ -229,6 +229,28 @@ impl<'v> InternalRunnerTestInfo<'v> {
             .unwrap_or(false)
     }
 
+    /// The content that alone determines the listing and result parsers, if both are
+    /// self-contained: each is the top-level `def` bound to its own name in a file whose module
+    /// loads nothing, imports nothing and binds only such `def`s with literal defaults. The
+    /// identity is each callable's name and its file's name and complete text. A parser that
+    /// reaches any other file or module-level value has no such identity, and the error says why.
+    pub fn self_contained_parser_identity(&self) -> Result<String, String> {
+        fn callable(role: &str, value: Value<'_>) -> Result<String, String> {
+            let source = value
+                .self_contained_function_source()
+                .map_err(|reason| format!("{role}: {reason}"))?;
+            Ok(format!(
+                "{role}: {}; file={}; source[{}]={}\n",
+                value.to_repr(),
+                source.filename,
+                source.source.len(),
+                source.source
+            ))
+        }
+        Ok(callable("parse_test_listing", self.parse_test_listing.get())?
+            + &callable("parse_test_result", self.parse_test_result.get())?)
+    }
+
     pub fn default_executor(&self) -> Option<&'v StarlarkCommandExecutorConfig> {
         self.default_executor.map(|v| v.as_ref())
     }
