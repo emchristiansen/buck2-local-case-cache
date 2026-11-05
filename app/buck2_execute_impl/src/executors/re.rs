@@ -401,7 +401,10 @@ impl PreparedCommandExecutor for ReExecutor {
             materialized_outputs_for_failed_actions: None,
         });
 
-        if command.request.executor_preference().requires_local() {
+        // Only the local executor creates scratch subdirectories.
+        if command.request.executor_preference().requires_local()
+            || !command.request.scratch_subdirectories().is_empty()
+        {
             return ControlFlow::Break(
                 manager.error("remote_prepare", RemoteExecutorError::LocalOnlyAction),
             )?;

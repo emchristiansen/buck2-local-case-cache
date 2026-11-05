@@ -190,6 +190,7 @@ use sorted_vector_map::SortedVectorMap;
 
 use crate::command::InternalRunnerConfig;
 use crate::internal_runner::InternalTestOrchestrator;
+use crate::local_case_fresh_dirs::FreshDirs;
 use crate::local_result_cache::ConstrainedCase;
 use crate::local_result_cache::LocalCaseAdmission;
 use crate::local_result_cache::LocalCaseGap;
@@ -255,6 +256,14 @@ impl OwnedTestInfo {
             }
             (None, Some(external)) => Ok(Some(Self::External(external))),
             (None, None) => Ok(None),
+        }
+    }
+
+    /// The names whose variables each test case process receives naming a fresh directory.
+    fn fresh_dir_env(&self) -> Vec<&str> {
+        match self {
+            Self::External(_) => Vec::new(),
+            Self::Internal(info) => info.as_ref().value().as_ref().fresh_dir_env().collect(),
         }
     }
 
@@ -763,12 +772,26 @@ impl<'a> BuckTestOrchestrator<'a> {
         let ExpandedTestExecutable {
             cwd,
             cmd: expanded_cmd,
-            env: expanded_env,
+            env: mut expanded_env,
             ensured_inputs,
             supports_re,
             declared_outputs,
             worker,
         } = test_executable_expanded;
+        let fresh_dirs =
+            FreshDirs::for_stage(&test_target, stage.as_ref(), test_info.fresh_dir_env(), fs)?;
+        if let Some(fresh_dirs) = &fresh_dirs {
+            for (name, value) in fresh_dirs.env()? {
+                if expanded_env.insert(name.clone(), value).is_some() {
+                    return Err(ExecuteError::Error(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "`fresh_dir_env` entry `{}` of {} is also set in the test environment",
+                        name,
+                        test_target
+                    )));
+                }
+            }
+        }
 
         let input_deps_action_keys: Vec<_> = ensured_inputs
             .iter()
@@ -780,7 +803,23 @@ impl<'a> BuckTestOrchestrator<'a> {
             .into_iter()
             .collect();
 
-        let executor_preference = Self::executor_preference(options, supports_re)?;
+        let mut executor_preference = Self::executor_preference(options, supports_re)?;
+        if fresh_dirs.is_some() {
+            // Only the local executor creates the fresh directories, and their values are local
+            // absolute paths.
+            executor_preference = executor_preference.and(ExecutorPreference::LocalRequired)?;
+            if !test_executor
+                .executor()
+                .is_local_execution_possible(executor_preference)
+            {
+                return Err(ExecuteError::Error(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "{} declares `fresh_dir_env`, which needs local execution, but its executor \
+                    cannot run it locally",
+                    test_target
+                )));
+            }
+        }
         let required_resources = if test_executor
             .executor()
             .is_local_execution_possible(executor_preference)
@@ -836,6 +875,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             test_executor.re_dynamic_image(),
             test_executor.meta_internal_extra_params(),
             disable_local_network_isolation,
+            fresh_dirs.as_ref(),
         )
         .boxed()
         .await?;
@@ -862,6 +902,7 @@ impl<'a> BuckTestOrchestrator<'a> {
                             .map(|c| c.as_str().to_owned())
                             .collect(),
                     },
+                    fresh_dirs.as_ref(),
                     |preference| {
                         test_executor
                             .executor()
@@ -888,6 +929,7 @@ impl<'a> BuckTestOrchestrator<'a> {
             test_executor.re_cache_enabled(),
             effective_test_execution_caching,
             local_case,
+            fresh_dirs,
         )
         .boxed()
         .await?;
@@ -1381,6 +1423,14 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             declared_outputs,
             worker,
         } = test_executable_expanded;
+        // The command runs out of process after this returns, so no scratch lease could cover it.
+        if FreshDirs::for_stage(&test_target, &stage, test_info.fresh_dir_env(), fs)?.is_some() {
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "{} declares `fresh_dir_env`, which only Buck2's own test execution provides",
+                test_target
+            ));
+        }
 
         let execution_request = Self::create_command_execution_request(
             &mut self.dice.dupe().ctx(),
@@ -1398,6 +1448,7 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             test_executor.re_dynamic_image(),
             test_executor.meta_internal_extra_params(),
             disable_local_network_isolation,
+            None,
         )
         .await?;
 
@@ -1541,6 +1592,7 @@ impl BuckTestOrchestrator<'_> {
         cancellation: &CancellationContext,
         project_fs: &ProjectRoot,
         current_attempt: String,
+        fresh_dirs: Option<&FreshDirs>,
     ) -> (CommandExecutionResult, LocalCaseOutcome) {
         let request = prepared_command.request;
         let action_digest = prepared_command.prepared_action.digest();
@@ -1632,6 +1684,12 @@ impl BuckTestOrchestrator<'_> {
             }
             LocalCaseStart::Begun(pending) => pending,
         };
+        // Under the key's lease, and before the executor removes the scratch path. A holder of a
+        // scratch lease never waits for a key's lease, so the two cannot deadlock.
+        let pending = match fresh_dirs {
+            Some(fresh_dirs) => pending.holding(fresh_dirs.lease().await),
+            None => pending,
+        };
 
         // Execution and settlement form one critical section: a cancelled case is not dropped
         // between them, so its child is killed and the streams it already wrote are settled into
@@ -1720,6 +1778,7 @@ impl BuckTestOrchestrator<'_> {
         re_cache_enabled: bool,
         supports_test_execution_caching: bool,
         local_case: Option<ConstrainedCase>,
+        fresh_dirs: Option<FreshDirs>,
     ) -> Result<ExecuteData, ExecuteError> {
         let events = dice.per_transaction_data().get_dispatcher().dupe();
         let project_fs = executor.fs().fs().dupe();
@@ -1860,6 +1919,9 @@ impl BuckTestOrchestrator<'_> {
                 let current_attempt = events.trace_id().to_string();
                 events
                     .span_async(start, async move {
+                        // An untracked execution holds the fresh-directory scratch path until its
+                        // command has run; a tracked case takes it under its key's lease and
+                        // keeps it with its result.
                         let result = if let Some((what, e)) = launch_failure {
                             manager.error(what, e)
                         } else if let Some(local_case) = local_case {
@@ -1871,10 +1933,16 @@ impl BuckTestOrchestrator<'_> {
                                 cancellation,
                                 &project_fs,
                                 current_attempt,
+                                fresh_dirs.as_ref(),
                             )
                             .await;
                             *local_case_outcome = outcome;
                             result
+                        } else if let Some(fresh_dirs) = &fresh_dirs {
+                            let _scratch = fresh_dirs.lease().await;
+                            executor
+                                .exec_cmd(manager, &prepared_command, cancellation)
+                                .await
                         } else if supports_test_execution_caching {
                             match executor
                                 .action_cache(manager, &prepared_command, cancellation)
@@ -2354,10 +2422,12 @@ impl BuckTestOrchestrator<'_> {
         re_dynamic_image: Option<RemoteExecutorCustomImage>,
         meta_internal_extra_params: Arc<MetaInternalExtraParams>,
         disable_local_network_isolation: bool,
+        fresh_dirs: Option<&FreshDirs>,
     ) -> buck2_error::Result<CommandExecutionRequest> {
         let inputs = ensured_inputs
             .into_iter()
             .map(|(_, v)| CommandExecutionInput::Artifact(Box::new(v)))
+            .chain(fresh_dirs.map(FreshDirs::input))
             .collect_vec();
 
         // NOTE: This looks a bit awkward, that's because fbcode's rustfmt and ours slightly
@@ -2397,6 +2467,9 @@ impl BuckTestOrchestrator<'_> {
             .with_meta_internal_extra_params(meta_internal_extra_params)
             .with_required_local_resources(required_local_resources)?
             .with_disable_local_network_isolation(disable_local_network_isolation)
+            .with_scratch_subdirectories(
+                fresh_dirs.map(FreshDirs::subdirectories).unwrap_or_default(),
+            )
             .with_is_test();
         if let Some(timeout) = timeout {
             request = request.with_timeout(timeout)

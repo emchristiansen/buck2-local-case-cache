@@ -72,6 +72,7 @@ use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_execute_impl::executors::local::determined_local_environment;
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
@@ -79,6 +80,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::local_case_closure::InputTree;
+use crate::local_case_fresh_dirs::FreshDirs;
+use crate::local_case_fresh_dirs::ScratchLease;
 use crate::local_case_closure::LaunchFacts;
 use crate::local_case_closure::LaunchPlan;
 
@@ -166,7 +169,7 @@ impl DiscoveryIdentity {
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     FileDigest::from_content_for_algorithm(bytes, DigestAlgorithm::Sha256)
         .raw_digest()
         .to_string()
@@ -291,10 +294,14 @@ impl LocalCaseCandidate {
     /// local execution only, and no injected per-invocation identity variables.
     ///
     /// The request is returned unchanged when it does not qualify.
+    ///
+    /// The only scratch path admitted is the engine's own fresh-directory scratch path for this
+    /// request, `fresh_dirs`, exactly as the engine set it up.
     pub(crate) fn constrain(
         self,
         request: CommandExecutionRequest,
         facts: RequestFacts<'_>,
+        fresh_dirs: Option<&FreshDirs>,
         local_execution_possible: impl FnOnce(ExecutorPreference) -> bool,
     ) -> (
         CommandExecutionRequest,
@@ -311,7 +318,8 @@ impl LocalCaseCandidate {
                 input,
                 buck2_execute::execute::request::CommandExecutionInput::ScratchPath(..)
             )
-        }) {
+        }) && !fresh_dirs.is_some_and(|fresh_dirs| fresh_dirs.admits(&request))
+        {
             Some(LocalCaseGap::ScratchPath)
         } else if !request
             .local_environment_inheritance()
@@ -338,7 +346,8 @@ impl LocalCaseCandidate {
             omit_local_invocation_identity_env: request.omit_local_invocation_identity_env(),
         };
         let request = request.with_omit_local_invocation_identity_env(true);
-        let launch = match Self::launch_plan(&request, &facts) {
+        let scratch = fresh_dirs.map(|fresh_dirs| fresh_dirs.absolute().clone());
+        let launch = match Self::launch_plan(&request, &facts, scratch.as_deref().map(AsRef::<AbsPath>::as_ref)) {
             Ok(launch) => launch,
             Err(gap) => return (legacy.restore(request), Err(gap)),
         };
@@ -352,6 +361,7 @@ impl LocalCaseCandidate {
                 case: self.case,
                 launch,
                 legacy,
+                scratch,
             }),
         )
     }
@@ -360,9 +370,10 @@ impl LocalCaseCandidate {
     fn launch_plan(
         request: &CommandExecutionRequest,
         facts: &RequestFacts<'_>,
+        scratch: Option<&AbsPath>,
     ) -> Result<LaunchPlan, LocalCaseGap> {
         let working_directory = facts.project_fs.resolve(request.working_directory());
-        let env = determined_local_environment(request, &working_directory)
+        let env = determined_local_environment(request, &working_directory, scratch)
             .ok_or(LocalCaseGap::InheritedDaemonEnvironment)?;
         let tree = InputTree::new(request.paths().input_directory());
         LaunchPlan::new(
@@ -405,6 +416,8 @@ pub(crate) struct ConstrainedCase {
     case: CaseIdentity,
     launch: LaunchPlan,
     legacy: LegacyRequest,
+    /// The engine's fresh-directory scratch path, absolute, if the request has one.
+    scratch: Option<AbsNormPathBuf>,
 }
 
 /// Facts about the prepared action that enter the key.
@@ -446,7 +459,12 @@ impl ConstrainedCase {
         request: &CommandExecutionRequest,
         prepared: PreparedFacts<'_>,
     ) -> Result<LocalCaseKey, LocalCaseGap> {
-        let environment = determined_local_environment(request, prepared.working_directory)
+        let environment =
+            determined_local_environment(
+                request,
+                prepared.working_directory,
+                self.scratch.as_deref().map(AsRef::<AbsPath>::as_ref),
+            )
             .ok_or(LocalCaseGap::InheritedDaemonEnvironment)?;
         Ok(LocalCaseKey::new(KeyMaterial {
             engine: engine_identity()?,
@@ -545,17 +563,17 @@ impl LocalCaseKey {
 /// Length-delimited `(name, value)` fields; no field boundary can be forged by another field's
 /// bytes.
 #[derive(Default)]
-struct KeyRecord(Vec<u8>);
+pub(crate) struct KeyRecord(pub(crate) Vec<u8>);
 
 impl KeyRecord {
-    fn field(&mut self, name: &str, value: &[u8]) {
+    pub(crate) fn field(&mut self, name: &str, value: &[u8]) {
         self.0.extend((name.len() as u64).to_be_bytes());
         self.0.extend(name.as_bytes());
         self.0.extend((value.len() as u64).to_be_bytes());
         self.0.extend(value);
     }
 
-    fn count(&mut self, name: &str, count: usize) {
+    pub(crate) fn count(&mut self, name: &str, count: usize) {
         self.field(name, &(count as u64).to_be_bytes());
     }
 }
@@ -1541,6 +1559,7 @@ mod store {
                     guard: self,
                     generation,
                     origin: attempt.to_owned(),
+                    scratch: None,
                 }),
             })
         }
@@ -1685,6 +1704,9 @@ mod store {
         guard: KeyGuard,
         generation: u64,
         origin: String,
+        /// The fresh-directory scratch path the attempt's execution uses, held as long as the
+        /// key's lease: until the generation is published or recorded unsuccessful.
+        scratch: Option<ScratchLease>,
     }
 
     /// A durable pending generation, holding the key's lease, whose child has not yet produced
@@ -1697,6 +1719,14 @@ mod store {
     }
 
     impl PendingCase {
+        /// Hold `scratch` for as long as this attempt holds its key's lease.
+        pub(crate) fn holding(mut self, scratch: ScratchLease) -> Self {
+            if let Some(attempt) = self.attempt.as_mut() {
+                attempt.scratch = Some(scratch);
+            }
+            self
+        }
+
         /// Keep the exact raw streams of a local exit-0 execution until it is confirmed.
         pub(crate) fn capture(mut self, original: ExecutionRecord) -> CapturedCase {
             CapturedCase {
@@ -1912,6 +1942,9 @@ mod store {
     }
 
     impl PendingCase {
+        pub(crate) fn holding(self, _scratch: ScratchLease) -> Self {
+            match self.0 {}
+        }
         pub(crate) fn capture(self, _original: ExecutionRecord) -> CapturedCase {
             match self.0 {}
         }
@@ -2795,12 +2828,12 @@ mod tests {
                 request.omit_local_invocation_identity_env(),
                 request.all_args_vec(),
                 request.env().clone(),
-                determined_local_environment(request, project.root()).is_some(),
+                determined_local_environment(request, project.root(), None).is_some(),
             )
         };
 
         let args = vec![script, "module::case"];
-        let (constrained, case) = candidate().constrain(make(args.clone()), facts(), |_| true);
+        let (constrained, case) = candidate().constrain(make(args.clone()), facts(), None, |_| true);
         let case = case.expect("the case is eligible before its launch check");
         assert_eq!(
             constrained.executor_preference(),
@@ -2820,7 +2853,7 @@ mod tests {
 
         // An earlier classification failure gives back the same legacy request.
         let args = vec![script, "module::case", "/etc/hostname"];
-        let (earlier, case) = candidate().constrain(make(args.clone()), facts(), |_| true);
+        let (earlier, case) = candidate().constrain(make(args.clone()), facts(), None, |_| true);
         assert!(case.is_err());
         assert_eq!(legacy_policy(&earlier), legacy_policy(&make(args)));
         // Neither touched the store.

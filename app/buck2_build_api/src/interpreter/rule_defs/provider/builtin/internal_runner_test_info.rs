@@ -114,6 +114,11 @@ pub struct InternalRunnerTestInfo<'v> {
     /// remote action-cache permission or proof that the case is eligible.
     supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
 
+    /// Environment variables each test case process receives naming a new, empty directory of
+    /// its own, in declaration order. Listing gets none. This is of type `list[str]`; each name is
+    /// a valid variable name, appears once, and is neither `PWD` nor a key of `env`.
+    fresh_dir_env: ValueOfUnchecked<'v, ListType<String>>,
+
     /// Default executor to use to run tests. If none is
     /// passed we will default to the execution platform.
     default_executor: Option<ValueTyped<'v, StarlarkCommandExecutorConfig>>,
@@ -219,6 +224,11 @@ impl<'v> InternalRunnerTestInfo<'v> {
             .unwrap()
             .into_option()
             .unwrap_or(true)
+    }
+
+    /// The names `fresh_dir_env` declares, in declaration order.
+    pub fn fresh_dir_env(&self) -> impl Iterator<Item = &'v str> {
+        unwrap_all(iter_opt_str_list(self.fresh_dir_env.get(), "fresh_dir_env"))
     }
 
     pub fn supports_test_execution_caching(&self) -> bool {
@@ -528,6 +538,44 @@ impl<'v> InternalRunnerTestInfo<'v> {
     }
 }
 
+/// `fresh_dir_env` names variables the engine sets itself, so each must be a variable name that
+/// nothing else sets: not `PWD`, which the executor sets, not a key of `env`, and not repeated.
+fn check_fresh_dir_env(info: &InternalRunnerTestInfo<'_>) -> buck2_error::Result<()> {
+    let env_names = iter_test_env(info.env.get())
+        .map(|entry| entry.map(|(name, _)| name))
+        .collect::<buck2_error::Result<Vec<&str>>>()?;
+    let mut seen = Vec::new();
+    for name in iter_opt_str_list(info.fresh_dir_env.get(), "fresh_dir_env") {
+        let name = name?;
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+        let problem = if !valid {
+            Some("is not a valid environment variable name")
+        } else if name == "PWD" {
+            Some("is set by the executor")
+        } else if env_names.contains(&name) {
+            Some("is also a key of `env`")
+        } else if seen.contains(&name) {
+            Some("is declared more than once")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "`fresh_dir_env` entry `{}` {}",
+                name,
+                problem
+            ));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
 fn validate_internal_runner_test_info<'v>(
     info: &InternalRunnerTestInfo<'v>,
 ) -> buck2_error::Result<()> {
@@ -550,6 +598,7 @@ fn validate_internal_runner_test_info<'v>(
         }
     }
     check_all(iter_test_env(info.env.get()))?;
+    check_fresh_dir_env(info)?;
     check_all(iter_opt_str_list(info.labels.get(), "labels"))?;
     check_all(iter_opt_str_list(info.contacts.get(), "contacts"))?;
     check_all(iter_executor_overrides(info.executor_overrides.get()))?;
@@ -631,6 +680,7 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(default = NoneType)] required_local_resources: Value<'v>,
         #[starlark(default = NoneOr::None)] worker: NoneOr<ValueTyped<'v, WorkerInfo<'v>>>,
         #[starlark(default = NoneType)] supports_test_execution_caching: Value<'v>,
+        #[starlark(default = NoneType)] fresh_dir_env: Value<'v>,
     ) -> starlark::Result<InternalRunnerTestInfo<'v>> {
         let res = InternalRunnerTestInfo {
             test_type: ValueOfUnchecked::new(r#type),
@@ -642,6 +692,7 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             use_project_relative_paths: ValueOfUnchecked::new(use_project_relative_paths),
             run_from_project_root: ValueOfUnchecked::new(run_from_project_root),
             supports_test_execution_caching: ValueOfUnchecked::new(supports_test_execution_caching),
+            fresh_dir_env: ValueOfUnchecked::new(fresh_dir_env),
             default_executor: default_executor.into_option(),
             executor_overrides: ValueOfUnchecked::new(executor_overrides),
             local_resources: ValueOfUnchecked::new(local_resources),

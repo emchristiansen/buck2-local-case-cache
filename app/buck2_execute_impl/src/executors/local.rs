@@ -89,6 +89,7 @@ use buck2_fs::async_fs_util;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckIndexMap;
 use buck2_resource_control::ActionFreezeEvent;
 use buck2_resource_control::ActionFreezeEventReceiver;
@@ -640,7 +641,7 @@ impl LocalExecutor {
 
         let scratch_path_abs;
 
-        if let Some(scratch_path) = &scratch_path.0 {
+        if let Some(scratch_path) = &scratch_path.path {
             // For the $TMPDIR - important it is absolute
             scratch_path_abs = self.artifact_fs.fs().resolve(scratch_path);
 
@@ -656,11 +657,11 @@ impl LocalExecutor {
                         ),
                     );
                 }
-                env.push(("TEMP", StrOrOsStr::OsStr(scratch_path_abs.as_os_str())));
-                env.push(("TMP", StrOrOsStr::OsStr(scratch_path_abs.as_os_str())));
-            } else {
-                env.push(("TMPDIR", StrOrOsStr::OsStr(scratch_path_abs.as_os_str())));
             }
+            env.extend(
+                scratch_environment(&scratch_path_abs)
+                    .map(|(key, value)| (key, StrOrOsStr::OsStr(value))),
+            );
         }
         env.extend(
             request
@@ -1337,7 +1338,10 @@ pub async fn materialize_inputs(
     mut outputs: Vec<ProjectRelativePathBuf>,
 ) -> buck2_error::Result<MaterializedInputPaths> {
     let mut artifacts = vec![];
-    let mut scratch = ScratchPath(None);
+    let mut scratch = ScratchPath {
+        path: None,
+        subdirectories: request.scratch_subdirectories().to_vec(),
+    };
     let mut configuration_path_to_content_based_path_symlinks = vec![];
 
     for input in request.inputs().iter().chain(
@@ -1398,13 +1402,13 @@ pub async fn materialize_inputs(
                 // The action writes into its scratch path, so it is an output for leasing.
                 let path = artifact_fs.buck_out_path_resolver().resolve_scratch(path)?;
 
-                if scratch.0.is_some() {
+                if scratch.path.is_some() {
                     return Err(buck2_error::internal_error!(
                         "Multiple scratch paths for one action"
                     ));
                 }
                 outputs.push(path.clone());
-                scratch.0 = Some(path);
+                scratch.path = Some(path);
             }
             CommandExecutionInput::IncrementalRemoteOutput(..) => {
                 // Ignore, should be already materialized
@@ -1448,6 +1452,12 @@ pub async fn materialize_inputs(
         Err(e) => return Err(e.into()),
     };
 
+    if scratch.path.is_none() && !scratch.subdirectories.is_empty() {
+        return Err(buck2_error::internal_error!(
+            "Scratch subdirectories requested for an action without a scratch path"
+        ));
+    }
+
     Ok(MaterializedInputPaths {
         scratch,
         paths,
@@ -1456,18 +1466,28 @@ pub async fn materialize_inputs(
     })
 }
 
-/// A scratch path discovered during `materialize_inputs`.
-pub struct ScratchPath(Option<ProjectRelativePathBuf>);
+/// A scratch path discovered during `materialize_inputs`, with the empty subdirectories the
+/// request asks for inside it.
+pub struct ScratchPath {
+    path: Option<ProjectRelativePathBuf>,
+    subdirectories: Vec<ForwardRelativePathBuf>,
+}
 
+/// Make the scratch path an empty directory, holding only its requested empty subdirectories.
 pub async fn prep_scratch_path(
     scratch_path: &ScratchPath,
     artifact_fs: &ArtifactFs,
 ) -> buck2_error::Result<()> {
-    let Some(path) = scratch_path.0.as_ref() else {
+    let Some(path) = scratch_path.path.as_ref() else {
         return Ok(());
     };
     CleanOutputPaths::clean(std::iter::once(path.as_ref()), artifact_fs.fs())?;
-    async_fs_util::create_dir_all(artifact_fs.fs().resolve(path)).await
+    let path = artifact_fs.fs().resolve(path);
+    async_fs_util::create_dir_all(&path).await?;
+    for subdirectory in &scratch_path.subdirectories {
+        async_fs_util::create_dir_all(path.join(subdirectory)).await?;
+    }
+    Ok(())
 }
 
 async fn check_inputs(
@@ -1652,34 +1672,57 @@ pub fn apply_local_execution_environment(
     builder.set("PWD", working_directory.as_path());
 }
 
+/// The variables the local executor sets to a request's scratch path (absolute), before the
+/// request's own environment.
+fn scratch_environment(scratch: &AbsPath) -> impl Iterator<Item = (&'static str, &OsStr)> {
+    let names: &[&'static str] = if cfg!(windows) {
+        &["TEMP", "TMP"]
+    } else {
+        &["TMPDIR"]
+    };
+    names.iter().map(move |name| (*name, scratch.as_os_str()))
+}
+
 /// The complete environment, in installation order with later keys replacing earlier ones, that
 /// the local executor installs for `request` running in `working_directory` (absolute).
 ///
 /// Only requests whose environment is fully determined by the request are described: the
-/// inheritance must clear the daemon environment, and the request must have no scratch path, no
-/// local resources and no worker, and must omit the invocation identity variables. Any other
-/// request returns `None`, since part of its child environment is chosen during execution.
+/// inheritance must clear the daemon environment, and the request must have no local resources
+/// and no worker, and must omit the invocation identity variables. A request with a scratch path
+/// is described only given `scratch`, that path resolved to an absolute path by the caller, since
+/// the executor sets variables to it. Any other request returns `None`, since part of its child
+/// environment is chosen during execution.
 pub fn determined_local_environment(
     request: &CommandExecutionRequest,
     working_directory: &AbsPath,
+    scratch: Option<&AbsPath>,
 ) -> Option<Vec<(OsString, OsString)>> {
     let inheritance = request.local_environment_inheritance()?;
+    let has_scratch = request
+        .inputs()
+        .iter()
+        .any(|input| matches!(input, CommandExecutionInput::ScratchPath(..)));
     if !inheritance.clear()
         || !request.omit_local_invocation_identity_env()
         || !request.required_local_resources().is_empty()
         || request.worker().is_some()
-        || request
-            .inputs()
-            .iter()
-            .any(|input| matches!(input, CommandExecutionInput::ScratchPath(..)))
+        || has_scratch != scratch.is_some()
     {
         return None;
     }
     let mut recorded = RecordedEnvironment::default();
+    let scratch_env = scratch.into_iter().flat_map(scratch_environment);
     apply_local_execution_environment(
         &mut recorded,
         working_directory,
-        request.env().iter(),
+        scratch_env
+            .map(|(key, value)| (OsStr::new(key), value))
+            .chain(
+                request
+                    .env()
+                    .iter()
+                    .map(|(key, value)| (OsStr::new(key.as_str()), OsStr::new(value.as_str()))),
+            ),
         Some(inheritance),
     );
     Some(recorded.0)

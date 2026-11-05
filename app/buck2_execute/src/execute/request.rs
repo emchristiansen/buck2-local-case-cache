@@ -33,6 +33,7 @@ use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::buck2_error;
+use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckIndexSet;
 use derive_more::Display;
 use dupe::Dupe;
@@ -419,6 +420,11 @@ pub struct CommandExecutionRequest {
     /// reuse contract sets this so that the child's actual environment is exactly the
     /// environment its reuse key records.
     omit_local_invocation_identity_env: bool,
+
+    /// Empty directories the local executor creates inside the request's scratch path each time
+    /// it prepares that path, before the command starts. Only the local executor creates them, so
+    /// a request carrying any must execute locally.
+    scratch_subdirectories: Vec<ForwardRelativePathBuf>,
 }
 
 impl CommandExecutionRequest {
@@ -459,6 +465,7 @@ impl CommandExecutionRequest {
             network_access: None,
             disable_local_network_isolation: false,
             omit_local_invocation_identity_env: false,
+            scratch_subdirectories: Vec::new(),
         }
     }
 
@@ -774,6 +781,15 @@ impl CommandExecutionRequest {
 
     pub fn omit_local_invocation_identity_env(&self) -> bool {
         self.omit_local_invocation_identity_env
+    }
+
+    pub fn with_scratch_subdirectories(mut self, subdirectories: Vec<ForwardRelativePathBuf>) -> Self {
+        self.scratch_subdirectories = subdirectories;
+        self
+    }
+
+    pub fn scratch_subdirectories(&self) -> &[ForwardRelativePathBuf] {
+        &self.scratch_subdirectories
     }
 }
 
