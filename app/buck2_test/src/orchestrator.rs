@@ -192,12 +192,9 @@ use crate::local_result_cache::LocalCaseAdmission;
 use crate::local_result_cache::LocalCaseGap;
 use crate::local_result_cache::LocalCaseOutcome;
 use crate::local_result_cache::LocalCaseResult;
-use crate::local_result_cache::LocalCaseStore;
-use crate::local_result_cache::PendingCase;
-use crate::local_result_cache::ReusedCase;
+use crate::local_result_cache::LocalCaseStart;
+use crate::local_result_cache::settle_execution;
 use crate::local_result_cache::LocalCaseRequest;
-use crate::local_result_cache::Lookup;
-use crate::local_result_cache::ExecutionRecord;
 use crate::local_result_cache::PreparedFacts;
 use crate::local_result_cache::RequestFacts;
 use crate::local_resource_api::LocalResourcesSetupResult;
@@ -986,10 +983,13 @@ impl Display for TestExecutionKey {
     }
 }
 
-/// The first step of a constrained case, taken under its key's lease.
-enum LocalCaseStart {
-    Hit(ReusedCase),
-    Begun(PendingCase),
+/// The outcome of checking a constrained case's launch before its action is prepared.
+enum LaunchCheck {
+    Eligible(ConstrainedCase),
+    /// The case executes with its legacy request and publishes nothing.
+    Ineligible(ConstrainedCase),
+    /// The check itself failed: the case's error, with no child.
+    Failed(&'static str, buck2_error::Error),
 }
 
 /// Timing for a reused result: it waited for no child, so it has no execution interval of its
@@ -1438,14 +1438,10 @@ impl BuckTestOrchestrator<'_> {
     /// Serve a constrained case from the local store, or execute it and capture its success
     /// for confirmation by the internal runner.
     ///
-    /// A hit never reaches `exec_cmd`, so no test child starts. A launched input-tree script
-    /// whose `#!` interpreter is not bound makes the case ineligible: it executes normally and
-    /// publishes nothing. A key, materialization or store failure is the case's error and starts
-    /// no child.
+    /// A hit never reaches `exec_cmd`, so no test child starts. A key or store failure is the
+    /// case's error and starts no child. The case's launch was already checked by
+    /// `check_local_case_launch`.
     async fn execute_local_case(
-        test_target_label: &ConfiguredProvidersLabel,
-        stage: &TestStage,
-        materializer: &dyn Materializer,
         local_case: ConstrainedCase,
         executor: &CommandExecutor,
         manager: CommandExecutionManager,
@@ -1485,95 +1481,25 @@ impl BuckTestOrchestrator<'_> {
             }
         };
 
-        let launched = local_case.launch().executables();
-        if !launched.is_empty() {
-            if let Err(e) = materializer
-                .ensure_materialized(launched, MaterializationPurpose::IntermediateOnly)
-                .await
-            {
-                return (
-                    manager.error("local_case_launch_materialization", e),
-                    LocalCaseOutcome::default(),
-                );
-            }
-        }
-        let launch = local_case.launch().clone();
-        match tokio::task::spawn_blocking(move || launch.verify()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => {
-                Self::report_local_case_gap(
-                    test_target_label,
-                    stage,
-                    LocalCaseGap::UnboundCommandFile(why),
-                );
-                return (
-                    executor
-                        .exec_cmd(manager, prepared_command, cancellation)
-                        .await,
-                    LocalCaseOutcome::default(),
-                );
-            }
-            Err(e) => {
-                return (
-                    manager.error(
-                        "local_case_launch_check",
-                        buck2_error::buck2_error!(
-                            buck2_error::ErrorTag::Environment,
-                            "Local case launch check did not complete: {e}"
-                        ),
-                    ),
-                    LocalCaseOutcome::default(),
-                );
-            }
-        }
-
         let query = buck2_data::LocalTestResultCacheQuery {
             action_digest: key.action_digest().to_owned(),
             cache_key: key.digest().to_owned(),
             current_attempt: current_attempt.clone(),
         };
-        let root = local_case.root().to_owned();
         let reuse = local_case.reuse();
-        let attempt = current_attempt.clone();
-        // One blocking step opens the store, waits for the key's lease and either returns a
-        // verified hit or durably begins the next generation; the lease then stays with the
-        // returned hit or pending attempt. If this future is dropped first, the blocking step
-        // still finishes and its result is dropped, which releases the lease and records any
-        // begun generation as abandoned.
+        // Opens the store, waits for the key's lease without holding a blocking thread, and
+        // either returns a verified hit or durably begins the next generation; the lease then
+        // stays with the returned hit or pending attempt.
         let lookup = executor_stage_async(
             query,
-            tokio::task::spawn_blocking(move || {
-                let store = LocalCaseStore::open(&root)?;
-                let guard = store.lease(&key)?;
-                let guard = if reuse {
-                    match guard.lookup()? {
-                        Lookup::Hit(reused) => return buck2_error::Ok(LocalCaseStart::Hit(reused)),
-                        Lookup::Miss(guard) => guard,
-                    }
-                } else {
-                    guard
-                };
-                Ok(LocalCaseStart::Begun(guard.begin(&attempt)?))
-            }),
+            LocalCaseStart::take(local_case.root(), &key, reuse, &current_attempt),
         )
         .await;
         let lookup = match lookup {
-            Ok(Ok(start)) => start,
-            Ok(Err(e)) => {
-                return (
-                    manager.error("local_case_result_store", e),
-                    LocalCaseOutcome::default(),
-                );
-            }
+            Ok(start) => start,
             Err(e) => {
                 return (
-                    manager.error(
-                        "local_case_result_store",
-                        buck2_error::buck2_error!(
-                            buck2_error::ErrorTag::Environment,
-                            "Local case result store step did not complete: {e}"
-                        ),
-                    ),
+                    manager.error("local_case_result_store", e),
                     LocalCaseOutcome::default(),
                 );
             }
@@ -1618,48 +1544,50 @@ impl BuckTestOrchestrator<'_> {
         let result = executor
             .exec_cmd(manager, prepared_command, cancellation)
             .await;
-        let outcome = match (&result.report.status, &result.report.std_streams) {
-            (
-                CommandExecutionStatus::Success {
-                    execution_kind: CommandExecutionKind::Local { .. },
-                },
-                CommandStdStreams::Local { stdout, stderr },
-            ) if result.report.exit_code == Some(0) => LocalCaseOutcome::new(
-                LocalCaseResult::Captured(pending.capture(ExecutionRecord {
-                    stdout: stdout.clone(),
-                    stderr: stderr.clone(),
-                    status: result.report.status.to_string(),
-                    exit_code: result.report.exit_code,
-                    start_time: result.report.timing.start_time,
-                    execution_time: result.report.timing.execution_time,
-                })),
-            ),
-            _ => {
-                let reason = format!("execution did not succeed locally: {}", result.report.status);
-                // Keep the exact raw streams of a failed, timed-out or errored execution with
-                // its generation. Streams that are not local bytes are not available here.
-                let record = match &result.report.std_streams {
-                    CommandStdStreams::Local { stdout, stderr } => Some(ExecutionRecord {
-                        stdout: stdout.clone(),
-                        stderr: stderr.clone(),
-                        status: result.report.status.to_string(),
-                        exit_code: result.report.exit_code,
-                        start_time: result.report.timing.start_time,
-                        execution_time: result.report.timing.execution_time,
-                    }),
-                    _ => None,
-                };
-                match tokio::task::spawn_blocking(move || pending.reject(&reason, record.as_ref()))
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::warn!("Recording unsuccessful local case failed: {e:#}"),
-                    Err(e) => tracing::warn!("Recording unsuccessful local case failed: {e:#}"),
-                }
-                LocalCaseOutcome::default()
-            }
-        };
+        // A local exit-0 success is captured for confirmation; anything else, including a
+        // cancelled child, records the generation as unsuccessful with the exact raw streams the
+        // executor returned.
+        let outcome = settle_execution(pending, &result.report).await;
         (result, outcome)
+    }
+
+    /// Materialize the input-tree executables a constrained case launches and check their `#!`
+    /// interpreters. A case found ineligible here is given up; the caller restores its legacy
+    /// request, exactly as for a case found ineligible before it was constrained.
+    async fn check_local_case_launch(
+        test_target_label: &ConfiguredProvidersLabel,
+        stage: &TestStage,
+        materializer: &dyn Materializer,
+        local_case: ConstrainedCase,
+    ) -> LaunchCheck {
+        let launched = local_case.launch().executables();
+        if !launched.is_empty() {
+            if let Err(e) = materializer
+                .ensure_materialized(launched, MaterializationPurpose::IntermediateOnly)
+                .await
+            {
+                return LaunchCheck::Failed("local_case_launch_materialization", e);
+            }
+        }
+        let launch = local_case.launch().clone();
+        match tokio::task::spawn_blocking(move || launch.verify()).await {
+            Ok(Ok(())) => LaunchCheck::Eligible(local_case),
+            Ok(Err(why)) => {
+                Self::report_local_case_gap(
+                    test_target_label,
+                    stage,
+                    LocalCaseGap::UnboundCommandFile(why),
+                );
+                LaunchCheck::Ineligible(local_case)
+            }
+            Err(e) => LaunchCheck::Failed(
+                "local_case_launch_check",
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Environment,
+                    "Local case launch check did not complete: {e}"
+                ),
+            ),
+        }
     }
 
     fn executor_preference(
@@ -1689,7 +1617,7 @@ impl BuckTestOrchestrator<'_> {
         test_target_label: &ConfiguredProvidersLabel,
         stage: &TestStage,
         executor: &CommandExecutor,
-        request: CommandExecutionRequest,
+        mut request: CommandExecutionRequest,
         liveliness_observer: Arc<dyn LivelinessObserver>,
         re_cache_enabled: bool,
         supports_test_execution_caching: bool,
@@ -1709,6 +1637,29 @@ impl BuckTestOrchestrator<'_> {
         let test_target = TestTarget {
             target: test_target_label.target(),
             action_key_suffix: create_action_key_suffix(stage),
+        };
+
+        // A constrained case whose launch turns out ineligible is prepared and executed with its
+        // legacy request, as if reuse had not been requested.
+        let (local_case, launch_failure) = match local_case {
+            None => (None, None),
+            Some(local_case) => {
+                match Self::check_local_case_launch(
+                    test_target_label,
+                    stage,
+                    &*materializer,
+                    local_case,
+                )
+                .await
+                {
+                    LaunchCheck::Eligible(local_case) => (Some(local_case), None),
+                    LaunchCheck::Ineligible(local_case) => {
+                        request = local_case.into_legacy_request(request);
+                        (None, None)
+                    }
+                    LaunchCheck::Failed(what, e) => (None, Some((what, e))),
+                }
+            }
         };
 
         // For test execution, we currently do not do any cache queries
@@ -1811,11 +1762,10 @@ impl BuckTestOrchestrator<'_> {
                 let current_attempt = events.trace_id().to_string();
                 events
                     .span_async(start, async move {
-                        let result = if let Some(local_case) = local_case {
+                        let result = if let Some((what, e)) = launch_failure {
+                            manager.error(what, e)
+                        } else if let Some(local_case) = local_case {
                             let (result, outcome) = Self::execute_local_case(
-                                test_target_label,
-                                stage,
-                                &*materializer,
                                 local_case,
                                 executor,
                                 manager,

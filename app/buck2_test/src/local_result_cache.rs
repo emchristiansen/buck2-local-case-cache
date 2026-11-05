@@ -15,7 +15,11 @@
 //! Testing request takes part only when every one of these holds:
 //!
 //! - `[test] local_case_result_cache_root` names an absolute directory owned by this user and
-//!   inaccessible to others; no default location exists;
+//!   inaccessible to others; no default location exists. The path must be lexically canonical,
+//!   no component may be a symlink, and no ancestor may be changeable by another principal
+//!   (owned by root or this user and not group- or world-writable, unless root-owned and
+//!   sticky). The directory first found is pinned by descriptor for the daemon's life; if the
+//!   spelling later names another directory, opted-in cases are refused until a restart;
 //! - the request runs exactly one listed case, with no variant or repeat;
 //! - the child's whole environment is decided by the request: the inheritance clears the daemon
 //!   environment, there is no scratch path, worker or local resource, and the per-invocation
@@ -23,7 +27,8 @@
 //! - the request declares no outputs, every file its command names (`argv[0]`, a launched
 //!   script's `#!` interpreter, every `PATH` entry, and any argument or environment value naming
 //!   an existing file) is in the input tree or the Nix store, every input-tree file is a build
-//!   artifact under `buck-out` rather than a checkout file, and no loader override is set
+//!   artifact under `buck-out` rather than a checkout file, every input-tree symlink reaches a
+//!   declared build artifact or a Nix store path, and no loader override is set
 //!   (`local_case_closure`); a literal host tool such as `/bin/sh` makes the case ineligible;
 //! - the executor can and must run it locally.
 //!
@@ -41,6 +46,9 @@
 //! assert that a fresh execution of a nondeterministic test would pass; the provider's explicit
 //! request is its declaration that the case is deterministic under the declared contract.
 //!
+//! A waiter for a key's lease holds no blocking thread, so a holder's settlement, which runs on
+//! the blocking pool, cannot be starved by waiters for the same lease.
+//!
 //! Publication is one use of a capability: a durable pending generation is written before the
 //! child is dispatched, the child's exact raw streams are captured only for a local exit 0, and the
 //! entry is committed only after the in-process parser returns exactly one PASS for the expected
@@ -56,8 +64,12 @@ use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::DigestAlgorithm;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_execute::execute::action_digest::ActionDigest;
+use buck2_execute::execute::kind::CommandExecutionKind;
+use buck2_execute::execute::output::CommandStdStreams;
 use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
+use buck2_execute::execute::result::CommandExecutionReport;
+use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_execute_impl::executors::local::determined_local_environment;
 use buck2_fs::paths::abs_path::AbsPath;
@@ -321,10 +333,14 @@ impl LocalCaseCandidate {
         if !local_execution_possible(preference) {
             return (request, Err(LocalCaseGap::LocalExecutionImpossible));
         }
+        let legacy = LegacyRequest {
+            executor_preference: request.executor_preference(),
+            omit_local_invocation_identity_env: request.omit_local_invocation_identity_env(),
+        };
         let request = request.with_omit_local_invocation_identity_env(true);
         let launch = match Self::launch_plan(&request, &facts) {
             Ok(launch) => launch,
-            Err(gap) => return (request.with_omit_local_invocation_identity_env(false), Err(gap)),
+            Err(gap) => return (legacy.restore(request), Err(gap)),
         };
         let mut request = request;
         request.executor_preference = preference;
@@ -335,6 +351,7 @@ impl LocalCaseCandidate {
                 reuse: self.reuse,
                 case: self.case,
                 launch,
+                legacy,
             }),
         )
     }
@@ -366,12 +383,28 @@ impl LocalCaseCandidate {
     }
 }
 
+/// What `constrain` changes in a request, as it was before.
+struct LegacyRequest {
+    executor_preference: ExecutorPreference,
+    omit_local_invocation_identity_env: bool,
+}
+
+impl LegacyRequest {
+    fn restore(&self, request: CommandExecutionRequest) -> CommandExecutionRequest {
+        let mut request = request
+            .with_omit_local_invocation_identity_env(self.omit_local_invocation_identity_env);
+        request.executor_preference = self.executor_preference;
+        request
+    }
+}
+
 /// An eligible case whose request has been constrained to the reuse contract.
 pub(crate) struct ConstrainedCase {
     root: String,
     reuse: bool,
     case: CaseIdentity,
     launch: LaunchPlan,
+    legacy: LegacyRequest,
 }
 
 /// Facts about the prepared action that enter the key.
@@ -394,6 +427,17 @@ impl ConstrainedCase {
     /// The input-tree executables the command launches.
     pub(crate) fn launch(&self) -> &LaunchPlan {
         &self.launch
+    }
+
+    /// Give up the case after a later check found it ineligible, returning `request` exactly as
+    /// it was before `constrain`: its own executor preference, and the per-invocation identity
+    /// variables injected as for any request. The case then executes as if reuse had not been
+    /// requested, and nothing is recorded or published.
+    pub(crate) fn into_legacy_request(
+        self,
+        request: CommandExecutionRequest,
+    ) -> CommandExecutionRequest {
+        self.legacy.restore(request)
     }
 
     /// Build the full key for the constrained request.
@@ -699,6 +743,9 @@ pub(crate) struct LocalCaseOutcome(
 pub(crate) enum LocalCaseResult {
     Reused(ReusedCase),
     Captured(CapturedCase),
+    /// A tracked fresh generation already recorded as unsuccessful. It holds nothing, but tells
+    /// the runner to report the case strictly.
+    Unsuccessful,
 }
 
 impl LocalCaseOutcome {
@@ -721,6 +768,134 @@ impl fmt::Debug for LocalCaseOutcome {
     }
 }
 
+/// Run one short filesystem step of the store on the blocking pool. No step waits for another
+/// holder of a lease, so every step finishes without depending on other blocking work.
+async fn blocking<T: Send + 'static>(
+    step: impl FnOnce() -> buck2_error::Result<T> + Send + 'static,
+) -> buck2_error::Result<T> {
+    tokio::task::spawn_blocking(step).await.map_err(|e| {
+        buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Environment,
+            "Local case result store step did not complete: {e}"
+        )
+    })?
+}
+
+/// The first step of a constrained case, taken under its key's lease.
+pub(crate) enum LocalCaseStart {
+    Hit(ReusedCase),
+    Begun(PendingCase),
+}
+
+impl LocalCaseStart {
+    /// Open the store, wait for the key's lease and either return a verified hit or durably
+    /// begin the next generation; the lease then stays with the returned hit or pending
+    /// attempt. If this future is dropped first, any step in flight still finishes and its
+    /// result is dropped, which releases the lease and records any begun generation as
+    /// abandoned.
+    pub(crate) async fn take(
+        root: &str,
+        key: &LocalCaseKey,
+        reuse: bool,
+        attempt: &str,
+    ) -> buck2_error::Result<Self> {
+        let root = root.to_owned();
+        let store = blocking(move || LocalCaseStore::open(&root)).await?;
+        let guard = store.lease(key).await?;
+        let attempt = attempt.to_owned();
+        blocking(move || {
+            let guard = if reuse {
+                match guard.lookup()? {
+                    Lookup::Hit(reused) => return Ok(Self::Hit(reused)),
+                    Lookup::Miss(guard) => guard,
+                }
+            } else {
+                guard
+            };
+            Ok(Self::Begun(guard.begin(&attempt)?))
+        })
+        .await
+    }
+}
+
+/// Settle a begun generation from its executor result: keep a local exit-0 success for
+/// confirmation by the runner, or record the generation as unsuccessful with whatever exact raw
+/// streams the executor returned, including those of a failed, timed-out or cancelled child.
+pub(crate) async fn settle_execution(
+    pending: PendingCase,
+    report: &CommandExecutionReport,
+) -> LocalCaseOutcome {
+    let record = match &report.std_streams {
+        CommandStdStreams::Local { stdout, stderr } => Some(ExecutionRecord {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            status: report.status.to_string(),
+            exit_code: report.exit_code,
+            start_time: report.timing.start_time,
+            execution_time: report.timing.execution_time,
+        }),
+        // Streams that are not local bytes are not available here.
+        _ => None,
+    };
+    match (&report.status, record) {
+        (
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::Local { .. },
+            },
+            Some(record),
+        ) if report.exit_code == Some(0) => {
+            LocalCaseOutcome::new(LocalCaseResult::Captured(pending.capture(record)))
+        }
+        (status, record) => {
+            let reason = format!("execution did not succeed locally: {status}");
+            if let Err(e) = blocking(move || pending.reject(&reason, record.as_ref())).await {
+                tracing::warn!("Recording unsuccessful local case failed: {e:#}");
+            }
+            LocalCaseOutcome::new(LocalCaseResult::Unsuccessful)
+        }
+    }
+}
+
+/// Hide a reused entry the current parser did not confirm behind a new unsuccessful generation.
+pub(crate) async fn reject_reused(reused: ReusedCase, reason: String) {
+    if let Err(e) = blocking(move || reused.reject(&reason)).await {
+        tracing::warn!("Invalidating an unconfirmed local case result failed: {e:#}");
+    }
+}
+
+/// Publish a confirmed captured case after its result was reported, or record why not.
+pub(crate) async fn settle_fresh(
+    local_case: Option<LocalCaseResult>,
+    confirmation: Result<ConfirmedPass, NotConfirmed>,
+) {
+    match (local_case, confirmation) {
+        (Some(LocalCaseResult::Captured(captured)), Ok(confirmed)) => {
+            if let Err(e) = blocking(move || captured.confirm(&confirmed)).await {
+                tracing::warn!("Publishing confirmed local case result failed: {e:#}");
+            }
+        }
+        (local_case, Err(reason)) => settle_unconfirmed(local_case, &reason.to_string()).await,
+        (None | Some(LocalCaseResult::Unsuccessful), Ok(_)) => {}
+        (Some(LocalCaseResult::Reused(reused)), Ok(_)) => drop(reused),
+    }
+}
+
+/// Record a captured or reused case that was not confirmed. A captured generation becomes
+/// unsuccessful; a reused entry is hidden.
+pub(crate) async fn settle_unconfirmed(local_case: Option<LocalCaseResult>, reason: &str) {
+    let reason = reason.to_owned();
+    let settled = match local_case {
+        None | Some(LocalCaseResult::Unsuccessful) => return,
+        Some(LocalCaseResult::Captured(captured)) => {
+            blocking(move || captured.reject(&reason)).await
+        }
+        Some(LocalCaseResult::Reused(reused)) => blocking(move || reused.reject(&reason)).await,
+    };
+    if let Err(e) = settled {
+        tracing::warn!("Recording an unconfirmed local case failed: {e:#}");
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod store {
     use std::ffi::CStr;
@@ -736,6 +911,7 @@ mod store {
     use buck2_error::BuckErrorContext;
     use buck2_error::BuckErrorOptionContext;
     use buck2_error::buck2_error;
+    use dupe::Dupe;
 
     use super::*;
 
@@ -825,32 +1001,118 @@ mod store {
         name: String,
     }
 
+    /// Flags for an ancestor of the root, which is only searched. `O_PATH` needs no read
+    /// permission, so an ancestor such as a mode 0711 home directory can still be walked.
+    #[cfg(target_os = "linux")]
+    const ANCESTOR_FLAGS: libc::c_int =
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    const ANCESTOR_FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    /// The components of a configured root, which must be an absolute, lexically canonical path
+    /// below `/`: no trailing slash and no empty, `.` or `..` component.
+    fn root_components(path: &str) -> buck2_error::Result<Vec<CString>> {
+        let invalid = |why: &str| {
+            store_error(format!(
+                "[test] local_case_result_cache_root `{path}` {why}; it must be an absolute, \
+                 lexically canonical directory path"
+            ))
+        };
+        let Some(relative) = path.strip_prefix('/') else {
+            return Err(invalid("is not absolute"));
+        };
+        if relative.is_empty() {
+            return Err(invalid("is the filesystem root"));
+        }
+        relative
+            .split('/')
+            .map(|c| match c {
+                "" => Err(invalid("has an empty component or a trailing slash")),
+                "." | ".." => Err(invalid("has a `.` or `..` component")),
+                c => CString::new(c).map_err(|_| invalid("contains NUL")),
+            })
+            .collect()
+    }
+
+    /// An ancestor of the root must be a directory that no other principal can rename entries
+    /// in: owned by root or this user and writable by neither group nor others, unless it is a
+    /// root-owned sticky directory such as `/tmp`.
+    fn require_trusted_ancestor(fd: &OwnedFd, name: &str) -> buck2_error::Result<()> {
+        let stat = fstat(fd, name)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(store_error(format!(
+                "Local case result root ancestor `{name}` is not a directory"
+            )));
+        }
+        let owner_trusted = stat.st_uid == 0 || stat.st_uid == euid();
+        let shared_write = stat.st_mode & 0o022 != 0;
+        let root_sticky = stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0;
+        if !owner_trusted || (shared_write && !root_sticky) {
+            return Err(store_error(format!(
+                "Local case result root ancestor `{name}` may be changed by another user \
+                 (uid {}, mode {:o}); every ancestor must be owned by root or uid {} and not \
+                 writable by others unless it is a root-owned sticky directory",
+                stat.st_uid,
+                stat.st_mode & 0o7777,
+                euid()
+            )));
+        }
+        Ok(())
+    }
+
     impl Dir {
+        /// Open (creating the last component if absent) the configured root by walking it from
+        /// `/` one component at a time with `O_NOFOLLOW`. A symlink anywhere in the path, an
+        /// ancestor another principal could change, or a root that is not private is refused.
         fn open_root(path: &str) -> buck2_error::Result<Self> {
-            if !path.starts_with('/') {
-                return Err(store_error(format!(
-                    "[test] local_case_result_cache_root must be absolute, got `{path}`"
-                )));
+            let components = root_components(path)?;
+            let (last, ancestors) = components
+                .split_last()
+                .internal_error("root has components")?;
+            // SAFETY: valid C string; the returned descriptor is owned below.
+            let fd = unsafe { libc::open(c"/".as_ptr(), ANCESTOR_FLAGS) };
+            if fd < 0 {
+                return Err(io_error("Opening", "/"));
             }
-            let c_path = CString::new(path)
-                .map_err(|_| store_error(format!("`{path}` contains NUL")))?;
-            // SAFETY: valid C string; mkdir reports failure through errno.
-            if unsafe { libc::mkdir(c_path.as_ptr(), 0o700) } != 0
+            // SAFETY: freshly opened descriptor.
+            let mut parent = unsafe { OwnedFd::from_raw_fd(fd) };
+            let mut walked = String::new();
+            require_trusted_ancestor(&parent, "/")?;
+            for component in ancestors {
+                walked.push('/');
+                walked.push_str(&component.to_string_lossy());
+                // SAFETY: `parent` is an open directory and `component` a valid component.
+                let fd =
+                    unsafe { libc::openat(parent.as_raw_fd(), component.as_ptr(), ANCESTOR_FLAGS) };
+                if fd < 0 {
+                    return Err(io_error(
+                        "Opening (symlinks are refused) root ancestor",
+                        &walked,
+                    ));
+                }
+                // SAFETY: freshly opened descriptor.
+                parent = unsafe { OwnedFd::from_raw_fd(fd) };
+                require_trusted_ancestor(&parent, &walked)?;
+            }
+            // SAFETY: `parent` is an open directory and `last` a valid component.
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), last.as_ptr(), 0o700) } != 0
                 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
             {
                 return Err(io_error("Creating", path));
             }
-            // SAFETY: valid C string; the returned descriptor is owned below.
+            // SAFETY: as above.
             let fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
+                libc::openat(
+                    parent.as_raw_fd(),
+                    last.as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if fd < 0 {
-                return Err(io_error("Opening", path));
+                return Err(io_error("Opening (symlinks are refused)", path));
             }
-            // SAFETY: `fd` is a freshly opened descriptor owned by nobody else.
+            // SAFETY: freshly opened descriptor.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             require_private(&fd, path, libc::S_IFDIR)?;
             Ok(Self {
@@ -1016,10 +1278,30 @@ mod store {
         }
     }
 
-    /// A validated private store root.
+    /// The root directory a configured spelling was first found to name, and its layout
+    /// directory, both held open for the life of the process. Every key, lock and generation
+    /// operation is relative to these descriptors; the configured path is never resolved again
+    /// to reach them.
+    struct PinnedRoot {
+        layout: Dir,
+        device: u64,
+        inode: u64,
+    }
+
+    impl fmt::Debug for PinnedRoot {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "PinnedRoot({})", self.layout.name)
+        }
+    }
+
+    /// Roots pinned by this process, by configured spelling.
+    static PINNED_ROOTS: std::sync::Mutex<Vec<(String, std::sync::Arc<PinnedRoot>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// A validated private store root, pinned by descriptor.
     #[derive(Clone, Debug)]
     pub(crate) struct LocalCaseStore {
-        root: String,
+        root: std::sync::Arc<PinnedRoot>,
     }
 
     /// Whether the key's exclusive lease could be taken.
@@ -1038,34 +1320,72 @@ mod store {
     }
 
     impl LocalCaseStore {
-        /// Open the store under an explicitly configured absolute root.
-        pub(crate) fn open(root: &str) -> buck2_error::Result<Self> {
-            Dir::open_root(root)?.dir(LAYOUT)?;
-            Ok(Self {
-                root: root.to_owned(),
-            })
+        /// Open the store under an explicitly configured root. This blocks on the filesystem.
+        ///
+        /// The root must be an absolute, lexically canonical path every component of which is a
+        /// real directory, with no ancestor another principal could change, and the root itself
+        /// private to this user (see `Dir::open_root`). The directory found the first time a
+        /// spelling is opened is pinned for the life of the process: if the spelling later
+        /// names a different directory, the store is refused rather than silently switching
+        /// key, lock and generation namespaces, until the daemon restarts.
+        pub(crate) fn open(path: &str) -> buck2_error::Result<Self> {
+            let root = Dir::open_root(path)?;
+            let stat = fstat(&root.fd, path)?;
+            let (device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
+            let mut pinned = PINNED_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, existing)) = pinned.iter().find(|(spelling, _)| spelling == path) {
+                if (existing.device, existing.inode) != (device, inode) {
+                    return Err(store_error(format!(
+                        "[test] local_case_result_cache_root `{path}` now names a different \
+                         directory than the one this daemon pinned; restart the daemon to use \
+                         the new directory"
+                    )));
+                }
+                return Ok(Self {
+                    root: existing.dupe(),
+                });
+            }
+            let root = std::sync::Arc::new(PinnedRoot {
+                layout: root.dir(LAYOUT)?,
+                device,
+                inode,
+            });
+            pinned.push((path.to_owned(), root.dupe()));
+            Ok(Self { root })
         }
 
         /// Take the exclusive per-key lease, waiting for another holder to finish. It spans the
         /// whole use of the key: a hit until the runner confirms or rejects it, or an attempt
         /// from its pending record through capture and publication. Same-key attempts therefore
         /// never overlap each other or a hit.
-        pub(crate) fn lease(&self, key: &LocalCaseKey) -> buck2_error::Result<KeyGuard> {
-            match self.acquire(key, true)? {
-                Lease::Held(guard) => Ok(guard),
-                Lease::Busy => Err(store_error("blocking lease returned busy".to_owned())),
+        ///
+        /// A waiter holds no blocking thread while the lease is held elsewhere: each attempt to
+        /// take it is a short non-blocking step, and the wait between attempts is an async
+        /// timer. The holder's settlement, which runs on the blocking pool, therefore never
+        /// queues behind waiters for its own lease. Dropping the returned future abandons the
+        /// wait; a lease taken by an attempt still in flight is released when its result is
+        /// dropped.
+        pub(crate) async fn lease(&self, key: &LocalCaseKey) -> buck2_error::Result<KeyGuard> {
+            const FIRST_RETRY: Duration = Duration::from_millis(1);
+            const LONGEST_RETRY: Duration = Duration::from_millis(50);
+            let mut retry = FIRST_RETRY;
+            loop {
+                let store = self.clone();
+                let attempt_key = key.clone();
+                match blocking(move || store.try_lease(&attempt_key)).await? {
+                    Lease::Held(guard) => return Ok(guard),
+                    Lease::Busy => {
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(LONGEST_RETRY);
+                    }
+                }
             }
         }
 
-        /// Take the lease only if no one holds it.
-        #[cfg(test)]
+        /// Take the lease only if no one holds it, without waiting. This blocks only on the
+        /// filesystem.
         pub(crate) fn try_lease(&self, key: &LocalCaseKey) -> buck2_error::Result<Lease> {
-            self.acquire(key, false)
-        }
-
-        fn acquire(&self, key: &LocalCaseKey, wait: bool) -> buck2_error::Result<Lease> {
-            let layout = Dir::open_root(&self.root)?.dir(LAYOUT)?;
-            let dir = layout.dir(&key.digest)?;
+            let dir = self.root.layout.dir(&key.digest)?;
             let lock_name = component("lock")?;
             let fd = dir.openat(
                 &lock_name,
@@ -1078,18 +1398,15 @@ mod store {
             // SAFETY: freshly opened descriptor.
             let lock = unsafe { OwnedFd::from_raw_fd(fd) };
             require_private(&lock, &dir.child_name("lock"), libc::S_IFREG)?;
-            let operation = if wait {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_EX | libc::LOCK_NB
-            };
+            // Never `LOCK_EX` without `LOCK_NB`: a blocking wait would occupy a blocking-pool
+            // thread that the holder may need to settle and release this very lease.
             // SAFETY: `lock` is open for the lifetime of the guard.
-            while unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
+            while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let e = std::io::Error::last_os_error();
                 if e.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                if !wait && e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
                     return Ok(Lease::Busy);
                 }
                 return Err(store_error(format!(
@@ -1113,6 +1430,7 @@ mod store {
                 dir,
                 generations,
                 _lock: lock,
+                _root: self.root.dupe(),
             }))
         }
     }
@@ -1123,6 +1441,7 @@ mod store {
         dir: Dir,
         generations: Dir,
         _lock: OwnedFd,
+        _root: std::sync::Arc<PinnedRoot>,
     }
 
     impl KeyGuard {
@@ -1578,7 +1897,7 @@ mod store {
         pub(crate) fn open(_root: &str) -> buck2_error::Result<Self> {
             Err(unsupported())
         }
-        pub(crate) fn lease(&self, _key: &LocalCaseKey) -> buck2_error::Result<KeyGuard> {
+        pub(crate) async fn lease(&self, _key: &LocalCaseKey) -> buck2_error::Result<KeyGuard> {
             Err(unsupported())
         }
     }
@@ -1938,34 +2257,574 @@ mod tests {
         // A hit is held while a second attempt waits for the lease; the hit is then rejected,
         // as when the current parser does not confirm it.
         let Seen::Hit(reused) = look(&store, &key) else {
-            panic!()
+            panic!("expected a hit");
         };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = {
-            let store = store.clone();
-            let key = key.clone();
-            std::thread::spawn(move || {
-                let guard = store.lease(&key).unwrap();
-                tx.send(()).unwrap();
-                match guard.lookup().unwrap() {
-                    Lookup::Hit(_) => "hit",
-                    Lookup::Miss(guard) => {
-                        // The waiter's own attempt fails; nothing older may come back.
-                        guard
-                            .begin("second")
-                            .unwrap()
-                            .reject("exit 101", None)
-                            .unwrap();
-                        "miss"
+        on_one_blocking_thread(async move {
+            let waiter = {
+                let store = store.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let guard = store.lease(&key).await.unwrap();
+                    match guard.lookup().unwrap() {
+                        Lookup::Hit(_) => "hit",
+                        Lookup::Miss(guard) => {
+                            // The waiter's own attempt fails; nothing older may come back.
+                            guard
+                                .begin("second")
+                                .unwrap()
+                                .reject("exit 101", None)
+                                .unwrap();
+                            "miss"
+                        }
                     }
-                }
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!waiter.is_finished(), "the waiter overlapped the held hit");
+            reject_reused(reused, "not confirmed".to_owned()).await;
+            assert_eq!(waiter.await.unwrap(), "miss");
+            assert!(matches!(look(&store, &key), Seen::Miss(_)));
+        });
+    }
+
+    /// Run `scenario` on a runtime whose blocking pool has a single thread, the smallest a
+    /// daemon can be configured with. A lease wait that held a blocking thread would starve the
+    /// holder's settlement there and never finish; the bound turns that into a failure.
+    fn on_one_blocking_thread<T: Send + 'static>(
+        scenario: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let finished = runtime
+            .block_on(async move { tokio::time::timeout(Duration::from_secs(30), scenario).await });
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        finished.expect("a same-key scenario did not finish on a one-thread blocking pool")
+    }
+
+    fn local_kind() -> CommandExecutionKind {
+        CommandExecutionKind::Local {
+            digest: ActionDigest::from_content(b"action", CasDigestConfig::testing_default()),
+            command: vec!["runner".to_owned()],
+            env: Default::default(),
+        }
+    }
+
+    /// An executor report as the local executor returns it.
+    fn report(
+        status: CommandExecutionStatus,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> CommandExecutionReport {
+        CommandExecutionReport {
+            claim: None,
+            status,
+            timing: buck2_execute::execute::result::CommandExecutionMetadata {
+                time_span: buck2_util::time_span::TimeSpan::empty_now(),
+                execution_time: Duration::from_millis(7),
+                start_time: SystemTime::now(),
+                execution_stats: None,
+                input_materialization_duration: Duration::ZERO,
+                hashing_duration: Duration::ZERO,
+                hashed_artifacts_count: 0,
+                queue_duration: None,
+                suspend_duration: None,
+                suspend_count: None,
+            },
+            std_streams: CommandStdStreams::Local {
+                stdout: stdout.to_vec(),
+                stderr: stderr.to_vec(),
+            },
+            exit_code,
+            additional_message: None,
+            inline_environment_metadata: Default::default(),
+        }
+    }
+
+    fn succeeded(stdout: &[u8]) -> CommandExecutionReport {
+        report(
+            CommandExecutionStatus::Success {
+                execution_kind: local_kind(),
+            },
+            Some(0),
+            stdout,
+            b"",
+        )
+    }
+
+    fn failed() -> CommandExecutionReport {
+        report(
+            CommandExecutionStatus::Failure {
+                execution_kind: local_kind(),
+            },
+            Some(101),
+            b"failed\0\xff",
+            b"panicked",
+        )
+    }
+
+    /// What a contender saw, once it finished its whole use of the key.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Contended {
+        /// Reused an entry with this stdout, then released it.
+        Reused(Vec<u8>),
+        /// Ran as a new generation, whose child failed.
+        RanAndFailed,
+    }
+
+    /// Start `count` same-key contenders through the real admission and settlement path. Each
+    /// finishes its use of the key as a case would: a hit is consumed and released, and a miss
+    /// runs a child that fails.
+    fn contenders(
+        path: &str,
+        key: &LocalCaseKey,
+        reuse: bool,
+        count: usize,
+    ) -> Vec<tokio::task::JoinHandle<Contended>> {
+        (0..count)
+            .map(|i| {
+                let path = path.to_owned();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    match LocalCaseStart::take(&path, &key, reuse, &format!("contender-{i}"))
+                        .await
+                        .unwrap()
+                    {
+                        LocalCaseStart::Hit(reused) => Contended::Reused(reused.stdout().to_vec()),
+                        LocalCaseStart::Begun(pending) => {
+                            let outcome = settle_execution(pending, &failed()).await;
+                            assert!(
+                                matches!(outcome.take(), Some(LocalCaseResult::Unsuccessful)),
+                                "a failure was captured"
+                            );
+                            Contended::RanAndFailed
+                        }
+                    }
+                })
             })
+            .collect()
+    }
+
+    async fn begun(path: &str, key: &LocalCaseKey, reuse: bool, attempt: &str) -> PendingCase {
+        match LocalCaseStart::take(path, key, reuse, attempt)
+            .await
+            .unwrap()
+        {
+            LocalCaseStart::Begun(pending) => pending,
+            LocalCaseStart::Hit(_) => panic!("{attempt}: unexpected hit"),
+        }
+    }
+
+    /// Let contenders reach their lease wait, and check none overlapped the holder.
+    async fn all_waiting(waiters: &[tokio::task::JoinHandle<Contended>]) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            waiters.iter().all(|w| !w.is_finished()),
+            "a contender overlapped the lease holder"
+        );
+    }
+
+    async fn finished(waiters: Vec<tokio::task::JoinHandle<Contended>>) -> Vec<Contended> {
+        let mut seen = Vec::new();
+        for waiter in waiters {
+            seen.push(waiter.await.unwrap());
+        }
+        seen
+    }
+
+    #[test]
+    fn same_key_contenders_all_finish_on_a_one_thread_blocking_pool() {
+        let root = Root::new("one-thread");
+        let path = root.0.to_str().unwrap().to_owned();
+        let key = Material::new().key();
+        let state_path = root.key_dir(&key).join("state.json");
+        on_one_blocking_thread(async move {
+            // Confirmed success: the holder publishes while two others wait; both then reuse it.
+            let pending = begun(&path, &key, true, "success-holder").await;
+            let waiters = contenders(&path, &key, true, 2);
+            all_waiting(&waiters).await;
+            let outcome = settle_execution(pending, &succeeded(b"ok\0\xff tail")).await;
+            settle_fresh(outcome.take(), Ok(pass("module::case"))).await;
+            let reused = Contended::Reused(b"ok\0\xff tail".to_vec());
+            assert_eq!(
+                finished(waiters).await,
+                [reused, Contended::Reused(b"ok\0\xff tail".to_vec())]
+            );
+
+            // Rejected hit: the holder's hit is not confirmed while two others wait; neither may
+            // reuse it, and each runs and fails as a new generation.
+            let LocalCaseStart::Hit(reused) = LocalCaseStart::take(&path, &key, true, "hit-holder")
+                .await
+                .unwrap()
+            else {
+                panic!("expected the published hit");
+            };
+            let waiters = contenders(&path, &key, true, 2);
+            all_waiting(&waiters).await;
+            reject_reused(reused, "not confirmed".to_owned()).await;
+            assert_eq!(
+                finished(waiters).await,
+                [Contended::RanAndFailed, Contended::RanAndFailed]
+            );
+
+            // Failed execution: after a new success, a tracked rerun that does not read the
+            // store fails while two others wait. Its newer unsuccessful generation hides the
+            // older success from both.
+            let pending = begun(&path, &key, true, "second-success").await;
+            let outcome = settle_execution(pending, &succeeded(b"second")).await;
+            settle_fresh(outcome.take(), Ok(pass("module::case"))).await;
+            let pending = begun(&path, &key, false, "failing-rerun").await;
+            let waiters = contenders(&path, &key, true, 2);
+            all_waiting(&waiters).await;
+            assert!(
+                settle_execution(pending, &failed())
+                    .await
+                    .take()
+                    .is_some_and(|r| matches!(r, LocalCaseResult::Unsuccessful))
+            );
+            assert_eq!(
+                finished(waiters).await,
+                [Contended::RanAndFailed, Contended::RanAndFailed]
+            );
+
+            // Cancelled waiter: abandoning a wait leaves nothing holding or waiting on the key.
+            let pending = begun(&path, &key, true, "cancel-holder").await;
+            let waiter = contenders(&path, &key, true, 1).pop().unwrap();
+            all_waiting(std::slice::from_ref(&waiter)).await;
+            waiter.abort();
+            match waiter.await {
+                Err(e) => assert!(e.is_cancelled()),
+                Ok(_) => panic!("the cancelled waiter took the lease"),
+            }
+            assert!(
+                settle_execution(pending, &failed())
+                    .await
+                    .take()
+                    .is_some_and(|r| matches!(r, LocalCaseResult::Unsuccessful))
+            );
+            let pending = begun(&path, &key, true, "after-cancel").await;
+            assert!(
+                settle_execution(pending, &failed())
+                    .await
+                    .take()
+                    .is_some_and(|r| matches!(r, LocalCaseResult::Unsuccessful))
+            );
+        });
+        // Generations: 1 succeeded; the rejected hit hid it as 2; 3 and 4 failed; 5 succeeded;
+        // 6, 7 and 8 failed; 9 and 10 failed around the cancelled waiter, which began none.
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(state["latest_generation"], 10, "{state}");
+        assert_eq!(state["latest_state"], "unsuccessful", "{state}");
+        assert_eq!(state["success_generation"], 5, "{state}");
+    }
+
+    #[test]
+    fn an_unconfirmed_fresh_capture_publishes_nothing_and_keeps_its_raw() {
+        let root = Root::new("unconfirmed");
+        let path = root.0.to_str().unwrap().to_owned();
+        let key = Material::new().key();
+        let key_dir = root.key_dir(&key);
+        on_one_blocking_thread(async move {
+            let pending = begun(&path, &key, true, "first").await;
+            let outcome = settle_execution(pending, &succeeded(b"pass")).await;
+            settle_fresh(outcome.take(), Ok(pass("module::case"))).await;
+            // Each parse the runner reports as an explicit FAIL is settled as unconfirmed.
+            for (i, not_confirmed) in [
+                NotConfirmed::NotExactlyOneResult(0),
+                NotConfirmed::DifferentCase,
+                NotConfirmed::NotExactlyOneResult(2),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let pending = begun(&path, &key, i > 0, &format!("unconfirmed-{i}")).await;
+                let raw = format!("exit 0, unconfirmed {i}\0\u{fffd}");
+                let outcome = settle_execution(pending, &succeeded(raw.as_bytes())).await;
+                settle_fresh(outcome.take(), Err(not_confirmed)).await;
+            }
+            let _hidden = begun(&path, &key, true, "after").await;
+        });
+        for (generation, i) in [(2, 0), (3, 1), (4, 2)] {
+            let entry = key_dir.join(format!("generations/{generation}"));
+            assert_eq!(
+                std::fs::read(entry.join("stdout")).unwrap(),
+                format!("exit 0, unconfirmed {i}\0\u{fffd}").as_bytes()
+            );
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(manifest["outcome"], "unsuccessful");
+            assert_eq!(manifest["confirmed_status"], serde_json::Value::Null);
+        }
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(key_dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["success_generation"], 1);
+        assert_eq!(state["latest_generation"], 5);
+    }
+
+    #[test]
+    fn a_cancelled_execution_keeps_its_exact_raw_and_publishes_nothing() {
+        let root = Root::new("cancelled");
+        let path = root.0.to_str().unwrap().to_owned();
+        let key = Material::new().key();
+        let key_dir = root.key_dir(&key);
+        let stdout = b"partial\0out \xfe\xff unterminated".to_vec();
+        let stderr = b"err\0\x80 no newline".to_vec();
+        let (out, err) = (stdout.clone(), stderr.clone());
+        on_one_blocking_thread(async move {
+            let pending = begun(&path, &key, true, "first").await;
+            let outcome = settle_execution(pending, &succeeded(b"pass")).await;
+            settle_fresh(outcome.take(), Ok(pass("module::case"))).await;
+
+            // The local executor's report for a child cancelled after writing these bytes.
+            let pending = begun(&path, &key, false, "cancelled").await;
+            let cancelled = report(
+                CommandExecutionStatus::Cancelled {
+                    execution_kind: local_kind(),
+                    reason: None,
+                },
+                None,
+                &out,
+                &err,
+            );
+            assert!(
+                settle_execution(pending, &cancelled)
+                    .await
+                    .take()
+                    .is_some_and(|r| matches!(r, LocalCaseResult::Unsuccessful))
+            );
+            // The older success stays hidden.
+            let pending = begun(&path, &key, true, "after").await;
+            drop(pending);
+        });
+        let generation = key_dir.join("generations/2");
+        assert_eq!(std::fs::read(generation.join("stdout")).unwrap(), stdout);
+        assert_eq!(std::fs::read(generation.join("stderr")).unwrap(), stderr);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generation.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["outcome"], "unsuccessful");
+        assert_eq!(manifest["exit_code"], serde_json::Value::Null);
+        assert_eq!(manifest["confirmed_status"], serde_json::Value::Null);
+        assert!(
+            manifest["reason"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("cancel"),
+            "{manifest}"
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(key_dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["latest_generation"], 3);
+        assert_eq!(state["latest_state"], "unsuccessful");
+        assert_eq!(state["success_generation"], 1);
+    }
+
+    #[test]
+    fn the_root_contract_refuses_symlinks_shared_ancestors_and_redirection() {
+        use std::os::unix::fs::symlink;
+        let base = Root::new("contract");
+        let path = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+        let real = base.0.join("real");
+        let key = Material::new().key();
+        let refused = |spelling: String, why: &str| {
+            assert!(
+                LocalCaseStore::open(&spelling).is_err(),
+                "{why}: `{spelling}` was accepted"
+            );
         };
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(rx.try_recv().is_err(), "the waiter overlapped the held hit");
+
+        // A legitimate root below private and root-owned ancestors.
+        let store = LocalCaseStore::open(&path(&real)).unwrap();
+        produce(&store, &key, "old-pass", b"old pass");
+
+        // Symlinks: the final component with and without a trailing slash, and an ancestor.
+        let link = base.0.join("link");
+        symlink(&real, &link).unwrap();
+        refused(path(&link), "final symlink");
+        refused(
+            format!("{}/", path(&link)),
+            "final symlink with trailing slash",
+        );
+        refused(format!("{}/", path(&real)), "trailing slash");
+        let alias = base.0.join("alias");
+        symlink(&base.0, &alias).unwrap();
+        refused(path(&alias.join("real")), "ancestor symlink");
+        // Spellings that are not lexically canonical.
+        refused(format!("{}/./real", path(&base.0)), "`.` component");
+        refused(format!("{}/x/../real", path(&base.0)), "`..` component");
+        refused(format!("{}//real", path(&base.0)), "empty component");
+        refused("/".to_owned(), "filesystem root");
+        refused("relative/root".to_owned(), "relative");
+
+        // An ancestor another principal may write, even if sticky, unless owned by root.
+        let shared = base.0.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        for mode in [0o777, 0o1777, 0o770, 0o720] {
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(mode)).unwrap();
+            refused(
+                path(&shared.join("root")),
+                &format!("ancestor mode {mode:o}"),
+            );
+        }
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        LocalCaseStore::open(&path(&shared.join("root"))).unwrap();
+
+        // Redirection while a lease is held. Another retained namespace holds an older success
+        // for the same key; the pinned namespace has a pending generation under a held lease.
+        let other = base.0.join("other");
+        produce(
+            &LocalCaseStore::open(&path(&other)).unwrap(),
+            &key,
+            "older",
+            b"older",
+        );
+        let Seen::Hit(reused) = look(&store, &key) else {
+            panic!("expected the pinned success");
+        };
         reused.reject("not confirmed").unwrap();
-        assert_eq!(waiter.join().unwrap(), "miss");
-        assert!(matches!(look(&store, &key), Seen::Miss(_)));
+        let Seen::Miss(guard) = look(&store, &key) else {
+            panic!("a rejected success was reused");
+        };
+        let pending = guard.begin("held").unwrap();
+        // Reopening the same spelling yields the same namespace, whose lease is held.
+        let reopened = LocalCaseStore::open(&path(&real)).unwrap();
+        assert!(matches!(reopened.try_lease(&key).unwrap(), Lease::Busy));
+        // The spelling is redirected to the other namespace: it is refused, not switched.
+        std::fs::rename(&real, base.0.join("real-before")).unwrap();
+        std::fs::rename(&other, &real).unwrap();
+        refused(path(&real), "redirected while a lease is held");
+        pending.reject("exit 101", None).unwrap();
+        refused(path(&real), "redirected after the lease was released");
+        // The pinned namespace is still the one used, and its older success stays hidden.
+        assert!(matches!(look(&reopened, &key), Seen::Miss(_)));
+    }
+
+    #[test]
+    fn a_case_ineligible_at_its_launch_check_runs_its_legacy_request() {
+        use buck2_common::file_ops::metadata::FileMetadata;
+        use buck2_common::file_ops::metadata::TrackedFileDigest;
+        use buck2_core::cells::CellResolver;
+        use buck2_core::cells::cell_root_path::CellRootPathBuf;
+        use buck2_core::cells::name::CellName;
+        use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+        use buck2_core::fs::buck_out_path::BuckOutPathResolver;
+        use buck2_core::fs::project::ProjectRootTemp;
+        use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+        use buck2_directory::directory::entry::DirectoryEntry;
+        use buck2_execute::digest_config::DigestConfig;
+        use buck2_execute::directory::ActionDirectoryMember;
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+        use buck2_execute::execute::request::CommandExecutionInput;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use dupe::Dupe;
+
+        let temp = ProjectRootTemp::new().unwrap();
+        let project = temp.path();
+        let digest_config = DigestConfig::testing_default();
+        let fs = ArtifactFs::new(
+            CellResolver::testing_with_name_and_path(
+                CellName::testing_new("cell"),
+                CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell".into())),
+            ),
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new("buck-out/v2".into())),
+            project.dupe(),
+        );
+        // A launched build-artifact script whose interpreter is a host tool, which only the
+        // launch check after materialization can see.
+        let script = "buck-out/v2/gen/t/script";
+        let body = b"#!/bin/sh\necho\n";
+        let disk = project.root().as_path().join(script);
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        std::fs::write(&disk, body).unwrap();
+        let store = std::fs::canonicalize("/bin/sh").unwrap();
+        assert!(
+            store.starts_with("/nix/store"),
+            "the test needs a Nix store host"
+        );
+        let store = store.parent().unwrap().to_str().unwrap().to_owned();
+        let make = |args: Vec<&str>| {
+            let input = CommandExecutionInput::IncrementalRemoteOutput(
+                ProjectRelativePathBuf::unchecked_new(script.to_owned()),
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                    digest: TrackedFileDigest::from_content(
+                        body,
+                        digest_config.cas_digest_config(),
+                    ),
+                    is_executable: true,
+                })),
+            );
+            let paths = CommandExecutionPaths::new(
+                vec![input],
+                Default::default(),
+                &fs,
+                digest_config,
+                None,
+            )
+            .unwrap();
+            let mut env = sorted_vector_map::SortedVectorMap::new();
+            env.insert("PATH".to_owned(), store.clone());
+            CommandExecutionRequest::new(
+                vec![],
+                args.into_iter().map(str::to_owned).collect(),
+                paths,
+                env,
+            )
+            .with_local_environment_inheritance(EnvironmentInheritance::empty())
+            .with_executor_preference(ExecutorPreference::LocalPreferred)
+        };
+        let facts = || RequestFacts {
+            project_fs: project,
+            buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
+        };
+        let cache_root = project.root().as_path().join("cache-root");
+        let candidate = || LocalCaseCandidate {
+            root: cache_root.to_str().unwrap().to_owned(),
+            reuse: true,
+            case: Material::new().case,
+        };
+        let legacy_policy = |request: &CommandExecutionRequest| {
+            (
+                request.executor_preference(),
+                request.omit_local_invocation_identity_env(),
+                request.all_args_vec(),
+                request.env().clone(),
+                determined_local_environment(request, project.root()).is_some(),
+            )
+        };
+
+        let args = vec![script, "module::case"];
+        let (constrained, case) = candidate().constrain(make(args.clone()), facts(), |_| true);
+        let case = case.expect("the case is eligible before its launch check");
+        assert_eq!(
+            constrained.executor_preference(),
+            ExecutorPreference::LocalRequired
+        );
+        assert!(constrained.omit_local_invocation_identity_env());
+        let why = case.launch().verify().unwrap_err();
+        assert!(why.contains("/bin/sh"), "{why}");
+        let fallback = case.into_legacy_request(constrained);
+        // The same request, environment and executor policy as a case that never opted in.
+        assert_eq!(legacy_policy(&fallback), legacy_policy(&make(args)));
+        assert_eq!(
+            fallback.executor_preference(),
+            ExecutorPreference::LocalPreferred
+        );
+        assert!(!fallback.omit_local_invocation_identity_env());
+
+        // An earlier classification failure gives back the same legacy request.
+        let args = vec![script, "module::case", "/etc/hostname"];
+        let (earlier, case) = candidate().constrain(make(args.clone()), facts(), |_| true);
+        assert!(case.is_err());
+        assert_eq!(legacy_policy(&earlier), legacy_policy(&make(args)));
+        // Neither touched the store.
+        assert!(!cache_root.exists());
     }
 
     #[test]

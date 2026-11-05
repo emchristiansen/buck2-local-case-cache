@@ -881,7 +881,11 @@ impl LocalExecutor {
                     None,
                 )
             }
-            GatherOutputStatus::Cancelled => manager.cancel_claim(execution_kind, *timing),
+            // Keep what the child wrote before it was stopped: it is the cancelled execution's
+            // only evidence.
+            GatherOutputStatus::Cancelled => {
+                manager.cancel_claim(execution_kind, std_streams, *timing)
+            }
         };
 
         if let Some(run_action_key) = request.run_action_key()
@@ -1943,6 +1947,113 @@ mod tests {
             .await?;
         assert_matches!(status, GatherOutputStatus::TimedOut ( duration ) if duration == Duration::from_secs(1));
 
+        Ok(())
+    }
+
+    /// A real child writes bytes and is then stopped through the executor's ordinary structured
+    /// cancellation; the cancelled result carries exactly the bytes it wrote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_cancelled_keeps_the_written_streams() -> buck2_error::Result<()> {
+        use buck2_build_signals::env::WaitingData;
+        use buck2_events::dispatch::with_dispatcher_async;
+        use buck2_execute::execute::claim::MutexClaimManager;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_hash::BuckIndexSet;
+        use dice_futures::spawn::prepare_detached_cancellation;
+        use dice_futures::spawner::TokioSpawner;
+        use futures::FutureExt;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let digest_config = DigestConfig::testing_default();
+        let marker = root.as_path().join("written");
+        let paths = CommandExecutionPaths::new(
+            vec![],
+            BuckIndexSet::default(),
+            &executor.artifact_fs,
+            digest_config,
+            None,
+        )?;
+        // NUL, bytes that are not UTF-8, and no final newline on either stream.
+        let script = "printf 'out\\000\\376\\377 tail'; printf 'err\\000\\200 no newline' >&2; \
+                      : > written; exec sleep 60";
+        let request = CommandExecutionRequest::new(
+            vec![],
+            vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            paths,
+            Default::default(),
+        )
+        .with_skip_resource_control();
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (spawner, handle) = prepare_detached_cancellation();
+        let join = spawner.spawn(
+            move |cancellations| {
+                async move {
+                    with_dispatcher_async(EventDispatcher::null(), async move {
+                        let manager = CommandExecutionManager::new(
+                            Box::new(MutexClaimManager::new()),
+                            EventDispatcher::null(),
+                            NoopLivelinessObserver::create(),
+                            WaitingData::new(),
+                        );
+                        let digest = ActionDigest::empty(digest_config.cas_digest_config());
+                        // As `exec_cmd` runs it. The task is dropped as soon as the structured
+                        // section ends, so the result leaves from inside it.
+                        cancellations
+                            .with_structured_cancellation(|cancellation| async move {
+                                let result = executor
+                                    .exec_request(
+                                        &digest,
+                                        &request,
+                                        manager,
+                                        cancellation,
+                                        cancellations,
+                                        digest_config,
+                                        &[],
+                                        None,
+                                    )
+                                    .await;
+                                let _ignored = sender.send(result);
+                            })
+                            .await;
+                    })
+                    .await
+                }
+                .boxed()
+            },
+            &TokioSpawner,
+            &(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the child never wrote its streams"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), receiver)
+            .await
+            .expect("the cancelled execution did not return")
+            .expect("the execution dropped its result");
+        let _ignored = join.await;
+
+        assert_matches!(
+            result.report.status,
+            CommandExecutionStatus::Cancelled { reason: None, .. }
+        );
+        assert_eq!(result.report.exit_code, None);
+        match &result.report.std_streams {
+            CommandStdStreams::Local { stdout, stderr } => {
+                assert_eq!(stdout.as_slice(), b"out\0\xfe\xff tail");
+                assert_eq!(stderr.as_slice(), b"err\0\x80 no newline");
+            }
+            _ => panic!("the cancelled result lost the child's streams"),
+        }
         Ok(())
     }
 

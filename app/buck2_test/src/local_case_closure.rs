@@ -28,6 +28,11 @@
 //! tool such as `/bin/sh` is neither, so a case that names one is ineligible and publishes
 //! nothing.
 //!
+//! The serialized input tree binds a symlink's target string, not its referent, so every
+//! input-tree symlink, named or not, must resolve to a declared build artifact or a Nix store
+//! path. Paths are resolved in kernel order: a symlink is replaced by its target before any later
+//! component applies, and `..` is followed only between declared input-tree directories.
+//!
 //! This classifies operands; it does not discover dependencies. What a bound artifact itself
 //! loads or reads while it runs is covered by the provider's explicit request, which declares
 //! that its cases are deterministic within their declared inputs.
@@ -108,67 +113,115 @@ impl InputTree {
         Self { leaves, dirs }
     }
 
-    fn resolve(&self, mut path: Vec<String>) -> Result<Resolved, String> {
+    /// Resolve a project-relative path as the kernel would, one component at a time from the
+    /// project root: an input-tree symlink is replaced by its target before any later component
+    /// is applied, so a `..` applies to the directory the link resolved to, never lexically to
+    /// the link. A `..` is followed only out of a declared input-tree directory into another
+    /// one, since what lies on disk above or beside the declared tree, possibly behind a
+    /// symlink the tree does not record, is unknown here.
+    fn resolve(&self, path: &Path) -> Result<Resolved, String> {
+        let mut pending = std::collections::VecDeque::new();
+        push_components(&mut pending, path)
+            .ok_or_else(|| format!("`{}` is not a relative path", path.display()))?;
+        self.walk(Vec::new(), pending)
+    }
+
+    /// Continue resolving `pending` from the resolved, symlink-free directory `current`.
+    fn walk(
+        &self,
+        mut current: Vec<String>,
+        mut pending: std::collections::VecDeque<Step>,
+    ) -> Result<Resolved, String> {
         let mut hops = 0;
-        'restart: loop {
-            for end in 1..=path.len() {
-                match self.leaves.get(&path[..end]) {
-                    None => {}
-                    Some(Leaf::File { executable }) => {
-                        return Ok(if end == path.len() {
-                            Resolved::Tree {
-                                path,
-                                executable: *executable,
-                            }
-                        } else {
-                            Resolved::Undeclared(path)
+        while let Some(step) = pending.pop_front() {
+            let name = match step {
+                Step::Parent => {
+                    let parent = &current[..current.len().saturating_sub(1)];
+                    if current.is_empty()
+                        || !self.dirs.contains(&current)
+                        || !self.dirs.contains(parent)
+                    {
+                        return Err(format!(
+                            "`..` after `{}` leaves the declared input tree",
+                            current.join("/")
+                        ));
+                    }
+                    current.pop();
+                    continue;
+                }
+                Step::Name(name) => name,
+            };
+            current.push(name);
+            match self.leaves.get(&current) {
+                None => {}
+                Some(Leaf::File { executable }) => {
+                    if pending.is_empty() {
+                        return Ok(Resolved::Tree {
+                            path: current,
+                            executable: *executable,
                         });
                     }
-                    Some(Leaf::External(target)) => {
-                        let mut host = target.clone();
-                        host.extend(&path[end..]);
-                        return Ok(Resolved::Host(host));
+                    // A file is not a directory: nothing below it exists.
+                    current.extend(pending.into_iter().map(Step::into_name));
+                    return Ok(Resolved::Undeclared(current));
+                }
+                Some(Leaf::External(target)) => {
+                    let mut host = target.clone();
+                    host.extend(pending.into_iter().map(Step::into_name));
+                    return Ok(Resolved::Host(host));
+                }
+                Some(Leaf::Symlink(target)) => {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return Err(format!(
+                            "`{}` passes more than {MAX_SYMLINK_HOPS} input-tree symlinks",
+                            current.join("/")
+                        ));
                     }
-                    Some(Leaf::Symlink(target)) => {
-                        hops += 1;
-                        if hops > MAX_SYMLINK_HOPS {
-                            return Err(format!(
-                                "`{}` passes more than {MAX_SYMLINK_HOPS} input-tree symlinks",
-                                path.join("/")
-                            ));
-                        }
-                        let mut next = path[..end - 1].to_vec();
-                        push_relative(&mut next, Path::new(target)).ok_or_else(|| {
-                            format!(
-                                "input-tree symlink `{}` -> `{target}` leaves the project",
-                                path[..end].join("/")
-                            )
-                        })?;
-                        next.extend_from_slice(&path[end..]);
-                        path = next;
-                        continue 'restart;
-                    }
+                    let link = current.join("/");
+                    current.pop();
+                    let mut next = std::collections::VecDeque::new();
+                    push_components(&mut next, Path::new(target)).ok_or_else(|| {
+                        format!("input-tree symlink `{link}` -> `{target}` is not relative")
+                    })?;
+                    next.extend(pending);
+                    pending = next;
                 }
             }
-            return Ok(if self.dirs.contains(&path) {
-                Resolved::TreeDir
-            } else {
-                Resolved::Undeclared(path)
-            });
+        }
+        // The project root itself is not a declared input-tree directory.
+        Ok(if self.dirs.contains(&current) {
+            Resolved::TreeDir
+        } else {
+            Resolved::Undeclared(current)
+        })
+    }
+}
+
+/// One component of a relative path still to be resolved.
+#[derive(Debug, Clone)]
+enum Step {
+    Name(String),
+    Parent,
+}
+
+impl Step {
+    fn into_name(self) -> String {
+        match self {
+            Self::Name(name) => name,
+            Self::Parent => "..".to_owned(),
         }
     }
 }
 
-/// Append a relative path to `base`, applying `.` and `..`; `None` if it is not relative or
-/// leaves the root.
-fn push_relative(base: &mut Vec<String>, path: &Path) -> Option<()> {
+/// Append the components of a relative path, keeping `..` for resolution in kernel order and
+/// dropping `.`; `None` if the path is not relative or not UTF-8.
+fn push_components(steps: &mut std::collections::VecDeque<Step>, path: &Path) -> Option<()> {
     for component in path.components() {
         match component {
-            Component::Normal(c) => base.push(c.to_str()?.to_owned()),
+            Component::Normal(c) => steps.push_back(Step::Name(c.to_str()?.to_owned())),
             Component::CurDir => {}
-            Component::ParentDir => {
-                base.pop()?;
-            }
+            Component::ParentDir => steps.push_back(Step::Parent),
             Component::RootDir | Component::Prefix(_) => return None,
         }
     }
@@ -241,6 +294,43 @@ impl LaunchPlan {
                 "input `{}` is a checkout file, not a build artifact under buck-out",
                 source.join("/")
             ));
+        }
+
+        // Every input-tree symlink, whether or not the command names it, must reach immutable
+        // bound content: a declared build artifact, or a path in the Nix store. The serialized
+        // tree binds only a symlink's target string, so any other referent, such as a host file
+        // or an undeclared project file or directory, could change without changing the key.
+        let mut links = tree
+            .leaves
+            .iter()
+            .filter(|(_, leaf)| !matches!(leaf, Leaf::File { .. }))
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        links.sort();
+        for link in links {
+            let name = link.join("/");
+            let steps = link.iter().map(|c| Step::Name(c.clone())).collect();
+            match tree
+                .walk(Vec::new(), steps)
+                .map_err(|e| format!("input-tree symlink `{name}`: {e}"))?
+            {
+                Resolved::Tree { .. } => {}
+                Resolved::Host(host) => {
+                    store_path(&host).map_err(|e| format!("input-tree symlink `{name}`: {e}"))?;
+                }
+                Resolved::TreeDir => {
+                    return Err(format!(
+                        "input-tree symlink `{name}` names a directory, not a declared artifact"
+                    ));
+                }
+                Resolved::Undeclared(path) => {
+                    return Err(format!(
+                        "input-tree symlink `{name}` resolves to `{}`, which is not a declared \
+                         artifact",
+                        path.join("/")
+                    ));
+                }
+            }
         }
 
         let mut path_var = None;
@@ -357,23 +447,25 @@ impl Classify<'_> {
     /// error if it names an existing file that is not bound.
     fn named(&self, value: &str) -> Result<Option<Bound>, String> {
         let path = Path::new(value);
-        let project = if path.is_absolute() {
+        let resolved = if path.is_absolute() {
             match path.strip_prefix(self.facts.project_root) {
-                Ok(inside) => {
-                    let mut components = Vec::new();
-                    push_relative(&mut components, inside)
-                        .ok_or_else(|| format!("`{value}` is not a plain project path"))?;
-                    components
-                }
+                Ok(inside) => self.tree.resolve(inside),
                 Err(_) => return self.host(path, value),
             }
         } else {
-            let mut components = self.facts.working_directory.clone();
-            push_relative(&mut components, path)
-                .ok_or_else(|| format!("`{value}` leaves the project"))?;
-            components
-        };
-        match self.tree.resolve(project)? {
+            // From the project root through the working directory, as the kernel resolved it.
+            let mut steps = self
+                .facts
+                .working_directory
+                .iter()
+                .map(|c| Step::Name(c.clone()))
+                .collect();
+            push_components(&mut steps, path)
+                .ok_or_else(|| format!("`{value}` is not a plain relative path"))?;
+            self.tree.walk(Vec::new(), steps)
+        }
+        .map_err(|e| format!("`{value}`: {e}"))?;
+        match resolved {
             Resolved::Tree { path, executable } => Ok(Some(Bound::Artifact { path, executable })),
             Resolved::TreeDir => Ok(None),
             Resolved::Host(host) => self.host(&host, value),
@@ -408,12 +500,17 @@ mod tests {
 
     fn tree(leaves: &[(&str, Leaf)], dirs: &[&str]) -> InputTree {
         let split = |p: &str| p.split('/').map(str::to_owned).collect::<Vec<_>>();
+        let leaves: HashMap<_, _> = leaves.iter().map(|(p, l)| (split(p), l.clone())).collect();
+        // Every ancestor of a leaf is a directory of the tree, as in a real input directory.
+        let mut all_dirs: HashSet<Vec<String>> = dirs.iter().map(|d| split(d)).collect();
+        for path in leaves.keys() {
+            for end in 1..path.len() {
+                all_dirs.insert(path[..end].to_vec());
+            }
+        }
         InputTree {
-            leaves: leaves
-                .iter()
-                .map(|(p, l)| (split(p), l.clone()))
-                .collect(),
-            dirs: dirs.iter().map(|d| split(d)).collect(),
+            leaves,
+            dirs: all_dirs,
         }
     }
 
@@ -536,6 +633,223 @@ mod tests {
         // An external symlink into the store is a bound tool.
         let p = plan(&t, &root, &["buck-out/v2/gen/t/tool"], &[path_env]).unwrap();
         assert!(p.executables().is_empty());
+    }
+
+    /// An input tree built the way an action's input directory is: leaves inserted into an
+    /// `ActionDirectoryBuilder` and fingerprinted with the real directory serializer.
+    fn real_tree(leaves: Vec<(&str, ActionDirectoryMember)>) -> InputTree {
+        use buck2_directory::directory::entry::DirectoryEntry;
+        use buck2_execute::digest_config::DigestConfig;
+        use buck2_execute::directory::ActionDirectoryBuilder;
+        use buck2_execute::directory::insert_entry;
+
+        let digest_config = DigestConfig::testing_default();
+        let mut builder = ActionDirectoryBuilder::empty_non_exhaustive();
+        for (path, member) in leaves {
+            insert_entry(
+                &mut builder,
+                ProjectRelativePathBuf::unchecked_new(path.to_owned()),
+                DirectoryEntry::Leaf(member),
+            )
+            .unwrap();
+        }
+        InputTree::new(&builder.fingerprint(digest_config.as_directory_serializer()))
+    }
+
+    fn artifact(executable: bool) -> ActionDirectoryMember {
+        use buck2_common::file_ops::metadata::FileMetadata;
+        use buck2_common::file_ops::metadata::TrackedFileDigest;
+        use buck2_execute::digest_config::DigestConfig;
+        ActionDirectoryMember::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                b"artifact",
+                DigestConfig::testing_default().cas_digest_config(),
+            ),
+            is_executable: executable,
+        })
+    }
+
+    fn relative_link(target: &str) -> ActionDirectoryMember {
+        use buck2_common::file_ops::metadata::Symlink;
+        ActionDirectoryMember::Symlink(std::sync::Arc::new(Symlink::new(target.into())))
+    }
+
+    fn external_link(target: &Path) -> ActionDirectoryMember {
+        use buck2_common::external_symlink::ExternalSymlink;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+        ActionDirectoryMember::ExternalSymlink(std::sync::Arc::new(
+            ExternalSymlink::new(target.to_owned(), ForwardRelativePathBuf::default()).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn every_input_tree_symlink_must_reach_a_declared_artifact_or_the_store() {
+        let root = tempfile_root("closure-links");
+        let store = store_dir();
+        let sh = format!("{store}/sh");
+        let path_env = ("PATH", store.as_str());
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("payload"), "mutable").unwrap();
+        std::fs::create_dir_all(root.join("undeclared")).unwrap();
+        std::fs::write(root.join("undeclared/payload"), "mutable").unwrap();
+        let script = "buck-out/v2/gen/t/script";
+        // Only the containing resource layout is named on the command line, never a link.
+        let argv = [sh.as_str(), script, "buck-out/v2/gen/t/resources"];
+        let with = |extra: Vec<(&str, ActionDirectoryMember)>| {
+            let mut leaves = vec![
+                (script, artifact(true)),
+                ("buck-out/v2/gen/t/resources/data", artifact(false)),
+            ];
+            leaves.extend(extra);
+            plan(&real_tree(leaves), &root, &argv, &[path_env])
+        };
+
+        // Positive: a relative link to a declared artifact and an external link into the store.
+        with(vec![
+            ("buck-out/v2/gen/t/resources/alias", relative_link("data")),
+            (
+                "buck-out/v2/gen/t/resources/tool",
+                external_link(Path::new(&sh)),
+            ),
+        ])
+        .unwrap();
+
+        // An external link to a mutable host file.
+        let e = with(vec![(
+            "buck-out/v2/gen/t/resources/hidden",
+            external_link(&outside.join("payload")),
+        )])
+        .unwrap_err();
+        assert!(e.contains("resources/hidden"), "{e}");
+        // A relative chain ending at an undeclared project file.
+        let e = with(vec![
+            ("buck-out/v2/gen/t/resources/a", relative_link("b")),
+            (
+                "buck-out/v2/gen/t/resources/b",
+                relative_link("../../../../../undeclared/payload"),
+            ),
+        ])
+        .unwrap_err();
+        assert!(e.contains("resources/a"), "{e}");
+        // A link to a directory, whose undeclared contents it would expose.
+        let e = with(vec![(
+            "buck-out/v2/gen/t/resources/dir",
+            relative_link("../../t"),
+        )])
+        .unwrap_err();
+        assert!(e.contains("names a directory"), "{e}");
+        // A dangling link.
+        let e = with(vec![(
+            "buck-out/v2/gen/t/resources/dangling",
+            relative_link("missing"),
+        )])
+        .unwrap_err();
+        assert!(e.contains("resources/dangling"), "{e}");
+    }
+
+    #[test]
+    fn parent_components_resolve_after_symlinks_as_the_kernel_does() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile_root("closure-dotdot");
+        let store = store_dir();
+        let sh = format!("{store}/sh");
+        let path_env = ("PATH", store.as_str());
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("deep")).unwrap();
+        std::fs::write(outside.join("payload"), "outside").unwrap();
+        // On disk exactly as the tree describes it, plus an undeclared directory symlink.
+        let v2 = root.join("buck-out/v2");
+        std::fs::create_dir_all(v2.join("gen/a")).unwrap();
+        std::fs::write(v2.join("payload"), "declared").unwrap();
+        std::fs::write(v2.join("gen/b"), "declared").unwrap();
+        let _ignored = std::fs::remove_file(v2.join("link"));
+        symlink(outside.join("deep"), v2.join("link")).unwrap();
+        let _ignored = std::fs::remove_file(v2.join("undeclared"));
+        symlink(outside.join("deep"), v2.join("undeclared")).unwrap();
+        let _ignored = std::fs::remove_file(v2.join("chain"));
+        symlink("link/../payload", v2.join("chain")).unwrap();
+        let t = tree(
+            &[
+                ("buck-out/v2/payload", Leaf::File { executable: false }),
+                ("buck-out/v2/gen/b", Leaf::File { executable: false }),
+                ("buck-out/v2/link", Leaf::External(outside.join("deep"))),
+                (
+                    "buck-out/v2/chain",
+                    Leaf::Symlink("link/../payload".to_owned()),
+                ),
+            ],
+            &["buck-out/v2/gen/a"],
+        );
+        let kernel = |value: &str| std::fs::canonicalize(root.join(value)).unwrap();
+        let resolved = |value: &str| match t.resolve(Path::new(value)).unwrap() {
+            Resolved::Tree { path, .. } => {
+                std::fs::canonicalize(root.join(path.join("/"))).unwrap()
+            }
+            Resolved::Host(host) => std::fs::canonicalize(host).unwrap(),
+            other => panic!("{value}: {other:?}"),
+        };
+
+        // The counterexample: `link/..` is the parent of the link's referent, not `buck-out/v2`.
+        let value = "buck-out/v2/link/../payload";
+        assert_eq!(
+            kernel(value),
+            outside.join("payload").canonicalize().unwrap()
+        );
+        assert_ne!(
+            t.resolve(Path::new(value)).unwrap(),
+            Resolved::Tree {
+                path: vec!["buck-out".into(), "v2".into(), "payload".into()],
+                executable: false
+            }
+        );
+        assert_eq!(resolved(value), kernel(value));
+        // The same through a relative symlink target.
+        assert_eq!(resolved("buck-out/v2/chain"), kernel("buck-out/v2/chain"));
+        // `..` between declared directories agrees with the kernel and stays bound.
+        let value = "buck-out/v2/gen/a/../b";
+        assert_eq!(resolved(value), kernel(value));
+        // `..` after a component the tree does not declare is refused, since the kernel may
+        // follow a symlink there that the tree does not record.
+        assert!(
+            t.resolve(Path::new("buck-out/v2/undeclared/../payload"))
+                .is_err()
+        );
+
+        // As command operands, none of these is accepted as the declared payload.
+        for value in [
+            "buck-out/v2/link/../payload",
+            "buck-out/v2/undeclared/../payload",
+        ] {
+            let tree_without_links = tree(
+                &[
+                    ("buck-out/v2/payload", Leaf::File { executable: false }),
+                    ("buck-out/v2/link", Leaf::External(outside.join("deep"))),
+                ],
+                &[],
+            );
+            // The link itself is already refused by the all-symlink rule; check the operand
+            // classification separately with the classifier.
+            let argv = vec![sh.clone(), value.to_owned()];
+            let env = vec![(OsString::from("PATH"), OsString::from(&store))];
+            let facts = LaunchFacts {
+                project_root: &root,
+                working_directory: vec![],
+                buck_out: vec!["buck-out".into(), "v2".into()],
+                argv: &argv,
+                env: &env,
+            };
+            let classify = Classify {
+                tree: &tree_without_links,
+                facts: &facts,
+            };
+            let e = classify
+                .named(value)
+                .err()
+                .unwrap_or_else(|| panic!("`{value}` was accepted as a bound operand"));
+            assert!(e.contains(value), "{e}");
+            assert!(plan(&t, &root, &[&sh, value], &[path_env]).is_err());
+        }
     }
 
     fn tempfile_root(name: &str) -> PathBuf {

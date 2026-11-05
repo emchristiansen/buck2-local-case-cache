@@ -226,9 +226,13 @@ impl CommandExecutionManagerWithClaim {
         )
     }
 
+    /// The claimed command was cancelled. `std_streams` are whatever the command wrote before
+    /// it was stopped, which callers keep as unsuccessful evidence; pass
+    /// `CommandStdStreams::Empty` when none were captured.
     pub fn cancel_claim(
         self,
         execution_kind: CommandExecutionKind,
+        std_streams: CommandStdStreams,
         timing: CommandExecutionMetadata,
     ) -> CommandExecutionResult {
         self.result(
@@ -237,7 +241,7 @@ impl CommandExecutionManagerWithClaim {
                 reason: None,
             },
             BuckIndexMap::default(),
-            Default::default(),
+            std_streams,
             None,
             timing,
             None,

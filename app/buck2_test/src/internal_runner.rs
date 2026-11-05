@@ -46,6 +46,9 @@ use crate::local_result_cache::LocalCaseGap;
 use crate::local_result_cache::LocalCaseRequest;
 use crate::local_result_cache::LocalCaseOutcome;
 use crate::local_result_cache::LocalCaseResult;
+use crate::local_result_cache::reject_reused;
+use crate::local_result_cache::settle_fresh;
+use crate::local_result_cache::settle_unconfirmed;
 
 /// The in-process orchestrator interface, which can also return a case's local reuse or
 /// captured success for confirmation by this runner.
@@ -74,7 +77,9 @@ pub(crate) trait InternalTestOrchestrator: TestOrchestrator {
 /// When the provider requests local case reuse, each case's request carries the discovery
 /// identity, and a captured success is published only after its parsed result is exactly one PASS
 /// for that case and was reported. A reused result is reported only if the current parser
-/// confirms it the same way; otherwise it is invalidated and the case executes again.
+/// confirms it the same way; otherwise it is invalidated and the case executes again. A tracked
+/// fresh case whose parse is not exactly one result for it is reported as an explicit FAIL,
+/// never as an ordinary PASS.
 pub async fn run_internal_test(
     orchestrator: &dyn InternalTestOrchestrator,
     spec: ExternalRunnerSpec,
@@ -237,6 +242,11 @@ pub async fn run_internal_test(
         match test_response {
             Ok((ExecuteResponse::Result(result), local_case)) => {
                 let local_case = local_case.take();
+                // A fresh generation recorded for an eligible case, successful or not.
+                let tracked_fresh = matches!(
+                    local_case,
+                    Some(LocalCaseResult::Captured(_) | LocalCaseResult::Unsuccessful)
+                );
                 let exit_code = match result.status {
                     ExecutionStatus::Finished { exitcode } => exitcode,
                     ExecutionStatus::TimedOut { .. } => {
@@ -285,6 +295,7 @@ pub async fn run_internal_test(
                             exit_code,
                             &result,
                             result_entries,
+                            tracked_fresh,
                         )
                         .await?;
                         settle_fresh(other, confirmation).await;
@@ -299,17 +310,8 @@ pub async fn run_internal_test(
                             // The current parser does not confirm the reused raw streams: hide the
                             // entry and execute the case afresh as a new tracked generation that
                             // does not read the store, reporting only that execution.
-                            let reason = format!("reused result not confirmed: {reason}");
-                            match tokio::task::spawn_blocking(move || reused.reject(&reason)).await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => tracing::warn!(
-                                    "Invalidating an unconfirmed local case result failed: {e:#}"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    "Invalidating an unconfirmed local case result failed: {e:#}"
-                                ),
-                            }
+                            reject_reused(reused, format!("reused result not confirmed: {reason}"))
+                                .await;
                             futures.push(run_case(entry_name, filter, false));
                             continue;
                         }
@@ -321,6 +323,7 @@ pub async fn run_internal_test(
                         exit_code,
                         &result,
                         result_entries,
+                        false,
                     )
                     .await?;
                     // The confirmed reuse is reported; dropping `reused` releases its lease.
@@ -377,55 +380,87 @@ fn confirm_case(
     ConfirmedPass::exact(expected_case, exit_code, &results)
 }
 
-/// Publish a confirmed captured case after its result was reported, or record why not.
-async fn settle_fresh(
-    local_case: Option<LocalCaseResult>,
-    confirmation: Result<ConfirmedPass, crate::local_result_cache::NotConfirmed>,
-) {
-    match (local_case, confirmation) {
-        (Some(LocalCaseResult::Captured(captured)), Ok(confirmed)) => {
-            match tokio::task::spawn_blocking(move || captured.confirm(&confirmed)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("Publishing confirmed local case result failed: {e:#}"),
-                Err(e) => tracing::warn!("Publishing confirmed local case result failed: {e:#}"),
+/// The entries to report for a tracked fresh case. Its parsed entries are reported unchanged
+/// only when they are exactly one result for the expected case that agrees with the exit code, so
+/// a genuine parsed FAIL or SKIP stays as reported. An empty, wrong-case or multiple parse, or a
+/// PASS from a non-zero exit, is reported as one explicit FAIL for the expected case naming the
+/// mismatch, with the raw output: it never reads as an ordinary PASS. Nothing is published for
+/// it, since it is not an exact confirmation.
+fn strict_fresh_entries(
+    expected: &str,
+    exit_code: i32,
+    execution_time: Duration,
+    raw_output: impl FnOnce() -> String,
+    entries: Vec<TestResultEntry>,
+) -> Vec<TestResultEntry> {
+    let mismatch = match entries.as_slice() {
+        [only] if only.name == expected => {
+            if only.status == TestStatus::PASS && exit_code != 0 {
+                Some(format!(
+                    "the parser reported PASS for `{expected}`, but the case exited with code \
+                     {exit_code}"
+                ))
+            } else {
+                None
             }
         }
-        (local_case, Err(reason)) => settle_unconfirmed(local_case, &reason.to_string()).await,
-        (None, Ok(_)) => {}
-        (Some(LocalCaseResult::Reused(reused)), Ok(_)) => drop(reused),
-    }
-}
-
-/// Record a captured or reused case that was not confirmed. A captured generation becomes
-/// unsuccessful; a reused entry is hidden.
-async fn settle_unconfirmed(local_case: Option<LocalCaseResult>, reason: &str) {
-    let reason = reason.to_owned();
-    let settled = match local_case {
-        None => return,
-        Some(LocalCaseResult::Captured(captured)) => {
-            tokio::task::spawn_blocking(move || captured.reject(&reason)).await
-        }
-        Some(LocalCaseResult::Reused(reused)) => {
-            tokio::task::spawn_blocking(move || reused.reject(&reason)).await
-        }
+        parsed => Some(format!(
+            "the parser returned {} result(s) [{}] for `{expected}` (exit code {exit_code}), not \
+             exactly one result for that case",
+            parsed.len(),
+            parsed
+                .iter()
+                .map(|e| format!("{}: {:?}", e.name, e.status))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     };
-    match settled {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("Recording an unconfirmed local case failed: {e:#}"),
-        Err(e) => tracing::warn!("Recording an unconfirmed local case failed: {e:#}"),
+    match mismatch {
+        None => entries,
+        Some(mismatch) => vec![TestResultEntry {
+            name: expected.to_owned(),
+            status: TestStatus::FAIL,
+            message: Some(format!("Unconfirmed case result: {mismatch}")),
+            details: Some(raw_output()),
+            duration: Some(execution_time),
+        }],
     }
 }
 
-/// Report the parsed entries, or a fallback derived from the exit code when the parser returned
-/// none.
-async fn report_entries(
-    orchestrator: &dyn InternalTestOrchestrator,
+/// The results reported for a case's parsed entries. A tracked fresh case is reported strictly
+/// (`strict_fresh_entries`); any other case keeps the legacy reporting, including its fallback
+/// for an empty parse.
+fn case_results(
+    tracked_fresh: bool,
     target_handle: ConfiguredTargetHandle,
     entry_name: &str,
     exit_code: i32,
     result: &buck2_test_api::data::ExecutionResult2,
     result_entries: Vec<TestResultEntry>,
-) -> buck2_error::Result<()> {
+) -> Vec<TestResult> {
+    let result_entries = if tracked_fresh {
+        strict_fresh_entries(
+            entry_name,
+            exit_code,
+            result.execution_time,
+            || format_execution_output(&result.stdout, &result.stderr),
+            result_entries,
+        )
+    } else {
+        result_entries
+    };
+    ordinary_results(target_handle, entry_name, exit_code, result, result_entries)
+}
+
+/// The ordinary results for parsed entries, or a fallback derived from the exit code when the
+/// parser returned none.
+fn ordinary_results(
+    target_handle: ConfiguredTargetHandle,
+    entry_name: &str,
+    exit_code: i32,
+    result: &buck2_test_api::data::ExecutionResult2,
+    result_entries: Vec<TestResultEntry>,
+) -> Vec<TestResult> {
     if result_entries.is_empty() {
         // Parser returned no results — synthesize a fallback based on
         // exit code to prevent silent test disappearance.
@@ -434,7 +469,7 @@ async fn report_entries(
         } else {
             TestStatus::FAIL
         };
-        let test_result = TestResult {
+        vec![TestResult {
             target: target_handle,
             name: entry_name.to_owned(),
             status,
@@ -445,14 +480,11 @@ async fn report_entries(
             duration: Some(result.execution_time),
             details: format_execution_output(&result.stdout, &result.stderr),
             max_memory_used_bytes: result.max_memory_used_bytes,
-        };
-        orchestrator
-            .report_test_result(test_result)
-            .await
-            .buck_error_context("Failed to report test result")?;
+        }]
     } else {
-        for res in result_entries {
-            let test_result = TestResult {
+        result_entries
+            .into_iter()
+            .map(|res| TestResult {
                 target: target_handle,
                 name: res.name,
                 status: res.status,
@@ -460,12 +492,33 @@ async fn report_entries(
                 duration: res.duration,
                 details: res.details.unwrap_or_default(),
                 max_memory_used_bytes: result.max_memory_used_bytes,
-            };
-            orchestrator
-                .report_test_result(test_result)
-                .await
-                .buck_error_context("Failed to report test result")?;
-        }
+            })
+            .collect()
+    }
+}
+
+/// Report a case's parsed entries as `case_results` decides.
+async fn report_entries(
+    orchestrator: &dyn InternalTestOrchestrator,
+    target_handle: ConfiguredTargetHandle,
+    entry_name: &str,
+    exit_code: i32,
+    result: &buck2_test_api::data::ExecutionResult2,
+    result_entries: Vec<TestResultEntry>,
+    tracked_fresh: bool,
+) -> buck2_error::Result<()> {
+    for test_result in case_results(
+        tracked_fresh,
+        target_handle,
+        entry_name,
+        exit_code,
+        result,
+        result_entries,
+    ) {
+        orchestrator
+            .report_test_result(test_result)
+            .await
+            .buck_error_context("Failed to report test result")?;
     }
     Ok(())
 }
@@ -579,6 +632,139 @@ mod tests {
             oncall: None,
             working_dir_cell: CellName::testing_new("root"),
         }
+    }
+
+    fn execution(exit_code: i32) -> buck2_test_api::data::ExecutionResult2 {
+        buck2_test_api::data::ExecutionResult2 {
+            status: ExecutionStatus::Finished {
+                exitcode: exit_code,
+            },
+            stdout: ExecutionStream::Inline(b"raw out \xff".to_vec()),
+            stderr: ExecutionStream::Inline(b"raw err".to_vec()),
+            outputs: Default::default(),
+            start_time: std::time::SystemTime::now(),
+            execution_time: Duration::from_millis(9),
+            max_memory_used_bytes: None,
+            execution_details: Default::default(),
+            command_execution: None,
+        }
+    }
+
+    fn entry(name: &str, status: TestStatus) -> TestResultEntry {
+        TestResultEntry {
+            name: name.to_owned(),
+            status,
+            message: None,
+            details: None,
+            duration: None,
+        }
+    }
+
+    const CASE: &str = "module::case";
+
+    /// The results the runner reports for a fresh case, as its result loop decides them.
+    fn reported(
+        tracked_fresh: bool,
+        exit_code: i32,
+        entries: Vec<TestResultEntry>,
+    ) -> Vec<TestResult> {
+        case_results(
+            tracked_fresh,
+            ConfiguredTargetHandleExt::testing_new(0),
+            CASE,
+            exit_code,
+            &execution(exit_code),
+            entries,
+        )
+    }
+
+    fn statuses(results: &[TestResult]) -> Vec<(&str, TestStatus)> {
+        results
+            .iter()
+            .map(|r| (r.name.as_str(), r.status.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_tracked_fresh_case_never_reports_an_unconfirmed_pass() {
+        let mismatches = [
+            ("empty parse", 0, vec![]),
+            (
+                "wrong-case PASS",
+                0,
+                vec![entry("module::other", TestStatus::PASS)],
+            ),
+            (
+                "two PASS entries",
+                0,
+                vec![entry(CASE, TestStatus::PASS), entry(CASE, TestStatus::PASS)],
+            ),
+            (
+                "expected and another PASS",
+                0,
+                vec![
+                    entry(CASE, TestStatus::PASS),
+                    entry("module::other", TestStatus::PASS),
+                ],
+            ),
+            (
+                "PASS from a failed exit",
+                1,
+                vec![entry(CASE, TestStatus::PASS)],
+            ),
+        ];
+        for (name, exit_code, entries) in mismatches {
+            // Not an exact confirmation, so the captured generation is rejected, not published.
+            assert!(confirm_case(CASE, exit_code, &entries).is_err(), "{name}");
+            let results = reported(true, exit_code, entries);
+            assert_eq!(statuses(&results), [(CASE, TestStatus::FAIL)], "{name}");
+            let message = results[0].msg.as_deref().unwrap();
+            assert!(
+                message.contains("Unconfirmed case result"),
+                "{name}: {message}"
+            );
+            // The raw output stays with the reported result.
+            assert!(results[0].details.contains("raw out"), "{name}");
+            assert!(results[0].details.contains("raw err"), "{name}");
+        }
+
+        // An exact confirmation, and a genuine parsed FAIL or SKIP, are reported as parsed.
+        assert!(confirm_case(CASE, 0, &[entry(CASE, TestStatus::PASS)]).is_ok());
+        for (exit_code, status) in [
+            (0, TestStatus::PASS),
+            (1, TestStatus::FAIL),
+            (0, TestStatus::SKIP),
+        ] {
+            let results = reported(true, exit_code, vec![entry(CASE, status.clone())]);
+            assert_eq!(statuses(&results), [(CASE, status)]);
+        }
+    }
+
+    #[test]
+    fn an_untracked_case_keeps_the_legacy_reporting() {
+        // An empty parse falls back to the exit code.
+        let results = reported(false, 0, vec![]);
+        assert_eq!(statuses(&results), [(CASE, TestStatus::PASS)]);
+        assert_eq!(
+            results[0].msg.as_deref(),
+            Some("Parser returned no results (exit code 0)")
+        );
+        assert_eq!(
+            statuses(&reported(false, 1, vec![])),
+            [(CASE, TestStatus::FAIL)]
+        );
+        // Parsed entries are forwarded unchanged.
+        let entries = vec![
+            entry("module::other", TestStatus::PASS),
+            entry(CASE, TestStatus::PASS),
+        ];
+        assert_eq!(
+            statuses(&reported(false, 0, entries)),
+            [
+                ("module::other", TestStatus::PASS),
+                (CASE, TestStatus::PASS)
+            ]
+        );
     }
 
     #[test]
