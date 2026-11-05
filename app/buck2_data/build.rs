@@ -270,6 +270,17 @@ fn main() -> io::Result<()> {
             "buck.data.Invocation.expanded_command_line_args",
             "#[serde(default)]",
         )
+        // Added after event logs were already written without it: an absent value is zero, as
+        // in protobuf, so older JSON logs stay readable.
+        .field_attribute(
+            "buck.data.AggregatedBuildMetrics.local_test_result_cache_hits",
+            "#[serde(default)]",
+        )
+        .field_attribute("buck.data.TestResult.reuse", "#[serde(default)]")
+        .field_attribute(
+            "buck.data.TestResultReuse.current_execution_time",
+            "#[serde(default, rename = \"current_execution_time_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",
+        )
         .field_attribute(
             "buck.data.CommandExecutionMetadata.wall_time",
             "#[serde(rename = \"wall_time_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",

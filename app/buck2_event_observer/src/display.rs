@@ -793,6 +793,7 @@ pub fn format_test_result(
         status,
         duration,
         details,
+        reuse,
         ..
     } = test_result;
     let status = TestStatus::try_from(*status)?;
@@ -822,12 +823,35 @@ pub fn format_test_result(
     }?;
     let mut base = Line::from_iter([prefix, Span::new_unstyled(format!(": {name}",))?]);
 
-    if let Some(duration) = duration {
-        if let Ok(duration) = Duration::try_from(*duration) {
-            base.push(Span::new_unstyled(format!(
-                " ({})",
-                fmt_duration::fmt_duration(duration)
-            ))?);
+    let duration = duration
+        .as_ref()
+        .and_then(|duration| Duration::try_from(*duration).ok())
+        .map(fmt_duration::fmt_duration);
+    match reuse {
+        None => {
+            if let Some(duration) = duration {
+                base.push(Span::new_unstyled(format!(" ({duration})"))?);
+            }
+        }
+        // No case ran for a reused result: its duration (and details) are the original
+        // execution's, and this run's own execution time is reported beside it.
+        Some(reuse) => {
+            let original = match duration {
+                Some(duration) => format!("{duration} originally"),
+                None => "original duration unknown".to_owned(),
+            };
+            let current = reuse
+                .current_execution_time
+                .as_ref()
+                .and_then(|current| Duration::try_from(*current).ok())
+                .unwrap_or(Duration::ZERO);
+            base.push(Span::new_styled(
+                format!(
+                    " (reused: {original}, {} now)",
+                    fmt_duration::fmt_duration(current)
+                )
+                .cyan(),
+            )?);
         }
     }
     // If a test has details, we always show them. It's the test runner's
@@ -1493,6 +1517,60 @@ mod tests {
         let stream_contents = "test\n";
         let res = strip_trailing_newline(stream_contents);
         assert_eq!(res, "test");
+    }
+
+    fn test_result(reuse: Option<buck2_data::TestResultReuse>) -> buck2_data::TestResult {
+        buck2_data::TestResult {
+            name: "case".to_owned(),
+            status: buck2_data::TestStatus::Pass as i32,
+            msg: None,
+            duration: Some(Duration::from_secs(9).try_into().unwrap()),
+            details: "test case ... ok".to_owned(),
+            target_label: None,
+            max_memory_used_bytes: None,
+            reuse,
+        }
+    }
+
+    fn rendered(result: &buck2_data::TestResult, verbosity: &str) -> Option<Vec<String>> {
+        format_test_result(result, Verbosity::try_from_cli(verbosity).unwrap())
+            .unwrap()
+            .map(|lines| lines.0.iter().map(|line| line.to_unstyled()).collect())
+    }
+
+    #[test]
+    fn test_result_distinguishes_reused_from_fresh() {
+        let fresh = test_result(None);
+        let reused = test_result(Some(buck2_data::TestResultReuse {
+            origin_attempt: "origin".to_owned(),
+            entry_manifest: "manifest".to_owned(),
+            current_attempt: "current".to_owned(),
+            current_execution_time: Some(Duration::ZERO.try_into().unwrap()),
+        }));
+        assert_eq!(
+            rendered(&fresh, "1").unwrap(),
+            ["✓ Pass: case (9.0s)", "test case ... ok"]
+        );
+        assert_eq!(
+            rendered(&reused, "1").unwrap(),
+            [
+                "✓ Pass: case (reused: 9.0s originally, 0.0s now)",
+                "test case ... ok"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_result_reused_without_original_duration() {
+        let mut reused = test_result(Some(buck2_data::TestResultReuse::default()));
+        reused.duration = None;
+        reused.details = String::new();
+        // A passing result without details stays hidden by default, reused or not.
+        assert_eq!(rendered(&reused, "1"), None);
+        assert_eq!(
+            rendered(&reused, "3").unwrap(),
+            ["✓ Pass: case (reused: original duration unknown, 0.0s now)"]
+        );
     }
 
     #[test]

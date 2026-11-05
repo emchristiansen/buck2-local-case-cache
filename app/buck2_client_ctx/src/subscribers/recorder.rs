@@ -1879,6 +1879,18 @@ impl InvocationRecorder {
         Ok(())
     }
 
+    fn handle_test_run_end(
+        &mut self,
+        test_run: &buck2_data::TestRunEnd,
+    ) -> buck2_error::Result<()> {
+        // A test run is not a build action: only a local test-result reuse is recorded, in its
+        // dedicated counter. Its query/hit executor stages are not counted separately.
+        if last_command_execution_kind::is_local_test_result_reuse(test_run) {
+            self.run_local_test_result_cache_count += 1;
+        }
+        Ok(())
+    }
+
     fn handle_test_result(
         &mut self,
         test_result: &buck2_data::TestResult,
@@ -2512,6 +2524,9 @@ impl InvocationRecorder {
                     buck2_data::span_end_event::Data::ExecutorStage(executor_stage) => {
                         self.handle_executor_stage_end(executor_stage, event)
                     }
+                    buck2_data::span_end_event::Data::TestRun(test_run) => {
+                        self.handle_test_run_end(test_run)
+                    }
                     buck2_data::span_end_event::Data::BxlEnsureArtifacts(_bxl_ensure_artifacts) => {
                         self.handle_bxl_ensure_artifacts_end(*_bxl_ensure_artifacts, event)
                     }
@@ -2934,5 +2949,200 @@ mod tests {
         recorder.update_peak_system_load(Duration::from_secs(5 * 60), 2.0, 7.0);
         assert_eq!(recorder.peak_normalized_system_load1, Some(4.0));
         assert_eq!(recorder.peak_normalized_system_load5, Some(7.0));
+    }
+
+    mod local_test_result_reuse {
+        use std::sync::Arc;
+        use std::time::SystemTime;
+
+        use buck2_data::buck_event::Data;
+        use buck2_data::command_execution_kind::Command;
+        use buck2_events::BuckEvent;
+        use buck2_events::span::SpanId;
+        use buck2_wrapper_common::invocation_id::TraceId;
+
+        use crate::subscribers::recorder::InvocationRecorder;
+
+        fn event(span: u64, parent: Option<u64>, data: Data) -> Arc<BuckEvent> {
+            Arc::new(BuckEvent::new(
+                SystemTime::now(),
+                TraceId::null(),
+                Some(SpanId::from_u64(span).unwrap()),
+                parent.map(|p| SpanId::from_u64(p).unwrap()),
+                data,
+            ))
+        }
+
+        fn start(
+            span: u64,
+            parent: Option<u64>,
+            data: buck2_data::span_start_event::Data,
+        ) -> Arc<BuckEvent> {
+            event(
+                span,
+                parent,
+                Data::SpanStart(buck2_data::SpanStartEvent { data: Some(data) }),
+            )
+        }
+
+        fn end(
+            span: u64,
+            parent: Option<u64>,
+            data: buck2_data::span_end_event::Data,
+        ) -> Arc<BuckEvent> {
+            event(
+                span,
+                parent,
+                Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(data),
+                    ..Default::default()
+                }),
+            )
+        }
+
+        fn stage(
+            span: u64,
+            parent: u64,
+            stage: buck2_data::executor_stage_start::Stage,
+        ) -> [Arc<BuckEvent>; 2] {
+            [
+                start(
+                    span,
+                    Some(parent),
+                    buck2_data::ExecutorStageStart { stage: Some(stage) }.into(),
+                ),
+                end(
+                    span,
+                    Some(parent),
+                    buck2_data::ExecutorStageEnd::default().into(),
+                ),
+            ]
+        }
+
+        fn command_report(command: Command) -> buck2_data::CommandExecution {
+            buck2_data::CommandExecution {
+                details: Some(buck2_data::CommandExecutionDetails {
+                    command_kind: Some(buck2_data::CommandExecutionKind {
+                        command: Some(command),
+                    }),
+                    ..Default::default()
+                }),
+                status: Some(buck2_data::command_execution::Success {}.into()),
+                ..Default::default()
+            }
+        }
+
+        /// The events the test orchestrator emits for one test stage (see
+        /// `BuckTestOrchestrator::execute_request` / `execute_local_case`): a `TestRun` span
+        /// containing the local-test-result-cache query stage, on a hit the hit stage, and a
+        /// `TestRunEnd` carrying the final command report.
+        fn test_run(span: u64, hit: bool) -> Vec<Arc<BuckEvent>> {
+            let suite = buck2_data::TestSuite {
+                suite_name: "suite".to_owned(),
+                test_names: vec!["case".to_owned()],
+                target_label: None,
+            };
+            let mut events = vec![start(
+                span,
+                None,
+                buck2_data::TestRunStart {
+                    suite: Some(suite.clone()),
+                }
+                .into(),
+            )];
+            events.extend(stage(
+                span + 1,
+                span,
+                buck2_data::LocalTestResultCacheQuery {
+                    action_digest: "digest".to_owned(),
+                    cache_key: "key".to_owned(),
+                    current_attempt: "current".to_owned(),
+                }
+                .into(),
+            ));
+            let command = if hit {
+                let hit = buck2_data::LocalTestResultCache {
+                    action_digest: "digest".to_owned(),
+                    cache_key: "key".to_owned(),
+                    origin_attempt: "origin".to_owned(),
+                    entry_manifest: "manifest".to_owned(),
+                    current_attempt: "current".to_owned(),
+                };
+                events.extend(stage(span + 2, span, hit.clone().into()));
+                Command::LocalTestResultCache(hit)
+            } else {
+                Command::LocalCommand(buck2_data::LocalCommand::default())
+            };
+            events.push(end(
+                span,
+                None,
+                buck2_data::TestRunEnd {
+                    suite: Some(suite),
+                    command_report: Some(command_report(command)),
+                    command_host_sharing_requirements: None,
+                }
+                .into(),
+            ));
+            events
+        }
+
+        fn local_action(span: u64) -> [Arc<BuckEvent>; 2] {
+            [
+                start(
+                    span,
+                    None,
+                    buck2_data::ActionExecutionStart::default().into(),
+                ),
+                end(
+                    span,
+                    None,
+                    buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            kind: buck2_data::ActionKind::Run as i32,
+                            commands: vec![command_report(Command::LocalCommand(
+                                buck2_data::LocalCommand::default(),
+                            ))],
+                            ..Default::default()
+                        },
+                    )),
+                ),
+            ]
+        }
+
+        async fn record(events: &[Arc<BuckEvent>]) -> InvocationRecorder {
+            let mut recorder =
+                InvocationRecorder::new(TraceId::new(), None, SystemTime::UNIX_EPOCH, vec![]);
+            for e in events {
+                recorder.handle_event(e).await.unwrap();
+            }
+            recorder
+        }
+
+        #[tokio::test]
+        async fn reuse_is_recorded_from_test_run_end() {
+            let events: Vec<_> = local_action(1)
+                .into_iter()
+                .chain(test_run(10, true))
+                .chain(test_run(20, false))
+                .collect();
+            let recorder = record(&events).await;
+            // The hit is counted once, although both its hit stage and `TestRunEnd` were seen.
+            assert_eq!(recorder.run_local_test_result_cache_count, 1);
+            // The build action is recorded exactly as before; the fresh test run changes nothing.
+            assert_eq!(recorder.run_local_count, 1);
+            assert_eq!(recorder.run_remote_count, 0);
+            assert_eq!(recorder.run_action_cache_count, 0);
+            assert_eq!(recorder.run_remote_dep_file_cache_count, 0);
+            assert_eq!(recorder.run_skipped_count, 0);
+            assert_eq!(recorder.run_fallback_count, 0);
+        }
+
+        #[tokio::test]
+        async fn fresh_test_run_is_not_recorded_as_reuse() {
+            let recorder = record(&test_run(10, false)).await;
+            assert_eq!(recorder.run_local_test_result_cache_count, 0);
+            assert_eq!(recorder.run_local_count, 0);
+            assert_eq!(recorder.run_skipped_count, 0);
+        }
     }
 }

@@ -127,6 +127,54 @@ pub struct TestResult {
     pub max_memory_used_bytes: Option<u64>,
     // the output of the test execution (combining stdout and stderr)
     pub details: String,
+    /// Whether the case was executed for this result or an earlier execution was reused. When
+    /// it was reused, `duration`, `msg` and `details` describe that earlier execution.
+    pub origin: TestResultOrigin,
+}
+
+/// Where the evidence behind a [`TestResult`] comes from.
+#[derive(PartialEq, Eq, Debug, Clone, Default)]
+pub enum TestResultOrigin {
+    /// The case was executed for this test run; the result describes that execution. Every
+    /// result an external test runner reports is fresh.
+    #[default]
+    Fresh,
+    /// No case was executed for this result: the recorded output of an earlier, confirmed
+    /// execution was reused under unchanged inputs and parsed again.
+    Reused(ReusedTestResult),
+}
+
+/// The provenance of a reused [`TestResult`]: the original execution and this run's reuse.
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct ReusedTestResult {
+    /// The attempt that executed the case and recorded the reused output.
+    pub origin_attempt: String,
+    /// The immutable entry manifest binding the reused output to its original execution.
+    pub entry_manifest: String,
+    /// This test run's attempt, which looked the output up and reused it.
+    pub current_attempt: String,
+    /// The execution time this test run spent on the case: no case process ran, so this is the
+    /// reuse's own execution time (zero), not the original's.
+    pub current_execution_time: Duration,
+}
+
+impl TestResultOrigin {
+    /// The origin of results parsed from `execution`'s output: reused when `execution` is a local
+    /// test-result cache hit, which runs no case, and fresh otherwise.
+    pub fn of_execution(execution: &ExecutionResult2) -> Self {
+        use buck2_data::command_execution_kind::Command;
+        match &execution.execution_details.execution_kind {
+            Some(buck2_data::CommandExecutionKind {
+                command: Some(Command::LocalTestResultCache(hit)),
+            }) => Self::Reused(ReusedTestResult {
+                origin_attempt: hit.origin_attempt.clone(),
+                entry_manifest: hit.entry_manifest.clone(),
+                current_attempt: hit.current_attempt.clone(),
+                current_execution_time: execution.execution_time,
+            }),
+            _ => Self::Fresh,
+        }
+    }
 }
 
 /// different possible test results
@@ -558,6 +606,64 @@ mod tests {
         assert_eq!(
             TestStatus::parse("EXECUTION_FAILURE").unwrap(),
             TestStatus::FATAL
+        );
+    }
+
+    fn execution(kind: Option<buck2_data::CommandExecutionKind>) -> ExecutionResult2 {
+        ExecutionResult2 {
+            status: ExecutionStatus::Finished { exitcode: 0 },
+            stdout: ExecutionStream::Inline(b"test case ... ok".to_vec()),
+            stderr: ExecutionStream::Inline(Vec::new()),
+            outputs: Default::default(),
+            start_time: SystemTime::UNIX_EPOCH,
+            execution_time: Duration::ZERO,
+            max_memory_used_bytes: None,
+            execution_details: ExecutionDetails {
+                execution_kind: kind,
+            },
+            command_execution: None,
+        }
+    }
+
+    #[test]
+    fn test_result_origin_of_local_test_result_cache_hit_is_reused() {
+        use buck2_data::command_execution_kind::Command;
+        let hit = execution(Some(buck2_data::CommandExecutionKind {
+            command: Some(Command::LocalTestResultCache(
+                buck2_data::LocalTestResultCache {
+                    action_digest: "digest".to_owned(),
+                    cache_key: "key".to_owned(),
+                    origin_attempt: "origin".to_owned(),
+                    entry_manifest: "manifest".to_owned(),
+                    current_attempt: "current".to_owned(),
+                },
+            )),
+        }));
+        assert_eq!(
+            TestResultOrigin::of_execution(&hit),
+            TestResultOrigin::Reused(ReusedTestResult {
+                origin_attempt: "origin".to_owned(),
+                entry_manifest: "manifest".to_owned(),
+                current_attempt: "current".to_owned(),
+                current_execution_time: Duration::ZERO,
+            })
+        );
+    }
+
+    #[test]
+    fn test_result_origin_of_executed_case_is_fresh() {
+        use buck2_data::command_execution_kind::Command;
+        assert_eq!(TestResultOrigin::default(), TestResultOrigin::Fresh);
+        assert_eq!(
+            TestResultOrigin::of_execution(&execution(None)),
+            TestResultOrigin::Fresh
+        );
+        let local = execution(Some(buck2_data::CommandExecutionKind {
+            command: Some(Command::LocalCommand(Default::default())),
+        }));
+        assert_eq!(
+            TestResultOrigin::of_execution(&local),
+            TestResultOrigin::Fresh
         );
     }
 

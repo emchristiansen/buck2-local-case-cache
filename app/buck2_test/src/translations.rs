@@ -68,6 +68,7 @@ pub(crate) fn convert_test_result(
         details,
         target: test_target,
         max_memory_used_bytes,
+        origin,
     } = test_result;
 
     let test_target = session.get(test_target)?;
@@ -80,7 +81,29 @@ pub(crate) fn convert_test_result(
         details,
         target_label: Some(test_target.target().as_proto()),
         max_memory_used_bytes,
+        reuse: convert_test_result_origin(origin),
     })
+}
+
+fn convert_test_result_origin(
+    origin: buck2_test_api::data::TestResultOrigin,
+) -> Option<buck2_data::TestResultReuse> {
+    match origin {
+        buck2_test_api::data::TestResultOrigin::Fresh => None,
+        buck2_test_api::data::TestResultOrigin::Reused(
+            buck2_test_api::data::ReusedTestResult {
+                origin_attempt,
+                entry_manifest,
+                current_attempt,
+                current_execution_time,
+            },
+        ) => Some(buck2_data::TestResultReuse {
+            origin_attempt,
+            entry_manifest,
+            current_attempt,
+            current_execution_time: current_execution_time.try_into().ok(),
+        }),
+    }
 }
 
 /// Convert a named [`ArtifactValue`] into a test API's [`RemoteObject`].
@@ -125,5 +148,128 @@ fn convert_directory_entry(
             let digest = convert_digest(dir.fingerprint().data());
             Some(RemoteObject::dir(name, digest, children))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+    use std::time::SystemTime;
+
+    use buck2_core::configuration::data::ConfigurationData;
+    use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+    use buck2_event_observer::display::format_test_result;
+    use buck2_event_observer::verbosity::Verbosity;
+    use buck2_test_api::data::ExecutionDetails;
+    use buck2_test_api::data::ExecutionResult2;
+    use buck2_test_api::data::ExecutionStatus;
+    use buck2_test_api::data::ExecutionStream;
+    use buck2_test_api::data::TestResult;
+    use buck2_test_api::data::TestResultOrigin;
+    use buck2_test_api::data::TestStatus;
+
+    use super::*;
+    use crate::session::TestSessionOptions;
+
+    /// The execution result a case run returns: a fresh local execution, or a local test-result
+    /// cache hit as the orchestrator reports one (no child ran, zero execution time).
+    fn execution(reused: bool) -> ExecutionResult2 {
+        use buck2_data::command_execution_kind::Command;
+        let command = if reused {
+            Command::LocalTestResultCache(buck2_data::LocalTestResultCache {
+                action_digest: "digest".to_owned(),
+                cache_key: "key".to_owned(),
+                origin_attempt: "origin-attempt".to_owned(),
+                entry_manifest: "entry-manifest".to_owned(),
+                current_attempt: "current-attempt".to_owned(),
+            })
+        } else {
+            Command::LocalCommand(Default::default())
+        };
+        ExecutionResult2 {
+            status: ExecutionStatus::Finished { exitcode: 0 },
+            stdout: ExecutionStream::Inline(b"test case ... ok".to_vec()),
+            stderr: ExecutionStream::Inline(Vec::new()),
+            outputs: Default::default(),
+            start_time: SystemTime::now(),
+            execution_time: if reused {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(9)
+            },
+            max_memory_used_bytes: None,
+            execution_details: ExecutionDetails {
+                execution_kind: Some(buck2_data::CommandExecutionKind {
+                    command: Some(command),
+                }),
+            },
+            command_execution: None,
+        }
+    }
+
+    /// A fresh and a reused result whose parsed entries are identical (same 9 s duration and
+    /// details) stay distinguishable through the report translation and the console formatter.
+    #[test]
+    fn reused_and_fresh_results_are_distinguishable_when_reported() -> buck2_error::Result<()> {
+        let session = TestSession::new(TestSessionOptions::default());
+        let target = session.register(ConfiguredProvidersLabel::new(
+            ConfiguredTargetLabel::testing_parse("cell//pkg:foo", ConfigurationData::testing_new()),
+            Default::default(),
+        ));
+        let report = |reused: bool| -> buck2_error::Result<buck2_data::TestResult> {
+            // As the internal runner reports a parsed entry from this execution's output.
+            convert_test_result(
+                TestResult {
+                    target,
+                    name: "case".to_owned(),
+                    status: TestStatus::PASS,
+                    msg: None,
+                    duration: Some(Duration::from_secs(9)),
+                    details: "test case ... ok".to_owned(),
+                    max_memory_used_bytes: None,
+                    origin: TestResultOrigin::of_execution(&execution(reused)),
+                },
+                &session,
+            )
+        };
+        let fresh = report(false)?;
+        let reused = report(true)?;
+
+        assert_eq!(fresh.reuse, None);
+        assert_eq!(
+            reused.reuse,
+            Some(buck2_data::TestResultReuse {
+                origin_attempt: "origin-attempt".to_owned(),
+                entry_manifest: "entry-manifest".to_owned(),
+                current_attempt: "current-attempt".to_owned(),
+                current_execution_time: Some(Duration::ZERO.try_into()?),
+            })
+        );
+        // Everything but the provenance is the parsed entry, unchanged.
+        assert_eq!(
+            buck2_data::TestResult {
+                reuse: None,
+                ..reused.clone()
+            },
+            fresh
+        );
+
+        let render = |result: &buck2_data::TestResult| -> buck2_error::Result<Vec<String>> {
+            Ok(format_test_result(result, Verbosity::try_from_cli("1")?)?
+                .expect("a result with details is displayed")
+                .0
+                .iter()
+                .map(|line| line.to_unstyled())
+                .collect())
+        };
+        assert_eq!(render(&fresh)?, ["✓ Pass: case (9.0s)", "test case ... ok"]);
+        assert_eq!(
+            render(&reused)?,
+            [
+                "✓ Pass: case (reused: 9.0s originally, 0.0s now)",
+                "test case ... ok"
+            ]
+        );
+        Ok(())
     }
 }

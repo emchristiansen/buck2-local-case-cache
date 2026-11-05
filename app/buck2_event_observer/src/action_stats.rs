@@ -16,14 +16,16 @@ use dupe::Dupe;
 use crate::cache_hit_rate::total_cache_hit_rate;
 use crate::last_command_execution_kind::LastCommandExecutionKind;
 use crate::last_command_execution_kind::get_last_command_execution_kind;
+use crate::last_command_execution_kind::is_local_test_result_reuse;
 
 /// Records the number of actions depending on how they executed.
 /// There's no overlap between the actions - summing them all up
 /// gives the total number of actions. `local_actions` + `remote_actions`
 /// provides the total number of actually executed actions while
 /// `cached_actions` provides number of actions which we found
-/// in the action cache. Local test-result reuse has its own counter and never
-/// increments either execution counter. `fallback_actions` provides the number of actions
+/// in the action cache. Local test-result reuse has its own counter: it never
+/// increments an execution or action-cache counter and stays out of the build-action
+/// totals and cache-hit rate below (test runs that execute are not counted at all). `fallback_actions` provides the number of actions
 /// that had its command run more than once (hence, using fallback to run).
 ///
 /// These stats only track executions/commands.
@@ -50,7 +52,7 @@ impl ActionStats {
         let rate = total_cache_hit_rate(
             self.local_actions,
             self.remote_actions,
-            self.cached_actions + self.local_test_result_cached_actions,
+            self.cached_actions,
             self.remote_dep_file_cached_actions,
         ) * 100f64;
         let rate = if rate == 100.0 || rate == 0.0 {
@@ -63,9 +65,7 @@ impl ActionStats {
     }
 
     pub fn total_cached_actions(&self) -> u64 {
-        self.cached_actions
-            + self.remote_dep_file_cached_actions
-            + self.local_test_result_cached_actions
+        self.cached_actions + self.remote_dep_file_cached_actions
     }
 
     pub fn total_executed_actions(&self) -> u64 {
@@ -77,7 +77,6 @@ impl ActionStats {
             + self.remote_actions
             + self.cached_actions
             + self.remote_dep_file_cached_actions
-            + self.local_test_result_cached_actions
     }
 
     pub fn update(&mut self, action: &buck2_data::ActionExecutionEnd) {
@@ -113,13 +112,29 @@ impl ActionStats {
         }
     }
 
+    /// Test runs are not build actions: only a local test-result reuse is counted, and only in
+    /// its dedicated counter. A test that actually ran leaves every counter unchanged.
+    pub fn update_test_run(&mut self, test_run: &buck2_data::TestRunEnd) {
+        if is_local_test_result_reuse(test_run) {
+            self.local_test_result_cached_actions += 1;
+        }
+    }
+
     pub fn log_stats(&self) -> bool {
-        self.total_executed_and_cached_actions() > 0
+        self.total_executed_and_cached_actions() > 0 || self.local_test_result_cached_actions > 0
     }
 }
 
 impl fmt::Display for ActionStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.total_executed_and_cached_actions() == 0 {
+            // No build command ran or hit a cache: there is no build cache-hit rate to report.
+            return write!(
+                f,
+                "Local test-result reuse: {}",
+                self.local_test_result_cached_actions
+            );
+        }
         let mut action_stats_message = format!(
             "Cache hits: {}%. Commands: {} (cached: {}, remote: {}, local: {})",
             self.total_cache_hit_percentage(),
@@ -198,8 +213,11 @@ mod tests {
         assert_eq!(stats.remote_actions, 0);
         assert_eq!(stats.cached_actions, 0);
         assert_eq!(stats.remote_dep_file_cached_actions, 0);
-        assert_eq!(stats.total_cached_actions(), 1);
+        assert_eq!(stats.total_cached_actions(), 0);
         assert_eq!(stats.total_executed_actions(), 0);
+        assert_eq!(stats.total_executed_and_cached_actions(), 0);
+        assert!(stats.log_stats());
+        assert_eq!(stats.to_string(), "Local test-result reuse: 1");
     }
 
     use buck2_data::ActionExecutionEnd;

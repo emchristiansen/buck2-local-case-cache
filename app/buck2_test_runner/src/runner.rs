@@ -22,6 +22,7 @@ use buck2_test_api::data::ExternalRunnerSpec;
 use buck2_test_api::data::ExternalRunnerSpecValue;
 use buck2_test_api::data::RequiredLocalResources;
 use buck2_test_api::data::TestResult;
+use buck2_test_api::data::TestResultOrigin;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
 use buck2_test_api::grpc::TestOrchestratorClient;
@@ -233,6 +234,8 @@ fn get_test_result(
             execution_result.stdout, execution_result.stderr
         ),
         max_memory_used_bytes: execution_result.max_memory_used_bytes,
+        // This runner executes every case it reports.
+        origin: TestResultOrigin::Fresh,
     }
 }
 

@@ -32,6 +32,7 @@ use buck2_test_api::data::LocalResourceType;
 use buck2_test_api::data::RequiredLocalResources;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestResultEntry;
+use buck2_test_api::data::TestResultOrigin;
 use buck2_test_api::data::TestStage;
 use buck2_test_api::data::TestStatus;
 use buck2_test_api::protocol::TestOrchestrator;
@@ -260,6 +261,7 @@ pub async fn run_internal_test(
                             duration: Some(result.execution_time),
                             details: format_execution_output(&result.stdout, &result.stderr),
                             max_memory_used_bytes: result.max_memory_used_bytes,
+                            origin: TestResultOrigin::Fresh,
                         };
                         orchestrator
                             .report_test_result(test_result)
@@ -340,6 +342,7 @@ pub async fn run_internal_test(
                     duration: None,
                     details: String::new(),
                     max_memory_used_bytes: None,
+                    origin: TestResultOrigin::Fresh,
                 };
                 orchestrator
                     .report_test_result(test_result)
@@ -355,6 +358,7 @@ pub async fn run_internal_test(
                     duration: None,
                     details: String::new(),
                     max_memory_used_bytes: None,
+                    origin: TestResultOrigin::Fresh,
                 };
                 orchestrator
                     .report_test_result(test_result)
@@ -461,6 +465,8 @@ fn ordinary_results(
     result: &buck2_test_api::data::ExecutionResult2,
     result_entries: Vec<TestResultEntry>,
 ) -> Vec<TestResult> {
+    // A confirmed local test-result cache hit ran no case: its entries are reused, not fresh.
+    let origin = TestResultOrigin::of_execution(result);
     if result_entries.is_empty() {
         // Parser returned no results — synthesize a fallback based on
         // exit code to prevent silent test disappearance.
@@ -480,6 +486,7 @@ fn ordinary_results(
             duration: Some(result.execution_time),
             details: format_execution_output(&result.stdout, &result.stderr),
             max_memory_used_bytes: result.max_memory_used_bytes,
+            origin,
         }]
     } else {
         result_entries
@@ -492,6 +499,7 @@ fn ordinary_results(
                 duration: res.duration,
                 details: res.details.unwrap_or_default(),
                 max_memory_used_bytes: result.max_memory_used_bytes,
+                origin: origin.clone(),
             })
             .collect()
     }

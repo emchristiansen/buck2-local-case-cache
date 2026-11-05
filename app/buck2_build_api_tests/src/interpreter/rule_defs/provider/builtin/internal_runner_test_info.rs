@@ -14,6 +14,7 @@ use buck2_build_api::interpreter::rule_defs::register_rule_defs;
 use buck2_build_api::interpreter::rule_defs::required_test_local_resource::register_required_test_local_resource;
 use buck2_core::bzl::ImportPath;
 use buck2_interpreter_for_build::interpreter::testing::Tester;
+use buck2_interpreter_for_build::interpreter::testing::cells;
 use buck2_test_api::data::TestStatus;
 use indoc::indoc;
 
@@ -29,6 +30,97 @@ fn freeze_provider(starlark_code: &str) -> buck2_error::Result<OwnedInternalRunn
     let loaded = tester.add_import(
         &ImportPath::testing_new("root//test:provider.bzl"),
         starlark_code,
+    )?;
+    loaded
+        .env()
+        .get("exported_info")
+        .expect("`exported_info` not found")
+        .downcast_starlark::<InternalRunnerTestInfo>()
+        .map_err(buck2_error::Error::from)
+}
+
+/// A generic self-contained libtest parser module: top-level defs with literal defaults,
+/// docstrings and helpers, using only standard Starlark builtins and methods.
+const GENERIC_LIBTEST_PARSERS: &str = r#"
+"""A libtest listing and single-case result parser that loads nothing."""
+
+def _listed_name(line, suffix = ": test"):
+    """The case name on one terse listing line, or None for anything else."""
+    if line.endswith(suffix):
+        return line[:-len(suffix)]
+    return None
+
+def parse_libtest_listing(stdout):
+    names = [_listed_name(line) for line in stdout.split("\n")]
+    return [{"name": name, "filter": name} for name in names if name]
+
+def _status(word):
+    return {"FAILED": "FAIL", "ignored": "SKIP", "ok": "PASS"}.get(word.split(",")[0])
+
+def parse_libtest_case(stdout, stderr, exit_code):
+    results = []
+    for index, line in enumerate(stdout.split("\n")):
+        if not line.startswith("test ") or " ... " not in line:
+            continue
+        name, _separator, word = line[len("test "):].partition(" ... ")
+        status = _status(word)
+        if status == None:
+            fail("line {} has an unknown outcome: {}".format(index, repr(word)))
+        results.append({"name": name, "status": status, "message": None if exit_code == 0 else stderr})
+    if len(results) != 1 or int(exit_code) not in range(256):
+        return []
+    return results
+"#;
+
+/// The native internal-runner fixture's self-contained parsers,
+/// `tests/core/test/test_internal_runner_data/case_parsers.bzl`.
+const FIXTURE_CASE_PARSERS: &str = r#"# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+"""Self-contained internal-runner parsers: a module of top-level defs that loads nothing."""
+
+def parse_internal_listing(stdout):
+    return [{"name": name, "filter": name} for name in stdout.strip().split("\n") if name]
+
+def parse_internal_result(stdout, stderr, exit_code):
+    return [{
+        "name": "case",
+        "status": "PASS" if exit_code == 0 else "FAIL",
+        "message": None if exit_code == 0 else stderr,
+    }]
+"#;
+
+/// The real Buck loader with `config` as the root cell's buckconfig: `parsers` is loaded from
+/// `//test:parsers.bzl`, and the provider names its `listing` and `result` functions.
+fn provider_with_parsers(
+    config: Option<&str>,
+    parsers: &str,
+    listing: &str,
+    result: &str,
+) -> buck2_error::Result<OwnedInternalRunnerTestInfo> {
+    let mut tester = Tester::with_cells(cells(config)?)?;
+    tester.additional_globals(register_rule_defs);
+    tester.additional_globals(register_required_test_local_resource);
+    tester.add_import(&ImportPath::testing_new("root//test:parsers.bzl"), parsers)?;
+    let loaded = tester.add_import(
+        &ImportPath::testing_new("root//test:provider.bzl"),
+        &format!(
+            r#"
+load("//test:parsers.bzl", "{listing}", "{result}")
+exported_info = InternalRunnerTestInfo(
+    type = "rust",
+    parse_test_listing = {listing},
+    parse_test_result = {result},
+    listing_command = ["binary", "--list"],
+    supports_test_execution_caching = True,
+)
+"#
+        ),
     )?;
     loaded
         .env()
@@ -102,6 +194,137 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Self-contained parser identity, loaded by the real Buck interpreter
+    // ---------------------------------------------------------------------------
+
+    const READ_CONFIG_PARSERS: &str = r#"
+def parse_listing(stdout):
+    return [{"name":"case","filter":"case"}]
+def parse_result(stdout, stderr, exit_code):
+    return [{"name":"case","status":read_config("probe", "status", "PASS")}]
+"#;
+
+    /// A parser that calls Buck's `read_config` parses the same output differently under two
+    /// configurations, so its source is not its identity: it is ineligible under both.
+    #[test]
+    fn self_contained_parser_identity_rejects_config_dependent_parser() -> buck2_error::Result<()> {
+        let mut statuses = Vec::new();
+        for status in ["PASS", "FAIL"] {
+            let info = provider_with_parsers(
+                Some(&format!("[probe]\nstatus = {status}\n")),
+                READ_CONFIG_PARSERS,
+                "parse_listing",
+                "parse_result",
+            )?;
+            let identity = info
+                .as_ref()
+                .value()
+                .as_ref()
+                .self_contained_parser_identity();
+            let reason = identity.expect_err("a configuration-dependent parser has no identity");
+            assert!(
+                reason.contains("read_config")
+                    && reason.contains("neither its own nor a standard Starlark builtin"),
+                "{reason}"
+            );
+            let results = InternalRunnerTestInfo::parse_test_result_output(&info, "", "", 0)?;
+            statuses.push(results[0].status.clone());
+        }
+        // The hazard is real: identical source and output, different results.
+        assert_eq!(statuses, [TestStatus::PASS, TestStatus::FAIL]);
+        Ok(())
+    }
+
+    /// A self-contained libtest parser module is admitted, with an identity that is its source
+    /// and that does not depend on the configuration, and it still parses a libtest case.
+    #[test]
+    fn self_contained_parser_identity_admits_generic_libtest_parsers() -> buck2_error::Result<()>
+    {
+        let mut identities = Vec::new();
+        for config in [None, Some("[probe]\nstatus = FAIL\n")] {
+            let info = provider_with_parsers(
+                config,
+                GENERIC_LIBTEST_PARSERS,
+                "parse_libtest_listing",
+                "parse_libtest_case",
+            )?;
+            let identity = info
+                .as_ref()
+                .value()
+                .as_ref()
+                .self_contained_parser_identity()
+                .map_err(|e| buck2_error::buck2_error!(buck2_error::ErrorTag::Input, "{e}"))?;
+            assert!(identity.contains(GENERIC_LIBTEST_PARSERS), "{identity}");
+            assert!(identity.starts_with("parse_test_listing: "), "{identity}");
+            identities.push(identity);
+
+            let listing = InternalRunnerTestInfo::parse_test_listing_output(
+                &info,
+                "a::b: test\nc: benchmark\n",
+            )?;
+            assert_eq!(listing.len(), 1);
+            assert_eq!(listing[0].name, "a::b");
+            let results = InternalRunnerTestInfo::parse_test_result_output(
+                &info,
+                "\nrunning 1 test\ntest a::b ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+                "",
+                0,
+            )?;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].name, "a::b");
+            assert_eq!(results[0].status, TestStatus::PASS);
+        }
+        assert_eq!(identities[0], identities[1]);
+        Ok(())
+    }
+
+    /// The native fixture's parsers stay admitted too.
+    #[test]
+    fn self_contained_parser_identity_admits_fixture_parsers() -> buck2_error::Result<()> {
+        let info = provider_with_parsers(
+            None,
+            FIXTURE_CASE_PARSERS,
+            "parse_internal_listing",
+            "parse_internal_result",
+        )?;
+        let identity = info
+            .as_ref()
+            .value()
+            .as_ref()
+            .self_contained_parser_identity();
+        assert!(
+            identity
+                .as_ref()
+                .is_ok_and(|i| i.contains(FIXTURE_CASE_PARSERS)),
+            "{identity:?}"
+        );
+        Ok(())
+    }
+
+    /// A lambda is not a top-level function of a self-contained file.
+    #[test]
+    fn self_contained_parser_identity_rejects_lambda() -> buck2_error::Result<()> {
+        let info = freeze_provider(indoc!(
+            r#"
+        exported_info = InternalRunnerTestInfo(
+            type = "rust",
+            parse_test_listing = lambda stdout: [],
+            parse_test_result = lambda stdout, stderr, exit_code: [],
+            listing_command = ["binary", "--list"],
+        )
+        "#
+        ))?;
+        assert!(
+            info.as_ref()
+                .value()
+                .as_ref()
+                .self_contained_parser_identity()
+                .is_err()
+        );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------

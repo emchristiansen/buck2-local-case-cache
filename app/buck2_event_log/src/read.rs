@@ -471,4 +471,152 @@ mod tests {
             AbsNormPathBuf::new("/foo".into()).unwrap()
         }
     }
+
+    /// A complete `DetailedAggregatedMetrics` event as written before
+    /// `AggregatedBuildMetrics.local_test_result_cache_hits` existed: the current event with
+    /// exactly that member removed (the interface review's baseline-schema fixture, verbatim).
+    const BASELINE_METRICS_EVENT_JSON: &str = r#"{"Event":{"data":{"Instant":{"data":{"DetailedAggregatedMetrics":{"all_targets_build_metrics":{"action_graph_size":null,"compute_time_ms":null,"metrics":{"analysis_retained_memory":0.0,"declared_actions":0.0,"full_graph_execution_time_ms":0.0,"full_graph_output_size_bytes":0.0,"local_execution_time_ms":0.0,"local_executions":0.0,"remote_cache_hits":0.0,"remote_execution_time_ms":0.0,"remote_executions":0.0}},"top_level_target_metrics":[]}}}},"parent_id":0,"span_id":0,"timestamp":null,"trace_id":""}}"#;
+
+    fn metrics_event(local_test_result_cache_hits: f64) -> buck2_data::BuckEvent {
+        buck2_data::BuckEvent {
+            data: Some(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::DetailedAggregatedMetrics(
+                        buck2_data::DetailedAggregatedMetrics {
+                            all_targets_build_metrics: Some(buck2_data::AllTargetsBuildMetrics {
+                                metrics: Some(buck2_data::AggregatedBuildMetrics {
+                                    local_executions: 2.0,
+                                    local_test_result_cache_hits,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn aggregated_metrics(value: &StreamValue) -> &buck2_data::AggregatedBuildMetrics {
+        let StreamValue::Event(event) = value else {
+            panic!("expected an event");
+        };
+        match event.data.as_ref() {
+            Some(buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::DetailedAggregatedMetrics(m)),
+            })) => m
+                .all_targets_build_metrics
+                .as_ref()
+                .and_then(|m| m.metrics.as_ref())
+                .expect("aggregated metrics"),
+            other => panic!("expected aggregated metrics, got {other:?}"),
+        }
+    }
+
+    fn invocation_proto() -> buck2_data::Invocation {
+        buck2_data::Invocation {
+            command_line_args: vec!["buck2".to_owned(), "test".to_owned()],
+            expanded_command_line_args: vec!["buck2".to_owned(), "test".to_owned()],
+            working_dir: "/work".to_owned(),
+            trace_id: Some("7b797fa8-62f1-4123-85f9-875cd74b0a63".to_owned()),
+            start_time: None,
+        }
+    }
+
+    async fn read_all(
+        dir: &tempfile::TempDir,
+        name: &str,
+        encoding: Encoding,
+        bytes: Vec<u8>,
+    ) -> buck2_error::Result<Vec<StreamValue>> {
+        let path = AbsPathBuf::try_from(dir.path().join(name)).unwrap();
+        std::fs::write(&path, bytes)?;
+        let log = EventLogPathBuf { path, encoding };
+        let (invocation, events) = log.unpack_stream().await?;
+        assert_eq!(invocation.command_line_args, ["buck2", "test"]);
+        events.try_collect().await
+    }
+
+    /// A JSON log line holding an event written before the counter existed, followed by a
+    /// current event: both decode through the maintained reader, so the failure cannot be the
+    /// last line that the truncation tolerance would hide.
+    #[tokio::test]
+    async fn test_json_log_with_baseline_schema_metrics_event() -> buck2_error::Result<()> {
+        let baseline: serde_json::Value = serde_json::from_str(BASELINE_METRICS_EVENT_JSON)?;
+        assert!(
+            !BASELINE_METRICS_EVENT_JSON.contains("local_test_result_cache_hits"),
+            "the baseline fixture must lack the new member: {baseline}"
+        );
+        let following = serde_json::to_string(&StreamValue::Event(Box::new(metrics_event(3.0))))?;
+        let log = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&invocation_proto())?,
+            BASELINE_METRICS_EVENT_JSON,
+            following,
+        );
+
+        let dir = tempfile::tempdir()?;
+        let values = read_all(&dir, "log.json-lines", Encoding::JSON, log.into_bytes()).await?;
+        assert_eq!(values.len(), 2);
+        let old = aggregated_metrics(&values[0]);
+        assert_eq!(old, &buck2_data::AggregatedBuildMetrics::default());
+        let current = aggregated_metrics(&values[1]);
+        assert_eq!(current.local_test_result_cache_hits, 3.0);
+        assert_eq!(current.local_executions, 2.0);
+        Ok(())
+    }
+
+    /// Current JSON control: the counter round-trips through the writer's JSON and the reader.
+    #[tokio::test]
+    async fn test_json_log_with_current_schema_metrics_event() -> buck2_error::Result<()> {
+        let event = serde_json::to_string(&StreamValue::Event(Box::new(metrics_event(5.0))))?;
+        assert!(event.contains("\"local_test_result_cache_hits\":5.0"));
+        let log = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&invocation_proto())?,
+            event,
+            event,
+        );
+        let dir = tempfile::tempdir()?;
+        let values = read_all(&dir, "log.json-lines", Encoding::JSON, log.into_bytes()).await?;
+        assert_eq!(values.len(), 2);
+        for value in &values {
+            assert_eq!(aggregated_metrics(value).local_test_result_cache_hits, 5.0);
+        }
+        Ok(())
+    }
+
+    /// Protobuf control: an absent counter (as in a baseline message) decodes to zero and a set
+    /// counter round-trips, through the maintained protobuf reader.
+    #[tokio::test]
+    async fn test_protobuf_log_with_metrics_events() -> buck2_error::Result<()> {
+        let mut bytes = Vec::new();
+        invocation_proto()
+            .encode_length_delimited(&mut bytes)
+            .unwrap();
+        for hits in [0.0, 7.0] {
+            CommandProgress {
+                progress: Some(command_progress::Progress::Event(Box::new(metrics_event(
+                    hits,
+                )))),
+            }
+            .encode_length_delimited(&mut bytes)
+            .unwrap();
+        }
+        let dir = tempfile::tempdir()?;
+        let values = read_all(&dir, "log.pb", Encoding::PROTO, bytes).await?;
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            aggregated_metrics(&values[0]).local_test_result_cache_hits,
+            0.0
+        );
+        assert_eq!(
+            aggregated_metrics(&values[1]).local_test_result_cache_hits,
+            7.0
+        );
+        Ok(())
+    }
 }

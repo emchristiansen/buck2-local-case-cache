@@ -1476,6 +1476,23 @@ message TestResult {
   string details = 8; // Required
   ConfiguredTargetLabel target_label = 9;
   optional uint64 max_memory_used_bytes = 10;
+  // Present only when no case was executed for this result: the recorded
+  // output of an earlier execution was reused and parsed again. `duration`,
+  // `msg` and `details` then describe that earlier execution.
+  TestResultReuse reuse = 11; // Optional
+}
+
+// The provenance of a reused test result.
+message TestResultReuse {
+  // The attempt that executed the case and recorded the reused output.
+  string origin_attempt = 1;
+  // The immutable entry manifest binding the reused output to its original
+  // execution.
+  string entry_manifest = 2;
+  // This test run's attempt, which looked the output up and reused it.
+  string current_attempt = 3;
+  // The execution time this test run spent on the case (no case ran).
+  google.protobuf.Duration current_execution_time = 4;
 }
 
 // At the beginning of discovery, the test orchestrator will advertise

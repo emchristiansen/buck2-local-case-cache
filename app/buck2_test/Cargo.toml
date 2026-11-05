@@ -50,6 +50,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+buck2_event_observer.workspace = true
 maplit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
