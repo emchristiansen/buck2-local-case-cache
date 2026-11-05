@@ -51,6 +51,7 @@ use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_info::OwnedLocalResourceInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::worker_info::WorkerInfo;
+use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::required_test_local_resource::StarlarkRequiredTestLocalResource;
 use buck2_build_api::keep_going::KeepGoing;
 use buck2_build_api::materialize::invocation_re_use_case;
@@ -210,16 +211,61 @@ use crate::translations;
 
 const MAX_SUFFIX_LEN: usize = 1024;
 
-/// Test info wrapper that works with both `ExternalRunnerTestInfo` and
-/// `InternalRunnerTestInfo`. Provider selection is gated on
-/// `[test].use_internal_runner` to stay consistent with
-/// `command.rs::test_target()`.
+/// The one test provider `buck2 test` runs for a target, chosen by [`OwnedTestInfo::select`].
+/// `Internal` runs in-process; `External` is dispatched to the test executor.
 pub(crate) enum OwnedTestInfo {
     External(OwnedExternalRunnerTestInfo),
     Internal(OwnedInternalRunnerTestInfo),
 }
 
 impl OwnedTestInfo {
+    /// The single runner choice for a target under `[test] use_internal_runner`: its
+    /// `InternalRunnerTestInfo` when the config selects that provider's framework, otherwise its
+    /// `ExternalRunnerTestInfo`. The test driver label-filters, dispatches and builds the
+    /// executor spec from this provider, and the orchestrator resolves that spec's command and
+    /// environment handles from the same provider, so a target with both providers can never
+    /// have its spec produced from one and expanded against the other.
+    ///
+    /// `None` means the target is not a test. A target whose only provider is an
+    /// `InternalRunnerTestInfo` the config does not select is refused: there is no provider to
+    /// run it with.
+    pub(crate) fn select(
+        providers: &FrozenProviderCollectionValue,
+        internal_runner_config: &InternalRunnerConfig,
+    ) -> buck2_error::Result<Option<Self>> {
+        let internal: Option<OwnedInternalRunnerTestInfo> =
+            providers.builtin_provider_value::<InternalRunnerTestInfo>();
+        let external: Option<OwnedExternalRunnerTestInfo> =
+            providers.builtin_provider_value::<ExternalRunnerTestInfo>();
+        match (internal, external) {
+            (Some(internal), external) => {
+                let test_type = internal.as_ref().value().as_ref().test_type().to_owned();
+                if internal_runner_config.should_use(&test_type) {
+                    Ok(Some(Self::Internal(internal)))
+                } else if let Some(external) = external {
+                    Ok(Some(Self::External(external)))
+                } else {
+                    Err(buck2_error::buck2_error!(
+                        ErrorTag::Input,
+                        "`[test] use_internal_runner` does not select test type `{}`, and the \
+                        target has no `ExternalRunnerTestInfo` to run instead",
+                        test_type
+                    ))
+                }
+            }
+            (None, Some(external)) => Ok(Some(Self::External(external))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// The selected provider's labels, for label filtering.
+    pub(crate) fn labels(&self) -> Vec<&str> {
+        match self {
+            Self::External(info) => info.as_ref().value().as_ref().labels().collect(),
+            Self::Internal(info) => info.as_ref().value().as_ref().labels().collect(),
+        }
+    }
+
     fn requests_local_case_result_caching(&self) -> bool {
         match self {
             Self::External(_) => false,
@@ -2092,28 +2138,11 @@ impl BuckTestOrchestrator<'_> {
             .get_providers(test_target)
             .await?
             .require_compatible()?;
-
-        // Gate on [test].use_internal_runner, matching the runner
-        // selection in command.rs::test_target(). Without this check
-        // the orchestrator could resolve fields from the Internal
-        // provider while TPX was set up with the External one.
-        let internal: Option<OwnedInternalRunnerTestInfo> =
-            providers.builtin_provider_value::<InternalRunnerTestInfo>();
-        if let Some(internal) = internal {
-            if internal_runner_config.should_use(internal.as_ref().value().as_ref().test_type()) {
-                return Ok(OwnedTestInfo::Internal(internal));
-            }
-        }
-
-        let external: Option<OwnedExternalRunnerTestInfo> =
-            providers.builtin_provider_value::<ExternalRunnerTestInfo>();
-        if let Some(external) = external {
-            return Ok(OwnedTestInfo::External(external));
-        }
-
-        Err(internal_error!(
-            "Test executable requires ExternalRunnerTestInfo or InternalRunnerTestInfo"
-        ))
+        OwnedTestInfo::select(&providers, internal_runner_config)?.ok_or_else(|| {
+            internal_error!(
+                "Test executable requires ExternalRunnerTestInfo or InternalRunnerTestInfo"
+            )
+        })
     }
 
     /// `[test] local_internal_cases`: whether an `InternalRunnerTestInfo` test whose provider

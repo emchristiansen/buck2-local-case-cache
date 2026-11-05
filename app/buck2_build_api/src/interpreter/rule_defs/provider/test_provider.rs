@@ -162,10 +162,11 @@ impl<'v> TestProvider<'v> for InternalRunnerTestInfo<'v> {
     }
 
     // NOTE: This dispatch() sends the spec to the external test runner (TPX).
-    // In practice, test_target() in command.rs intercepts InternalRunnerTestInfo
-    // before dispatch() is called, routing it to the in-process runner instead.
-    // This impl exists so InternalRunnerTestInfo satisfies the TestProvider
-    // trait for contexts that use visit_artifacts() and labels().
+    // `buck2 test` never calls it: its provider choice (`OwnedTestInfo::select`
+    // in buck2_test) either runs an InternalRunnerTestInfo in-process or uses the
+    // target's ExternalRunnerTestInfo instead. This impl exists so
+    // InternalRunnerTestInfo satisfies the TestProvider trait for contexts that
+    // use visit_artifacts() and labels().
     fn dispatch<'exec>(
         &self,
         target: ConfiguredTarget,
@@ -187,6 +188,9 @@ impl<'v> TestProvider<'v> for InternalRunnerTestInfo<'v> {
     }
 }
 
+/// The test provider whose artifacts building a target's test outputs includes. This is not the
+/// runner choice: `buck2 test` runs the provider `[test] use_internal_runner` selects, which can
+/// be the `ExternalRunnerTestInfo` of a target that also has an `InternalRunnerTestInfo`.
 pub fn test_provider_from_collection<'v>(
     providers: &ProviderCollection<'v>,
 ) -> Option<&'v dyn TestProvider<'v>> {

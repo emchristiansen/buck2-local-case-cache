@@ -37,3 +37,42 @@ python_test = rule(
         "script": attrs.string(),
     },
 )
+
+# Each provider's command passes only when that provider is the expected one and runs with its own
+# environment. Only the Internal provider declares `INTERNAL_ONLY`, so running the wrong provider,
+# or pairing one provider's command or environment with the other's, fails.
+_PAIR_SCRIPT = "import os, sys; sys.exit(0 if '{provider}' == '{expected}' and os.environ.get('{own}') == '1' and '{other}' not in os.environ else 1)"
+
+def _pair_command(provider, expected, own, other):
+    return [
+        "fbpython",
+        "-c",
+        _PAIR_SCRIPT.format(provider = provider, expected = expected, own = own, other = other),
+    ]
+
+def _provider_pair_impl(ctx):
+    expected = ctx.attrs.expected
+    return [
+        DefaultInfo(),
+        InternalRunnerTestInfo(
+            type = "custom",
+            command = _pair_command("internal", expected, "INTERNAL_ONLY", "EXTERNAL_ONLY"),
+            env = {"INTERNAL_ONLY": "1"},
+            listing_command = ["fbpython", "-c", "print('case')"],
+            parse_test_listing = parse_internal_listing,
+            parse_test_result = parse_internal_result,
+        ),
+        ExternalRunnerTestInfo(
+            command = _pair_command("external", expected, "EXTERNAL_ONLY", "INTERNAL_ONLY"),
+            env = {"EXTERNAL_ONLY": "1"},
+            type = "custom",
+        ),
+    ]
+
+provider_pair_test = rule(
+    impl = _provider_pair_impl,
+    attrs = {
+        # `internal` or `external`: the provider the test run is expected to use.
+        "expected": attrs.string(),
+    },
+)

@@ -1,4 +1,4 @@
-load(":python_test.bzl", "python_test")
+load(":python_test.bzl", "provider_pair_test", "python_test")
 
 python_test(
     name = "trivial_pass",
@@ -26,4 +26,9 @@ python_test(
     internal = True,
     local_case_cache = True,
     script = "import sys; sys.exit(0)",
+)
+
+provider_pair_test(
+    name = "provider_pair",
+    expected = read_config("provider_pair", "expected", ""),
 )

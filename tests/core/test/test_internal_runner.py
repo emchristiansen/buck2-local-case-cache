@@ -96,3 +96,61 @@ async def test_internal_cache_request_with_literal_tool_executes_normally(
         test_executor=INTERNAL_TEST_EXECUTOR,
     )
     assert "argv[0] `fbpython` is found through the working directory or PATH" in result.stderr
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_pair_runner_disabled_runs_external(buck: Buck) -> None:
+    # The executor spec and its expansion both come from the External provider: its command
+    # runs with its own environment, and the Internal-only `INTERNAL_ONLY` is neither a
+    # dangling handle nor set.
+    await buck.test(
+        "-c",
+        "test.use_internal_runner=false",
+        "-c",
+        "provider_pair.expected=external",
+        ":provider_pair",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_pair_unselected_framework_runs_external(buck: Buck) -> None:
+    await buck.test(
+        "-c",
+        "test.use_internal_runner=rust",
+        "-c",
+        "provider_pair.expected=external",
+        ":provider_pair",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_provider_pair_runner_enabled_runs_internal(buck: Buck) -> None:
+    # The fixture's External command fails when Internal is expected, so passing proves the
+    # Internal provider ran.
+    await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        "provider_pair.expected=internal",
+        ":provider_pair",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_internal_only_provider_with_runner_disabled_is_refused(buck: Buck) -> None:
+    await expect_failure(
+        buck.test(
+            "-c",
+            "test.use_internal_runner=false",
+            ":internal_default_pass",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        ),
+        stderr_regex="does not select test type `custom`, and the target has no `ExternalRunnerTestInfo`",
+    )
