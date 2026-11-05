@@ -17,3 +17,24 @@ def parse_internal_result(stdout, stderr, exit_code):
         "status": "PASS" if exit_code == 0 else "FAIL",
         "message": None if exit_code == 0 else stderr,
     }]
+
+def parse_named_result(stdout, stderr, exit_code):
+    """A case prints its own name; a case printing `UNPARSEABLE` makes the parser fail."""
+    name = stdout.strip()
+    if name == "UNPARSEABLE":
+        fail("unparseable case output")
+    return [{
+        "name": name,
+        "status": "PASS" if exit_code == 0 else "FAIL",
+        "message": None if exit_code == 0 else stderr,
+        "details": "" if exit_code == 0 else stderr,
+    }]
+
+def parse_internal_result_with_details(stdout, stderr, exit_code):
+    """As `parse_internal_result`, also reporting a failed case's stderr as its details."""
+    return [{
+        "name": "case",
+        "status": "PASS" if exit_code == 0 else "FAIL",
+        "message": None if exit_code == 0 else stderr,
+        "details": "" if exit_code == 0 else stderr,
+    }]

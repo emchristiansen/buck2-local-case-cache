@@ -3038,7 +3038,7 @@ mod tests {
             )
             .unwrap();
             let mut env: sorted_vector_map::SortedVectorMap<String, String> =
-                scratch.env().unwrap().into_iter().collect();
+                sorted_vector_map::SortedVectorMap::new();
             env.insert("PATH".to_owned(), store.clone());
             CommandExecutionRequest::new(
                 vec![],
@@ -3048,7 +3048,7 @@ mod tests {
             )
             .with_local_environment_inheritance(EnvironmentInheritance::empty())
             .with_executor_preference(ExecutorPreference::LocalPreferred)
-            .with_scratch_subdirectories(scratch.subdirectories())
+            .with_scratch_dir_variables(scratch.variables())
         };
         let facts = || RequestFacts {
             project_fs: project,
@@ -3091,15 +3091,15 @@ mod tests {
                 },
             )
             .unwrap();
-        // The recorded environment, in installation order.
+        // The recorded environment, in installation order: the scratch directory variables last.
         let mut expected = KeyRecord::default();
         let scratch = fresh.absolute().to_string();
-        let env = fresh.env().unwrap();
+        let env = fresh.values().unwrap();
         for (name, value) in [
             ("TMPDIR", scratch.as_str()),
+            ("PATH", store.as_str()),
             ("FRESH_A", env[0].1.as_str()),
             ("FRESH_B", env[1].1.as_str()),
-            ("PATH", store.as_str()),
         ] {
             expected.field("env_name", name.as_bytes());
             expected.field("env_value", value.as_bytes());

@@ -1,4 +1,12 @@
-load(":python_test.bzl", "provider_artifact_pair_test", "provider_pair_test", "python_test")
+load(
+    ":python_test.bzl",
+    "fresh_dir_broker",
+    "fresh_dir_case_test",
+    "fresh_dir_env_test",
+    "provider_artifact_pair_test",
+    "provider_pair_test",
+    "python_test",
+)
 
 python_test(
     name = "trivial_pass",
@@ -64,4 +72,99 @@ for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
 
 provider_artifact_pair_test(
     name = "provider_artifact_pair",
+)
+
+# Regressions for a scratch path released before its child terminated: the same holding case
+# on each local-case route (no reuse requested; reuse requested without a store; reuse
+# requested with a parser that cannot be keyed), and beside a sibling whose output the parser
+# refuses.
+_SIGNALS = read_config("fresh_dirs", "signals", "")
+
+fresh_dir_case_test(
+    name = "fresh_hold",
+    cases = ["hold"],
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_cache_requested",
+    cases = ["hold"],
+    local_case_cache = True,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_unsupported_parser",
+    cases = ["hold"],
+    local_case_cache = True,
+    self_contained_parser = False,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure_cache_requested",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    local_case_cache = True,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure_unsupported_parser",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    local_case_cache = True,
+    self_contained_parser = False,
+    signals = _SIGNALS,
+)
+
+# Fresh directory variables against the variables the executor and local resources set.
+_STARTED = read_config("fresh_dirs", "started", "")
+
+fresh_dir_env_test(
+    name = "fresh_identity_names",
+    fresh_dir_env = [
+        "BUCK_BUILD_ID",
+        "BUCK2_DAEMON_UUID",
+        "FRESH_A",
+    ],
+    started = _STARTED,
+)
+
+fresh_dir_broker(
+    name = "broker_sets_fresh_a",
+    variable = "FRESH_A",
+)
+
+fresh_dir_broker(
+    name = "broker_sets_other",
+    variable = "OTHER",
+)
+
+fresh_dir_env_test(
+    name = "fresh_name_set_by_resource",
+    broker = ":broker_sets_fresh_a",
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
+)
+
+fresh_dir_env_test(
+    name = "fresh_beside_unrelated_resource",
+    broker = ":broker_sets_other",
+    broker_sets_other = True,
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
 )

@@ -421,10 +421,20 @@ pub struct CommandExecutionRequest {
     /// environment its reuse key records.
     omit_local_invocation_identity_env: bool,
 
-    /// Empty directories the local executor creates inside the request's scratch path each time
-    /// it prepares that path, before the command starts. Only the local executor creates them, so
-    /// a request carrying any must execute locally.
-    scratch_subdirectories: Vec<ForwardRelativePathBuf>,
+    /// Variables the local executor sets, after every other variable, to empty directories it
+    /// creates inside the request's scratch path each time it prepares that path, before the
+    /// command starts. Only the local executor creates them, so a request carrying any must
+    /// execute locally.
+    scratch_dir_variables: Vec<ScratchDirVariable>,
+}
+
+/// A variable the local executor sets to an empty, owner-only directory of the request's
+/// scratch path, `subdirectory` of it, which it creates before the command starts. The executor
+/// installs it after every other variable of the command, so its value is that directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScratchDirVariable {
+    pub name: String,
+    pub subdirectory: ForwardRelativePathBuf,
 }
 
 impl CommandExecutionRequest {
@@ -465,7 +475,7 @@ impl CommandExecutionRequest {
             network_access: None,
             disable_local_network_isolation: false,
             omit_local_invocation_identity_env: false,
-            scratch_subdirectories: Vec::new(),
+            scratch_dir_variables: Vec::new(),
         }
     }
 
@@ -783,13 +793,13 @@ impl CommandExecutionRequest {
         self.omit_local_invocation_identity_env
     }
 
-    pub fn with_scratch_subdirectories(mut self, subdirectories: Vec<ForwardRelativePathBuf>) -> Self {
-        self.scratch_subdirectories = subdirectories;
+    pub fn with_scratch_dir_variables(mut self, variables: Vec<ScratchDirVariable>) -> Self {
+        self.scratch_dir_variables = variables;
         self
     }
 
-    pub fn scratch_subdirectories(&self) -> &[ForwardRelativePathBuf] {
-        &self.scratch_subdirectories
+    pub fn scratch_dir_variables(&self) -> &[ScratchDirVariable] {
+        &self.scratch_dir_variables
     }
 }
 

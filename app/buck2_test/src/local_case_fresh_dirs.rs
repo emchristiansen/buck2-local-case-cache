@@ -13,17 +13,21 @@
 //! A Testing request of such a provider gets one engine-owned scratch path, the executor's
 //! existing per-request scratch: it is digested into the input tree as an empty directory, the
 //! local executor removes and recreates it before every run and sets `TMPDIR` to it. The `i`th
-//! declared name is set to the subdirectory `i` of it, which the local executor creates empty
-//! after preparing the scratch path and before the command starts. So, as with the external
-//! runner's `--fresh-dir-env`, each name gets a new, empty directory of its own inside the
-//! command's `TMPDIR`, and listing gets none.
+//! declared name is a scratch directory variable of the request for the subdirectory `i` of it:
+//! the local executor creates that directory empty and owner-only after preparing the scratch
+//! path, and sets the variable to it after every other variable of the command, so no other
+//! source of the environment replaces it. So, as with the external runner's `--fresh-dir-env`,
+//! each name gets a new, empty directory of its own inside the command's `TMPDIR`, and listing
+//! gets none.
 //!
 //! The scratch path is a function of the configured target and the request's suite, cases and
 //! variant only: the same case gets the same absolute values, which the local case key records
 //! byte for byte, and different cases never share one. Requests that run the same case under
 //! different keys do share it, so every execution of such a request holds the path's
-//! [`ScratchLease`] from before its inputs are materialized (and the path removed) until it no
-//! longer needs the path; a tracked case keeps it until its result is published or rejected.
+//! [`ScratchLease`] from before its inputs are materialized (and the path removed) until its
+//! child has terminated: every such execution runs as its own task with a real cancellation
+//! context, so a cancelled or abandoned execution keeps the lease while the executor stops and
+//! reaps its child. A tracked case keeps it until its result is published or rejected.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -37,6 +41,7 @@ use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_execute::execute::request::CommandExecutionInput;
 use buck2_execute::execute::request::CommandExecutionRequest;
+use buck2_execute::execute::request::ScratchDirVariable;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckMutMap;
@@ -121,8 +126,8 @@ impl FreshDirs {
         &self.absolute
     }
 
-    /// Each declared name and the absolute path of its directory.
-    pub(crate) fn env(&self) -> buck2_error::Result<Vec<(String, String)>> {
+    /// Each declared name and the absolute path of its directory: the value the executor sets.
+    pub(crate) fn values(&self) -> buck2_error::Result<Vec<(String, String)>> {
         self.names
             .iter()
             .map(|(name, subdirectory)| {
@@ -133,18 +138,30 @@ impl FreshDirs {
             .collect()
     }
 
+    /// The declared names.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(|(name, _)| name.as_str())
+    }
+
+    /// The scratch directory variables the executor sets, in declaration order.
+    pub(crate) fn variables(&self) -> Vec<ScratchDirVariable> {
+        self.names
+            .iter()
+            .map(|(name, subdirectory)| ScratchDirVariable {
+                name: name.clone(),
+                subdirectory: subdirectory.clone(),
+            })
+            .collect()
+    }
+
     /// The request input that makes the executor prepare the scratch path.
     pub(crate) fn input(&self) -> CommandExecutionInput {
         CommandExecutionInput::ScratchPath(self.scratch.clone())
     }
 
-    /// The subdirectories the executor creates inside the scratch path.
-    pub(crate) fn subdirectories(&self) -> Vec<ForwardRelativePathBuf> {
-        self.names.iter().map(|(_, dir)| dir.clone()).collect()
-    }
-
-    /// Whether `request`'s scratch inputs, scratch subdirectories and declared variables are
-    /// exactly these, so that its scratch path is this engine-owned one and nothing else.
+    /// Whether `request`'s scratch inputs and scratch directory variables are exactly these, and
+    /// it sets none of those variables itself, so that its scratch path is this engine-owned one
+    /// and nothing else.
     pub(crate) fn admits(&self, request: &CommandExecutionRequest) -> bool {
         let mut scratch_inputs = request.inputs().iter().filter_map(|input| match input {
             CommandExecutionInput::ScratchPath(path) => Some(path),
@@ -152,14 +169,9 @@ impl FreshDirs {
         });
         let one_scratch = scratch_inputs.next() == Some(&self.scratch)
             && scratch_inputs.next().is_none();
-        let Ok(env) = self.env() else {
-            return false;
-        };
         one_scratch
-            && request.scratch_subdirectories() == self.subdirectories().as_slice()
-            && env
-                .iter()
-                .all(|(name, value)| request.env().get(name) == Some(value))
+            && request.scratch_dir_variables() == self.variables().as_slice()
+            && self.names().all(|name| !request.env().contains_key(name))
     }
 
     /// Wait for the exclusive use of the scratch path. It is released when dropped.
@@ -255,14 +267,14 @@ mod tests {
         FreshDirs::for_stage(&target(target_name), stage, names.iter().copied(), fs).unwrap()
     }
 
-    /// The request the orchestrator builds for `fresh`: its scratch input, its subdirectories and
-    /// its variables, plus an unrelated variable.
+    /// The request the orchestrator builds for `fresh`: its scratch input and its scratch
+    /// directory variables, plus an unrelated variable of its own.
     fn request_for(
         fs: &ArtifactFs,
         fresh: &FreshDirs,
         extra_inputs: Vec<CommandExecutionInput>,
     ) -> CommandExecutionRequest {
-        let mut env: SortedVectorMap<String, String> = fresh.env().unwrap().into_iter().collect();
+        let mut env: SortedVectorMap<String, String> = SortedVectorMap::new();
         env.insert("OTHER".to_owned(), "1".to_owned());
         let inputs = std::iter::once(fresh.input()).chain(extra_inputs).collect();
         let paths = CommandExecutionPaths::new(
@@ -274,7 +286,7 @@ mod tests {
         )
         .unwrap();
         CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
-            .with_scratch_subdirectories(fresh.subdirectories())
+            .with_scratch_dir_variables(fresh.variables())
     }
 
     #[test]
@@ -303,17 +315,23 @@ mod tests {
             "{scratch}"
         );
         assert_eq!(
-            a.env().unwrap(),
+            a.values().unwrap(),
             vec![
                 ("FRESH_A".to_owned(), format!("{scratch}/0")),
                 ("FRESH_B".to_owned(), format!("{scratch}/1")),
             ]
         );
         assert_eq!(
-            a.subdirectories(),
+            a.variables(),
             vec![
-                ForwardRelativePathBuf::new("0".to_owned()).unwrap(),
-                ForwardRelativePathBuf::new("1".to_owned()).unwrap(),
+                ScratchDirVariable {
+                    name: "FRESH_A".to_owned(),
+                    subdirectory: ForwardRelativePathBuf::new("0".to_owned()).unwrap(),
+                },
+                ScratchDirVariable {
+                    name: "FRESH_B".to_owned(),
+                    subdirectory: ForwardRelativePathBuf::new("1".to_owned()).unwrap(),
+                },
             ]
         );
 
@@ -337,8 +355,9 @@ mod tests {
         }
     }
 
-    /// Admission accepts exactly the engine's own scratch path, subdirectories and values; any
-    /// other scratch path, or the same one set up differently, is refused.
+    /// Admission accepts exactly the engine's own scratch path and scratch directory variables,
+    /// with the request setting none of those names itself; any other scratch path, or the same
+    /// one set up differently, is refused.
     #[test]
     fn admits_only_the_engines_own_scratch_setup() {
         let temp = ProjectRootTemp::new().unwrap();
@@ -348,7 +367,7 @@ mod tests {
         let b = fresh(&fs, "t", &testing(&["b"], None), &names).unwrap();
         assert!(a.admits(&request_for(&fs, &a, vec![])));
 
-        // Another case's scratch path, with values naming it.
+        // Another case's scratch path, with variables naming its directories.
         assert!(!a.admits(&request_for(&fs, &b, vec![])));
         // A second scratch input.
         assert!(!a.admits(&request_for(&fs, &a, vec![b.input()])));
@@ -356,30 +375,25 @@ mod tests {
         let paths =
             CommandExecutionPaths::new(vec![], Default::default(), &fs, DigestConfig::testing_default(), None)
                 .unwrap();
-        let env: SortedVectorMap<String, String> = a.env().unwrap().into_iter().collect();
-        let bare = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
-            .with_scratch_subdirectories(a.subdirectories());
+        let bare = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, Default::default())
+            .with_scratch_dir_variables(a.variables());
         assert!(!a.admits(&bare));
-        // Missing, extra or reordered subdirectories.
-        let request = request_for(&fs, &a, vec![]);
-        assert!(!a.admits(&request.with_scratch_subdirectories(vec![])));
-        let mut extra = a.subdirectories();
-        extra.push(ForwardRelativePathBuf::new("2".to_owned()).unwrap());
-        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_subdirectories(extra)));
-        let mut reordered = a.subdirectories();
+        // Missing, extra, renamed or reordered variables.
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_dir_variables(vec![])));
+        let mut extra = a.variables();
+        extra.push(ScratchDirVariable {
+            name: "FRESH_C".to_owned(),
+            subdirectory: ForwardRelativePathBuf::new("2".to_owned()).unwrap(),
+        });
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_dir_variables(extra)));
+        let mut renamed = a.variables();
+        renamed[0].name = "OTHER_NAME".to_owned();
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_dir_variables(renamed)));
+        let mut reordered = a.variables();
         reordered.reverse();
-        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_subdirectories(reordered)));
-        // A value that names another directory, or a missing name.
-        for (name, value) in [("FRESH_A", Some("/elsewhere".to_owned())), ("FRESH_B", None)] {
-            let mut env: SortedVectorMap<String, String> = a.env().unwrap().into_iter().collect();
-            match value {
-                Some(value) => {
-                    env.insert(name.to_owned(), value);
-                }
-                None => {
-                    env.remove(name);
-                }
-            }
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_dir_variables(reordered)));
+        // The request also setting a declared name itself.
+        for name in names {
             let paths = CommandExecutionPaths::new(
                 vec![a.input()],
                 Default::default(),
@@ -388,8 +402,10 @@ mod tests {
                 None,
             )
             .unwrap();
+            let mut env: SortedVectorMap<String, String> = SortedVectorMap::new();
+            env.insert(name.to_owned(), "/elsewhere".to_owned());
             let request = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
-                .with_scratch_subdirectories(a.subdirectories());
+                .with_scratch_dir_variables(a.variables());
             assert!(!a.admits(&request), "{name}");
         }
     }

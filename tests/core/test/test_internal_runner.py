@@ -11,7 +11,11 @@
 
 
 import asyncio
+import json
+import os
 import re
+import signal
+from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.api.buck_result import BuckResult
@@ -334,3 +338,261 @@ async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
     )
     for result in results:
         assert_exactly_one_pass(result)
+
+
+_PASS_2 = (
+    "Tests finished: Pass 2. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
+    "Infra Failure 0. Build failure 0"
+)
+
+
+async def _without_forkserver(buck: Buck) -> None:
+    # Without a forkserver the daemon spawns the child itself and nothing kills it when the
+    # executing future is dropped, so a scratch path released before its child terminated
+    # leaves that child running for the next holder to observe.
+    await buck.kill()
+    with open(buck.cwd / ".buckconfig", "a") as buckconfig:
+        buckconfig.write("\n[buck2]\nforkserver = false\n")
+
+
+async def _expect_forkserver(buck: Buck, present: bool) -> None:
+    status = json.loads((await buck.status()).stdout)
+    assert (status.get("forkserver_pid") is not None) == present, status
+
+
+def _holder_pid(signals: Path) -> int:
+    return int((signals / "hold" / "holder").read_text())
+
+
+def _stop_if_running(signals: Path) -> None:
+    # A holder that outlived its scratch path's release must not outlive the test.
+    holder = signals / "hold" / "holder"
+    if holder.exists():
+        try:
+            os.kill(_holder_pid(signals), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+async def _wait_for(path: Path) -> None:
+    for _ in range(600):
+        if path.exists():
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def _hold_args(signals: Path, target: str, *config: str) -> list[str]:
+    return [
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        f"fresh_dirs.signals={signals}",
+        *config,
+        target,
+    ]
+
+
+async def _cancel_holder_with_queued_run(
+    buck: Buck, target: str, *config: str
+) -> None:
+    # The first run's case holds the scratch path with a live child; a second run of the same
+    # case waits for it; the first run is then interrupted. The second run's case passes only
+    # if the first run's child was gone before the scratch path was released to it.
+    signals = buck.cwd / "signals"
+    args = _hold_args(signals, target, *config)
+    holder = await buck.test(*args, test_executor=INTERNAL_TEST_EXECUTOR).start()
+    try:
+        await _wait_for(signals / "hold" / "holder")
+        queued = asyncio.ensure_future(
+            buck.test(*args, test_executor=INTERNAL_TEST_EXECUTOR)
+        )
+        # Give the second run time to reach the case and wait for its scratch path; it
+        # discriminates equally if it gets there only after the interruption.
+        await asyncio.sleep(3)
+        holder.send_signal(signal.SIGINT)
+        await holder.communicate()
+        assert holder.returncode != 0, holder.returncode
+        result = await queued
+        assert_exactly_one_pass(result)
+        assert (signals / "hold" / "queued").read_text() == "gone"
+    finally:
+        _stop_if_running(signals)
+
+
+async def _holder_beside_parser_failure(
+    buck: Buck, target: str = ":fresh_hold_beside_parser_failure", *config: str
+) -> None:
+    # The first run ends on its sibling's unparseable output while `hold` still runs, which
+    # abandons `hold`'s execution; the next run's `hold` passes only if that child was gone
+    # before the scratch path was released.
+    signals = buck.cwd / "signals"
+    args = _hold_args(signals, target, *config)
+    try:
+        await expect_failure(
+            buck.test(*args, test_executor=INTERNAL_TEST_EXECUTOR),
+            stderr_regex="unparseable case output",
+        )
+        result = await buck.test(*args, test_executor=INTERNAL_TEST_EXECUTOR)
+        assert _PASS_2 in _plain_stderr(result), result.stderr
+        assert (signals / "hold" / "queued").read_text() == "gone"
+    finally:
+        _stop_if_running(signals)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_cancelled_holder_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    await _cancel_holder_with_queued_run(buck, ":fresh_hold")
+    await _expect_forkserver(buck, True)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_cancelled_holder_releases_after_its_child_without_forkserver(
+    buck: Buck,
+) -> None:
+    await _without_forkserver(buck)
+    await _cancel_holder_with_queued_run(buck, ":fresh_hold")
+    await _expect_forkserver(buck, False)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_cancelled_holder_without_store_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    # Reuse requested, but no store is configured: the case executes normally.
+    await _without_forkserver(buck)
+    await _cancel_holder_with_queued_run(buck, ":fresh_hold_cache_requested")
+    await _expect_forkserver(buck, False)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_cancelled_holder_with_unsupported_parser_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    # Reuse requested with a store, but the parser cannot be keyed: the case executes
+    # normally.
+    await _without_forkserver(buck)
+    store = buck.cwd / "local-case-store"
+    await _cancel_holder_with_queued_run(
+        buck,
+        ":fresh_hold_unsupported_parser",
+        "-c",
+        f"test.local_case_result_cache_root={store}",
+    )
+    await _expect_forkserver(buck, False)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    await _holder_beside_parser_failure(buck)
+    await _expect_forkserver(buck, True)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child_without_forkserver(
+    buck: Buck,
+) -> None:
+    await _without_forkserver(buck)
+    await _holder_beside_parser_failure(buck)
+    await _expect_forkserver(buck, False)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_holder_without_store_beside_parser_failure_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    # Reuse requested, but no store is configured: the case executes normally.
+    await _without_forkserver(buck)
+    await _holder_beside_parser_failure(
+        buck, ":fresh_hold_beside_parser_failure_cache_requested"
+    )
+    await _expect_forkserver(buck, False)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_holder_with_unsupported_parser_beside_parser_failure_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    # Reuse requested with a store, but the parser cannot be keyed: the case executes
+    # normally.
+    await _without_forkserver(buck)
+    store = buck.cwd / "local-case-store"
+    await _holder_beside_parser_failure(
+        buck,
+        ":fresh_hold_beside_parser_failure_unsupported_parser",
+        "-c",
+        f"test.local_case_result_cache_root={store}",
+    )
+    await _expect_forkserver(buck, False)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_names_are_not_replaced_by_invocation_identity(
+    buck: Buck,
+) -> None:
+    # `BUCK_BUILD_ID` and `BUCK2_DAEMON_UUID` are otherwise set by the executor for every
+    # command; declared as fresh directory names they must still be the case's directories.
+    started = buck.cwd / "started.json"
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        f"fresh_dirs.started={started}",
+        ":fresh_identity_names",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert_exactly_one_pass(result)
+    assert started.exists()
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_name_set_by_a_local_resource_is_refused(
+    buck: Buck,
+) -> None:
+    # A local resource would set the case's fresh directory variable to its own value; the
+    # case is refused before its child starts.
+    started = buck.cwd / "started.json"
+    await expect_failure(
+        buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            f"fresh_dirs.started={started}",
+            ":fresh_name_set_by_resource",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        ),
+        stderr_regex="Scratch directory variable `FRESH_A` is also set by a local resource",
+    )
+    assert not started.exists()
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_beside_an_unrelated_local_resource(buck: Buck) -> None:
+    # The control: a local resource setting another variable leaves the fresh directory in
+    # place and still sets its own.
+    started = buck.cwd / "started.json"
+    result = await buck.test(
+        "-c",
+        "test.use_internal_runner=true",
+        "-c",
+        f"fresh_dirs.started={started}",
+        ":fresh_beside_unrelated_resource",
+        test_executor=INTERNAL_TEST_EXECUTOR,
+    )
+    assert_exactly_one_pass(result)
+    assert json.loads(started.read_text())["OTHER"] == "42"

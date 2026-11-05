@@ -575,14 +575,29 @@ impl<'a> BuckTestOrchestrator<'a> {
                 host_sharing_requirements: host_sharing_requirements.into(),
                 disable_test_execution_caching,
             };
+            // A fresh-directory execution holds its scratch path's lease until its child has
+            // terminated, so it too needs a task that outlives a dropped caller.
+            let fresh_dirs_declared = matches!(key.stage.as_ref(), TestStage::Testing { .. })
+                && !Self::get_test_info(
+                    &mut self.dice.dupe().ctx(),
+                    &key.test_target,
+                    &self.internal_runner_config,
+                )
+                .await?
+                .fresh_dir_env()
+                .is_empty();
+            let own_task = matches!(local_case_request, Some(LocalCaseRequest::Track { .. }))
+                || fresh_dirs_declared;
             match local_case_request {
-                Some(local_case_request @ LocalCaseRequest::Track { .. }) => {
+                local_case_request if own_task => {
                     // A tracked case holds its store generation from before its child starts
-                    // until settlement. Cancelling the test command drops this future, so the
-                    // case runs as its own task with a real cancellation context: on
-                    // cancellation the task stays alive inside `execute_local_case`'s critical
-                    // section, the executor kills the child and returns its collected streams,
-                    // and the generation is settled with them rather than abandoned.
+                    // until settlement, and a fresh-directory execution its scratch path's lease
+                    // until its child has terminated. Cancelling the test command drops this
+                    // future, so the case runs as its own task with a real cancellation context:
+                    // on cancellation the task stays alive inside the critical section around
+                    // execution, the executor kills and reaps the child and returns its
+                    // collected streams, and only then is the generation settled with them and
+                    // the scratch path released.
                     let dice = self.dice.dupe();
                     let liveliness_observer = self.liveliness_observer.dupe();
                     let internal_runner_config = self.internal_runner_config.clone();
@@ -596,7 +611,7 @@ impl<'a> BuckTestOrchestrator<'a> {
                                     key,
                                     liveliness_observer,
                                     &internal_runner_config,
-                                    Some(local_case_request),
+                                    local_case_request,
                                 )
                                 .await
                             }
@@ -781,7 +796,7 @@ impl<'a> BuckTestOrchestrator<'a> {
         let ExpandedTestExecutable {
             cwd,
             cmd: expanded_cmd,
-            env: mut expanded_env,
+            env: expanded_env,
             ensured_inputs,
             supports_re,
             declared_outputs,
@@ -790,15 +805,21 @@ impl<'a> BuckTestOrchestrator<'a> {
         let fresh_dirs =
             FreshDirs::for_stage(&test_target, stage.as_ref(), test_info.fresh_dir_env(), fs)?;
         if let Some(fresh_dirs) = &fresh_dirs {
-            for (name, value) in fresh_dirs.env()? {
-                if expanded_env.insert(name.clone(), value).is_some() {
-                    return Err(ExecuteError::Error(buck2_error::buck2_error!(
-                        buck2_error::ErrorTag::Input,
-                        "`fresh_dir_env` entry `{}` of {} is also set in the test environment",
-                        name,
-                        test_target
-                    )));
-                }
+            // The executor sets the variables itself, after every other variable.
+            if let Some(name) = fresh_dirs.names().find(|name| expanded_env.contains_key(*name)) {
+                return Err(ExecuteError::Error(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "`fresh_dir_env` entry `{}` of {} is also set in the test environment",
+                    name,
+                    test_target
+                )));
+            }
+            if worker.is_some() {
+                return Err(ExecuteError::Error(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "{} declares `fresh_dir_env`, which a test worker cannot provide",
+                    test_target
+                )));
             }
         }
 
@@ -1948,9 +1969,19 @@ impl BuckTestOrchestrator<'_> {
                             *local_case_outcome = outcome;
                             result
                         } else if let Some(fresh_dirs) = &fresh_dirs {
-                            let _scratch = fresh_dirs.lease().await;
-                            executor
-                                .exec_cmd(manager, &prepared_command, cancellation)
+                            // This runs as its own task with a real cancellation context (see
+                            // `execute2`): cancelled, the executor stops and reaps the child inside
+                            // the critical section, and only then is the lease released.
+                            let scratch = fresh_dirs.lease().await;
+                            let prepared_command = &prepared_command;
+                            cancellation
+                                .critical_section(|| async move {
+                                    let result = executor
+                                        .exec_cmd(manager, prepared_command, cancellation)
+                                        .await;
+                                    drop(scratch);
+                                    result
+                                })
                                 .await
                         } else if supports_test_execution_caching {
                             match executor
@@ -2476,9 +2507,7 @@ impl BuckTestOrchestrator<'_> {
             .with_meta_internal_extra_params(meta_internal_extra_params)
             .with_required_local_resources(required_local_resources)?
             .with_disable_local_network_isolation(disable_local_network_isolation)
-            .with_scratch_subdirectories(
-                fresh_dirs.map(FreshDirs::subdirectories).unwrap_or_default(),
-            )
+            .with_scratch_dir_variables(fresh_dirs.map(FreshDirs::variables).unwrap_or_default())
             .with_is_test();
         if let Some(timeout) = timeout {
             request = request.with_timeout(timeout)

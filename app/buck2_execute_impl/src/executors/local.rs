@@ -89,6 +89,7 @@ use buck2_fs::async_fs_util;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
+use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckIndexMap;
 use buck2_resource_control::ActionFreezeEvent;
@@ -640,6 +641,8 @@ impl LocalExecutor {
         let mut env = vec![];
 
         let scratch_path_abs;
+        // The scratch directory variables and their values, installed after everything else.
+        let mut scratch_dirs = Vec::new();
 
         if let Some(scratch_path) = &scratch_path.path {
             // For the $TMPDIR - important it is absolute
@@ -662,6 +665,7 @@ impl LocalExecutor {
                 scratch_environment(&scratch_path_abs)
                     .map(|(key, value)| (key, StrOrOsStr::OsStr(value))),
             );
+            scratch_dirs = scratch_dir_environment(&scratch_path_abs, request);
         }
         env.extend(
             request
@@ -683,6 +687,28 @@ impl LocalExecutor {
             env.push(("BUCK2_DAEMON_UUID", StrOrOsStr::from(&*daemon_id)));
             env.push(("BUCK_BUILD_ID", StrOrOsStr::from(build_id)));
         }
+        // Scratch directory variables come last, so nothing installed before them, the request's
+        // own variables and the invocation identity included, replaces them. A local resource
+        // that sets one would be lost without notice, so it is refused instead.
+        if let Some((name, _)) = scratch_dirs.iter().find(|(name, _)| {
+            local_resource_holders
+                .iter()
+                .any(|h| h.as_ref().0.iter().any(|env_var| env_var.key == *name))
+        }) {
+            return manager.error(
+                "scratch_dir_variable_conflict",
+                buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Scratch directory variable `{}` is also set by a local resource",
+                    name
+                ),
+            );
+        }
+        env.extend(
+            scratch_dirs
+                .iter()
+                .map(|(name, value)| (*name, StrOrOsStr::OsStr(value.as_os_str()))),
+        );
 
         let liveliness_observer = manager.inner.liveliness_observer.dupe().and(cancellation);
 
@@ -1340,7 +1366,11 @@ pub async fn materialize_inputs(
     let mut artifacts = vec![];
     let mut scratch = ScratchPath {
         path: None,
-        subdirectories: request.scratch_subdirectories().to_vec(),
+        subdirectories: request
+            .scratch_dir_variables()
+            .iter()
+            .map(|variable| variable.subdirectory.clone())
+            .collect(),
     };
     let mut configuration_path_to_content_based_path_symlinks = vec![];
 
@@ -1419,6 +1449,11 @@ pub async fn materialize_inputs(
     if scratch.path.is_none() && !scratch.subdirectories.is_empty() {
         return Err(buck2_error::internal_error!(
             "Scratch subdirectories requested for an action without a scratch path"
+        ));
+    }
+    if request.worker().is_some() && !scratch.subdirectories.is_empty() {
+        return Err(buck2_error::internal_error!(
+            "Scratch directory variables requested for a worker action"
         ));
     }
 
@@ -1692,6 +1727,24 @@ fn scratch_environment(scratch: &AbsPath) -> impl Iterator<Item = (&'static str,
     names.iter().map(move |name| (*name, scratch.as_os_str()))
 }
 
+/// Each scratch directory variable of `request` and its value: its directory of the scratch path
+/// `scratch` (absolute).
+fn scratch_dir_environment<'a>(
+    scratch: &AbsPath,
+    request: &'a CommandExecutionRequest,
+) -> Vec<(&'a str, AbsPathBuf)> {
+    request
+        .scratch_dir_variables()
+        .iter()
+        .map(|variable| {
+            (
+                variable.name.as_str(),
+                scratch.join(variable.subdirectory.as_path()),
+            )
+        })
+        .collect()
+}
+
 /// The complete environment, in installation order with later keys replacing earlier ones, that
 /// the local executor installs for `request` running in `working_directory` (absolute).
 ///
@@ -1699,8 +1752,9 @@ fn scratch_environment(scratch: &AbsPath) -> impl Iterator<Item = (&'static str,
 /// inheritance must clear the daemon environment, and the request must have no local resources
 /// and no worker, and must omit the invocation identity variables. A request with a scratch path
 /// is described only given `scratch`, that path resolved to an absolute path by the caller, since
-/// the executor sets variables to it. Any other request returns `None`, since part of its child
-/// environment is chosen during execution.
+/// the executor sets variables to it: `TMPDIR` first and the scratch directory variables last.
+/// Any other request returns `None`, since part of its child environment is chosen during
+/// execution.
 pub fn determined_local_environment(
     request: &CommandExecutionRequest,
     working_directory: &AbsPath,
@@ -1716,11 +1770,15 @@ pub fn determined_local_environment(
         || !request.required_local_resources().is_empty()
         || request.worker().is_some()
         || has_scratch != scratch.is_some()
+        || (!has_scratch && !request.scratch_dir_variables().is_empty())
     {
         return None;
     }
     let mut recorded = RecordedEnvironment::default();
     let scratch_env = scratch.into_iter().flat_map(scratch_environment);
+    let scratch_dirs = scratch
+        .map(|scratch| scratch_dir_environment(scratch, request))
+        .unwrap_or_default();
     apply_local_execution_environment(
         &mut recorded,
         working_directory,
@@ -1731,6 +1789,11 @@ pub fn determined_local_environment(
                     .env()
                     .iter()
                     .map(|(key, value)| (OsStr::new(key.as_str()), OsStr::new(value.as_str()))),
+            )
+            .chain(
+                scratch_dirs
+                    .iter()
+                    .map(|(key, value)| (OsStr::new(*key), value.as_os_str())),
             ),
         Some(inheritance),
     );
@@ -1903,6 +1966,7 @@ mod tests {
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
+    use buck2_execute::execute::request::ScratchDirVariable;
     use buck2_hash::BuckMutMap;
     use host_sharing::HostSharingStrategy;
 
@@ -2130,6 +2194,7 @@ mod tests {
     async fn run_request(
         executor: &LocalExecutor,
         request: &CommandExecutionRequest,
+        local_resources: &[buck2_common::local_resource_state::LocalResourceHolder],
     ) -> CommandExecutionResult {
         use buck2_build_signals::env::WaitingData;
         use buck2_events::dispatch::with_dispatcher_async;
@@ -2154,7 +2219,7 @@ mod tests {
                             cancellation,
                             CancellationContext::testing(),
                             digest_config,
-                            &[],
+                            local_resources,
                             None,
                         )
                         .await
@@ -2226,12 +2291,6 @@ test "$*" = "$FRESH_A/* $FRESH_A/.[!.]* $FRESH_B/* $FRESH_B/.[!.]*"
 : > "$s/.stale"
 printf ran
 "#;
-        let env = [
-            ("FRESH_A".to_owned(), fresh_a.to_string()),
-            ("FRESH_B".to_owned(), fresh_b.to_string()),
-        ]
-        .into_iter()
-        .collect();
         let request = CommandExecutionRequest::new(
             vec![],
             vec![
@@ -2242,12 +2301,18 @@ printf ran
                 scratch_abs.to_string(),
             ],
             paths,
-            env,
+            Default::default(),
         )
         .with_skip_resource_control()
-        .with_scratch_subdirectories(vec![
-            ForwardRelativePathBuf::new("0".to_owned())?,
-            ForwardRelativePathBuf::new("1".to_owned())?,
+        .with_scratch_dir_variables(vec![
+            ScratchDirVariable {
+                name: "FRESH_A".to_owned(),
+                subdirectory: ForwardRelativePathBuf::new("0".to_owned())?,
+            },
+            ScratchDirVariable {
+                name: "FRESH_B".to_owned(),
+                subdirectory: ForwardRelativePathBuf::new("1".to_owned())?,
+            },
         ]);
 
         // Something an earlier run left behind.
@@ -2256,7 +2321,7 @@ printf ran
             .map_err(|e| e.categorize_internal())?;
 
         for run in 0..2 {
-            let result = run_request(&executor, &request).await;
+            let result = run_request(&executor, &request, &[]).await;
             match &result.report.std_streams {
                 CommandStdStreams::Local { stdout, stderr } => assert_eq!(
                     (stdout.as_slice(), result.report.exit_code),
@@ -2277,7 +2342,8 @@ printf ran
         }
 
         // The executor's environment for this request, given its scratch path: `TMPDIR` first,
-        // then the request's own variables. Without the scratch path it is not determined.
+        // then the request's own variables, then the scratch directory variables. Without the
+        // scratch path it is not determined.
         let request = request
             .with_local_environment_inheritance(EnvironmentInheritance::empty())
             .with_omit_local_invocation_identity_env(true);
@@ -2328,10 +2394,273 @@ printf ran
             Default::default(),
         )
         .with_skip_resource_control()
-        .with_scratch_subdirectories(vec![ForwardRelativePathBuf::new("0".to_owned())?]);
-        let result = run_request(&executor, &request).await;
+        .with_scratch_dir_variables(vec![ScratchDirVariable {
+            name: "FRESH_A".to_owned(),
+            subdirectory: ForwardRelativePathBuf::new("0".to_owned())?,
+        }]);
+        let result = run_request(&executor, &request, &[]).await;
         assert_matches!(result.report.status, CommandExecutionStatus::Error { .. });
         assert!(!marker.exists());
+        Ok(())
+    }
+
+    /// A request with a scratch path at `cell//pkg:case`'s "local_case_fresh" scratch and the
+    /// given scratch directory variables, running `script` with that path as `$1`.
+    #[cfg(unix)]
+    fn scratch_request(
+        executor: &LocalExecutor,
+        script: &str,
+        env: Vec<(&str, &str)>,
+        variables: &[(&str, &str)],
+    ) -> buck2_error::Result<(CommandExecutionRequest, AbsNormPathBuf)> {
+        use buck2_core::category::CategoryRef;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
+        use buck2_core::fs::buck_out_path::BuckOutScratchPath;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_hash::BuckIndexSet;
+
+        let scratch = BuckOutScratchPath::new(
+            BaseDeferredKey::TargetLabel(ConfiguredTargetLabel::testing_parse(
+                "cell//pkg:case",
+                ConfigurationData::testing_new(),
+            )),
+            CategoryRef::new("local_case_fresh")?,
+            Some("case"),
+            ForwardRelativePathBuf::new("test".to_owned())?,
+            false,
+        )?;
+        let scratch_abs = executor.artifact_fs.fs().resolve(
+            &executor
+                .artifact_fs
+                .buck_out_path_resolver()
+                .resolve_scratch(&scratch)?,
+        );
+        let paths = CommandExecutionPaths::new(
+            vec![CommandExecutionInput::ScratchPath(scratch)],
+            BuckIndexSet::default(),
+            &executor.artifact_fs,
+            DigestConfig::testing_default(),
+            None,
+        )?;
+        let request = CommandExecutionRequest::new(
+            vec![],
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                "sh".to_owned(),
+                scratch_abs.to_string(),
+            ],
+            paths,
+            env.into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        )
+        .with_skip_resource_control()
+        .with_scratch_dir_variables(
+            variables
+                .iter()
+                .map(|(name, subdirectory)| {
+                    Ok(ScratchDirVariable {
+                        name: (*name).to_owned(),
+                        subdirectory: ForwardRelativePathBuf::new((*subdirectory).to_owned())?,
+                    })
+                })
+                .collect::<buck2_error::Result<_>>()?,
+        );
+        Ok((request, scratch_abs))
+    }
+
+    /// Scratch directory variables are installed after every other variable: neither the
+    /// invocation identity the executor adds by default nor the request's own environment
+    /// replaces them, and the determined environment records them last.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_scratch_dir_variables_are_installed_last() -> buck2_error::Result<()> {
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let (request, scratch) = scratch_request(
+            &executor,
+            r#"printf '%s\n' "$BUCK_BUILD_ID" "$BUCK2_DAEMON_UUID" "$FRESH_A""#,
+            vec![("FRESH_A", "from-the-request")],
+            &[
+                ("BUCK_BUILD_ID", "0"),
+                ("BUCK2_DAEMON_UUID", "1"),
+                ("FRESH_A", "2"),
+            ],
+        )?;
+        assert!(!request.omit_local_invocation_identity_env());
+        let result = run_request(&executor, &request, &[]).await;
+        let CommandStdStreams::Local { stdout, stderr } = &result.report.std_streams else {
+            panic!("no local streams");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(stdout),
+            format!("{scratch}/0\n{scratch}/1\n{scratch}/2\n"),
+            "{}",
+            String::from_utf8_lossy(stderr)
+        );
+
+        let request = request
+            .with_local_environment_inheritance(EnvironmentInheritance::empty())
+            .with_omit_local_invocation_identity_env(true);
+        let described = determined_local_environment(&request, &root, Some(&scratch))
+            .expect("determined given the scratch path");
+        let names: Vec<_> = described.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            // A later value of a name replaces the earlier one in place of the latest.
+            ["TMPDIR", "BUCK_BUILD_ID", "BUCK2_DAEMON_UUID", "FRESH_A", "PWD"],
+            "{described:?}"
+        );
+        let last = |name: &str| {
+            described
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(last("FRESH_A"), Some(format!("{scratch}/2")));
+        Ok(())
+    }
+
+    /// A local resource that sets a scratch directory variable would be replaced without notice,
+    /// so the execution is refused before its child starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_scratch_dir_variable_set_by_a_local_resource_is_refused() -> buck2_error::Result<()>
+    {
+        use buck2_common::local_resource_state::EnvironmentVariable;
+        use buck2_common::local_resource_state::LocalResource;
+        use buck2_common::local_resource_state::LocalResourceState;
+        use buck2_core::configuration::data::ConfigurationData;
+        use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let (request, _) = scratch_request(&executor, ": > started", vec![], &[("FRESH_A", "0")])?;
+        let pool = LocalResourceState::new(
+            ConfiguredTargetLabel::testing_parse("cell//pkg:resource", ConfigurationData::testing_new()),
+            None,
+            vec![LocalResource(vec![EnvironmentVariable {
+                key: "FRESH_A".to_owned(),
+                value: "resource".to_owned(),
+            }])],
+        );
+        let holder = pool.acquire_resource().await;
+        let result = run_request(&executor, &request, std::slice::from_ref(&holder)).await;
+        assert_matches!(result.report.status, CommandExecutionStatus::Error { .. });
+        assert!(!root.as_path().join("started").exists());
+
+        // An unrelated resource variable is installed as usual.
+        let (request, _) = scratch_request(
+            &executor,
+            r#"printf '%s' "$OTHER""#,
+            vec![],
+            &[("FRESH_A", "0")],
+        )?;
+        let pool = LocalResourceState::new(
+            ConfiguredTargetLabel::testing_parse("cell//pkg:other", ConfigurationData::testing_new()),
+            None,
+            vec![LocalResource(vec![EnvironmentVariable {
+                key: "OTHER".to_owned(),
+                value: "resource".to_owned(),
+            }])],
+        );
+        let holder = pool.acquire_resource().await;
+        let result = run_request(&executor, &request, std::slice::from_ref(&holder)).await;
+        assert_matches!(result.report.status, CommandExecutionStatus::Success { .. });
+        Ok(())
+    }
+
+    /// A command stopped through structured cancellation returns only after its child has been
+    /// killed and reaped: whoever waits for the result can rely on the child being gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_cancelled_command_returns_after_its_child_is_reaped() -> buck2_error::Result<()> {
+        use buck2_build_signals::env::WaitingData;
+        use buck2_events::dispatch::with_dispatcher_async;
+        use buck2_execute::execute::claim::MutexClaimManager;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use dice_futures::spawn::prepare_detached_cancellation;
+        use dice_futures::spawner::TokioSpawner;
+        use futures::FutureExt;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        let (request, _) = scratch_request(
+            &executor,
+            "echo $$ > \"$PWD/pid\"; exec sleep 60",
+            vec![],
+            &[("FRESH_A", "0")],
+        )?;
+        let pid_file = root.as_path().join("pid");
+        let digest_config = DigestConfig::testing_default();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (spawner, handle) = prepare_detached_cancellation();
+        let join = spawner.spawn(
+            move |cancellations| {
+                async move {
+                    with_dispatcher_async(EventDispatcher::null(), async move {
+                        let manager = CommandExecutionManager::new(
+                            Box::new(MutexClaimManager::new()),
+                            EventDispatcher::null(),
+                            NoopLivelinessObserver::create(),
+                            WaitingData::new(),
+                        );
+                        let digest = ActionDigest::empty(digest_config.cas_digest_config());
+                        cancellations
+                            .with_structured_cancellation(|cancellation| async move {
+                                let result = executor
+                                    .exec_request(
+                                        &digest,
+                                        &request,
+                                        manager,
+                                        cancellation,
+                                        cancellations,
+                                        digest_config,
+                                        &[],
+                                        None,
+                                    )
+                                    .await;
+                                let _ignored = sender.send(result);
+                            })
+                            .await;
+                    })
+                    .await
+                }
+                .boxed()
+            },
+            &TokioSpawner,
+            &(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                if pid.ends_with('\n') {
+                    break pid.trim().to_owned();
+                }
+            }
+            assert!(Instant::now() < deadline, "the child never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
+        assert!(proc.exists());
+        handle.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), receiver)
+            .await
+            .expect("the cancelled execution did not return")
+            .expect("the execution dropped its result");
+        assert_matches!(
+            result.report.status,
+            CommandExecutionStatus::Cancelled { .. }
+        );
+        // Reaped, not merely signalled: no process, not even a zombie, remains.
+        assert!(!proc.exists(), "child {pid} still exists after the result");
+        let _ignored = join.await;
         Ok(())
     }
 
