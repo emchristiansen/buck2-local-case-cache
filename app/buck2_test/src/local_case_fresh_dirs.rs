@@ -22,7 +22,19 @@
 //!
 //! The scratch path is a function of the configured target and the request's suite, cases and
 //! variant only: the same case gets the same absolute values, which the local case key records
-//! byte for byte, and different cases never share one. Requests that run the same case under
+//! byte for byte, and different cases never share one.
+//!
+//! By default it is a `buck-out` scratch path, whose absolute path leaves too little of the 107
+//! usable bytes of an `AF_UNIX` address for a socket in it: its fixed part alone is 84 bytes, so a
+//! tmux server's `tmux-<uid>/default` fits in the directory of name 0 only if the project root,
+//! the isolation directory and the cell name come to at most 5 bytes together. When `[test] local_case_scratch_root` names a root R,
+//! validated exactly like `[test] local_case_result_cache_root` (an absolute, canonical path of
+//! real directories that no other principal can change, R itself private to this user), the
+//! scratch path is instead R/<16 hex digits>, an owned scratch path of the request outside the
+//! project: the local executor removes it and creates it again, owner-only, before every run, as
+//! it does a `buck-out` one. Its digest also covers the absolute project root and `buck-out`
+//! directory, so no two daemons share one, and the lease below remains the only exclusion. A
+//! root of at most 70 bytes leaves room for `tmux-1000/default` in the directory of name 0. Requests that run the same case under
 //! different keys do share it, so every execution of such a request holds the path's
 //! [`ScratchLease`] from before its inputs are materialized (and the path removed) until its
 //! child has terminated: every such execution runs as its own task with a real cancellation
@@ -37,7 +49,6 @@ use buck2_core::category::CategoryRef;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutScratchPath;
-use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_execute::execute::request::CommandExecutionInput;
 use buck2_execute::execute::request::CommandExecutionRequest;
@@ -50,28 +61,58 @@ use dupe::Dupe;
 
 use crate::local_result_cache::KeyRecord;
 use crate::local_result_cache::sha256;
+use crate::local_result_cache::validate_scratch_root;
+
+/// `[test] local_case_scratch_root`, validated as a root private to this user.
+#[derive(Clone, Debug)]
+pub(crate) struct ScratchRoot(String);
+
+impl ScratchRoot {
+    /// Validate the configured root, creating it owner-only if absent, as the store's root is.
+    pub(crate) async fn validate(path: String) -> buck2_error::Result<Self> {
+        let checked = path.clone();
+        tokio::task::spawn_blocking(move || validate_scratch_root(&checked))
+            .await
+            .map_err(|e| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Environment,
+                    "Validating [test] local_case_scratch_root did not complete: {e}"
+                )
+            })??;
+        Ok(Self(path))
+    }
+}
+
+/// Where a request's fresh directories are.
+#[derive(Clone, Debug)]
+enum Location {
+    /// A `buck-out` scratch path, a scratch path input of the request.
+    BuckOut(BuckOutScratchPath),
+    /// A directory of a `ScratchRoot`, the request's owned scratch path.
+    Owned,
+}
 
 /// The engine-owned scratch path of one Testing request and the directory each declared name
 /// receives inside it.
 #[derive(Clone, Debug)]
 pub(crate) struct FreshDirs {
-    scratch: BuckOutScratchPath,
-    /// `scratch` resolved in the project.
-    scratch_path: ProjectRelativePathBuf,
-    /// `scratch` resolved to an absolute path, as the executor resolves it.
+    location: Location,
+    /// The scratch path, absolute, as the executor resolves it.
     absolute: AbsNormPathBuf,
     /// Each declared name, in declaration order, and its subdirectory of the scratch path.
     names: Vec<(String, ForwardRelativePathBuf)>,
 }
 
 impl FreshDirs {
-    /// The fresh directories of a Testing request whose provider declares `names`; `None` for a
-    /// listing or when no name is declared.
+    /// The fresh directories of a Testing request whose provider declares `names`, in `root` if
+    /// one is configured and in `buck-out` otherwise; `None` for a listing or when no name is
+    /// declared.
     pub(crate) fn for_stage<'a>(
         test_target: &ConfiguredProvidersLabel,
         stage: &TestStage,
         names: impl IntoIterator<Item = &'a str>,
         fs: &ArtifactFs,
+        root: Option<&ScratchRoot>,
     ) -> buck2_error::Result<Option<Self>> {
         let TestStage::Testing {
             suite,
@@ -102,20 +143,44 @@ impl FreshDirs {
             record.field("case", case.as_bytes());
         }
         record.field("variant", variant.as_deref().unwrap_or_default().as_bytes());
-        // 128 bits of the digest: short enough to stay a readable path component.
-        let identifier = &sha256(&record.0)[..32];
-        let scratch = BuckOutScratchPath::new(
-            BaseDeferredKey::TargetLabel(test_target.target().dupe()),
-            CategoryRef::new("local_case_fresh")?,
-            Some(identifier),
-            ForwardRelativePathBuf::new("test".to_owned())?,
-            false,
-        )?;
-        let scratch_path = fs.buck_out_path_resolver().resolve_scratch(&scratch)?;
-        let absolute = fs.fs().resolve(&scratch_path);
+        let (location, absolute) = match root {
+            None => {
+                // 128 bits of the digest: short enough to stay a readable path component.
+                let identifier = &sha256(&record.0)[..32];
+                let scratch = BuckOutScratchPath::new(
+                    BaseDeferredKey::TargetLabel(test_target.target().dupe()),
+                    CategoryRef::new("local_case_fresh")?,
+                    Some(identifier),
+                    ForwardRelativePathBuf::new("test".to_owned())?,
+                    false,
+                )?;
+                let absolute = fs
+                    .fs()
+                    .resolve(&fs.buck_out_path_resolver().resolve_scratch(&scratch)?);
+                (Location::BuckOut(scratch), absolute)
+            }
+            Some(ScratchRoot(root)) => {
+                // The configured target, and the project and `buck-out` it is built in, which
+                // `buck-out`'s own path would otherwise contribute.
+                record.field("target", test_target.to_string().as_bytes());
+                record.field(
+                    "project",
+                    fs.fs().root().as_path().as_os_str().as_encoded_bytes(),
+                );
+                record.field(
+                    "buck_out",
+                    fs.buck_out_path_resolver().root().as_str().as_bytes(),
+                );
+                // 64 bits of the digest, to keep socket paths in it short. A collision only
+                // makes two cases share an exclusively leased path removed before each use.
+                let identifier = &sha256(&record.0)[..16];
+                let absolute =
+                    AbsNormPathBuf::new(std::path::PathBuf::from(format!("{root}/{identifier}")))?;
+                (Location::Owned, absolute)
+            }
+        };
         Ok(Some(Self {
-            scratch,
-            scratch_path,
+            location,
             absolute,
             names,
         }))
@@ -127,6 +192,7 @@ impl FreshDirs {
     }
 
     /// Each declared name and the absolute path of its directory: the value the executor sets.
+    #[cfg(test)]
     pub(crate) fn values(&self) -> buck2_error::Result<Vec<(String, String)>> {
         self.names
             .iter()
@@ -155,20 +221,40 @@ impl FreshDirs {
     }
 
     /// The request input that makes the executor prepare the scratch path.
-    pub(crate) fn input(&self) -> CommandExecutionInput {
-        CommandExecutionInput::ScratchPath(self.scratch.clone())
+    pub(crate) fn input(&self) -> Option<CommandExecutionInput> {
+        match &self.location {
+            Location::BuckOut(scratch) => Some(CommandExecutionInput::ScratchPath(scratch.clone())),
+            Location::Owned => None,
+        }
     }
 
-    /// Whether `request`'s scratch inputs and scratch directory variables are exactly these, and
-    /// it sets none of those variables itself, so that its scratch path is this engine-owned one
-    /// and nothing else.
+    /// The request's owned scratch path, if the scratch path is not in `buck-out`.
+    pub(crate) fn owned_scratch_path(&self) -> Option<AbsNormPathBuf> {
+        match &self.location {
+            Location::BuckOut(_) => None,
+            Location::Owned => Some(self.absolute.clone()),
+        }
+    }
+
+    /// Whether `request`'s scratch path, scratch inputs and scratch directory variables are
+    /// exactly these, and it sets none of those variables itself, so that its scratch path is
+    /// this engine-owned one and nothing else.
     pub(crate) fn admits(&self, request: &CommandExecutionRequest) -> bool {
         let mut scratch_inputs = request.inputs().iter().filter_map(|input| match input {
             CommandExecutionInput::ScratchPath(path) => Some(path),
             _ => None,
         });
-        let one_scratch = scratch_inputs.next() == Some(&self.scratch)
-            && scratch_inputs.next().is_none();
+        let first_scratch_input = scratch_inputs.next();
+        let one_scratch = scratch_inputs.next().is_none()
+            && match &self.location {
+                Location::BuckOut(scratch) => {
+                    first_scratch_input == Some(scratch) && request.owned_scratch_path().is_none()
+                }
+                Location::Owned => {
+                    first_scratch_input.is_none()
+                        && request.owned_scratch_path() == Some(&self.absolute)
+                }
+            };
         one_scratch
             && request.scratch_dir_variables() == self.variables().as_slice()
             && self.names().all(|name| !request.env().contains_key(name))
@@ -179,11 +265,11 @@ impl FreshDirs {
         let lock = {
             let mut active = ACTIVE_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
             active.retain(|_, lock| lock.strong_count() > 0);
-            match active.get(&self.scratch_path).and_then(Weak::upgrade) {
+            match active.get(&self.absolute).and_then(Weak::upgrade) {
                 Some(lock) => lock,
                 None => {
                     let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    active.insert(self.scratch_path.clone(), Arc::downgrade(&lock));
+                    active.insert(self.absolute.clone(), Arc::downgrade(&lock));
                     lock
                 }
             }
@@ -197,7 +283,7 @@ impl FreshDirs {
 /// The scratch paths in use by this daemon. A daemon owns its `buck-out`, so no other process
 /// uses them.
 static ACTIVE_SCRATCH: LazyLock<
-    std::sync::Mutex<BuckMutMap<ProjectRelativePathBuf, Weak<tokio::sync::Mutex<()>>>>,
+    std::sync::Mutex<BuckMutMap<AbsNormPathBuf, Weak<tokio::sync::Mutex<()>>>>,
 > = LazyLock::new(Default::default);
 
 /// Exclusive use of one fresh-directory scratch path by one execution.
@@ -221,6 +307,7 @@ mod tests {
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::fs::buck_out_path::BuckOutPathResolver;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
     use buck2_execute::digest_config::DigestConfig;
     use buck2_execute::execute::request::CommandExecutionPaths;
@@ -264,11 +351,70 @@ mod tests {
         stage: &TestStage,
         names: &[&str],
     ) -> Option<FreshDirs> {
-        FreshDirs::for_stage(&target(target_name), stage, names.iter().copied(), fs).unwrap()
+        FreshDirs::for_stage(&target(target_name), stage, names.iter().copied(), fs, None).unwrap()
     }
 
-    /// The request the orchestrator builds for `fresh`: its scratch input and its scratch
-    /// directory variables, plus an unrelated variable of its own.
+    fn owned(
+        fs: &ArtifactFs,
+        target_name: &str,
+        stage: &TestStage,
+        names: &[&str],
+        root: &ScratchRoot,
+    ) -> FreshDirs {
+        FreshDirs::for_stage(
+            &target(target_name),
+            stage,
+            names.iter().copied(),
+            fs,
+            Some(root),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A new directory under the temporary directory, with a short name, removed when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "b2s{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_owned()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // A test may have made it unreadable to show it is refused.
+                let _ignored =
+                    std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch_root(path: &str) -> buck2_error::Result<ScratchRoot> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ScratchRoot::validate(path.to_owned()))
+    }
+
+    /// The request the orchestrator builds for `fresh`: its scratch input or owned scratch path
+    /// and its scratch directory variables, plus an unrelated variable of its own.
     fn request_for(
         fs: &ArtifactFs,
         fresh: &FreshDirs,
@@ -276,7 +422,7 @@ mod tests {
     ) -> CommandExecutionRequest {
         let mut env: SortedVectorMap<String, String> = SortedVectorMap::new();
         env.insert("OTHER".to_owned(), "1".to_owned());
-        let inputs = std::iter::once(fresh.input()).chain(extra_inputs).collect();
+        let inputs = fresh.input().into_iter().chain(extra_inputs).collect();
         let paths = CommandExecutionPaths::new(
             inputs,
             Default::default(),
@@ -287,6 +433,7 @@ mod tests {
         .unwrap();
         CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
             .with_scratch_dir_variables(fresh.variables())
+            .with_owned_scratch_path(fresh.owned_scratch_path())
     }
 
     #[test]
@@ -370,13 +517,23 @@ mod tests {
         // Another case's scratch path, with variables naming its directories.
         assert!(!a.admits(&request_for(&fs, &b, vec![])));
         // A second scratch input.
-        assert!(!a.admits(&request_for(&fs, &a, vec![b.input()])));
+        assert!(!a.admits(&request_for(&fs, &a, vec![b.input().unwrap()])));
         // No scratch input at all.
-        let paths =
-            CommandExecutionPaths::new(vec![], Default::default(), &fs, DigestConfig::testing_default(), None)
-                .unwrap();
-        let bare = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, Default::default())
-            .with_scratch_dir_variables(a.variables());
+        let paths = CommandExecutionPaths::new(
+            vec![],
+            Default::default(),
+            &fs,
+            DigestConfig::testing_default(),
+            None,
+        )
+        .unwrap();
+        let bare = CommandExecutionRequest::new(
+            vec![],
+            vec!["test".to_owned()],
+            paths,
+            Default::default(),
+        )
+        .with_scratch_dir_variables(a.variables());
         assert!(!a.admits(&bare));
         // Missing, extra, renamed or reordered variables.
         assert!(!a.admits(&request_for(&fs, &a, vec![]).with_scratch_dir_variables(vec![])));
@@ -395,7 +552,7 @@ mod tests {
         // The request also setting a declared name itself.
         for name in names {
             let paths = CommandExecutionPaths::new(
-                vec![a.input()],
+                vec![a.input().unwrap()],
                 Default::default(),
                 &fs,
                 DigestConfig::testing_default(),
@@ -444,7 +601,147 @@ mod tests {
         let c = fresh(&fs, "t", &testing(&["c"], None), &["FRESH_A"]).unwrap();
         let _c = c.lease().await;
         let active = ACTIVE_SCRATCH.lock().unwrap();
-        assert!(active.get(&a.scratch_path).is_none());
-        assert!(active.get(&c.scratch_path).is_some());
+        assert!(active.get(&a.absolute).is_none());
+        assert!(active.get(&c.absolute).is_some());
+    }
+
+    /// With a scratch root, each case's scratch path is a 16-digit directory of the root, with
+    /// the same layout inside; the same case of another project gets another one.
+    #[test]
+    fn a_scratch_root_gives_each_case_of_each_project_a_short_directory_of_its_own() {
+        let dir = TempDir::new();
+        let root_path = dir.path("r");
+        let root = scratch_root(&root_path).unwrap();
+        let (one, two) = (
+            ProjectRootTemp::new().unwrap(),
+            ProjectRootTemp::new().unwrap(),
+        );
+        let (fs_one, fs_two) = (artifact_fs(&one), artifact_fs(&two));
+        let names = ["FRESH_A", "FRESH_B"];
+        let a = owned(&fs_one, "t", &testing(&["a"], None), &names, &root);
+
+        let path = a.absolute().to_str().unwrap().to_owned();
+        let identifier = path.strip_prefix(&format!("{root_path}/")).unwrap();
+        assert_eq!(identifier.len(), 16, "{path}");
+        assert!(identifier.bytes().all(|b| b.is_ascii_hexdigit()), "{path}");
+        assert_eq!(
+            a.values().unwrap(),
+            vec![
+                ("FRESH_A".to_owned(), format!("{path}/0")),
+                ("FRESH_B".to_owned(), format!("{path}/1")),
+            ]
+        );
+        assert!(a.input().is_none());
+        assert_eq!(a.owned_scratch_path().as_ref(), Some(a.absolute()));
+
+        // The same case of the same project again; another case; another project.
+        let again = owned(&fs_one, "t", &testing(&["a"], None), &names, &root);
+        assert_eq!(again.absolute(), a.absolute());
+        let other_case = owned(&fs_one, "t", &testing(&["b"], None), &names, &root);
+        assert_ne!(other_case.absolute(), a.absolute());
+        let other_project = owned(&fs_two, "t", &testing(&["a"], None), &names, &root);
+        assert_ne!(other_project.absolute(), a.absolute());
+    }
+
+    /// Admission accepts exactly the engine's own owned scratch path, with no scratch input.
+    #[test]
+    fn admits_only_the_engines_own_owned_scratch_path() {
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let dir = TempDir::new();
+        let root = scratch_root(&dir.path("r")).unwrap();
+        let names = ["FRESH_A"];
+        let a = owned(&fs, "t", &testing(&["a"], None), &names, &root);
+        let b = owned(&fs, "t", &testing(&["b"], None), &names, &root);
+        let buck_out = fresh(&fs, "t", &testing(&["a"], None), &names).unwrap();
+        assert!(a.admits(&request_for(&fs, &a, vec![])));
+
+        // Another case's owned path; none; a `buck-out` scratch input beside it.
+        assert!(!a.admits(&request_for(&fs, &b, vec![])));
+        assert!(!a.admits(&request_for(&fs, &a, vec![]).with_owned_scratch_path(None)));
+        assert!(!a.admits(&request_for(&fs, &a, vec![buck_out.input().unwrap()])));
+        // The `buck-out` setup of the same case is not the owned one, nor the reverse.
+        assert!(!a.admits(&request_for(&fs, &buck_out, vec![])));
+        assert!(!buck_out.admits(&request_for(&fs, &a, vec![])));
+        assert!(!buck_out.admits(
+            &request_for(&fs, &buck_out, vec![]).with_owned_scratch_path(a.owned_scratch_path())
+        ));
+    }
+
+    /// The scratch root is validated as the store's root is: absolute and canonical, every
+    /// component a real directory, no ancestor another principal can change, and the root
+    /// itself private. An absent root is created owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_scratch_root_is_validated_like_the_result_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let created = dir.path("created");
+        scratch_root(&created).unwrap();
+        let mode = std::fs::metadata(&created).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+
+        let refused = |path: &str, expected: &str| {
+            let e = format!("{:#}", scratch_root(path).unwrap_err());
+            assert!(e.contains(expected), "{path}: {e}");
+        };
+        refused(
+            "relative",
+            "[test] local_case_scratch_root `relative` is not absolute",
+        );
+        refused(
+            &format!("{created}/"),
+            "has an empty component or a trailing slash",
+        );
+
+        let link = dir.path("link");
+        std::os::unix::fs::symlink(&created, &link).unwrap();
+        refused(&link, "symlinks are refused");
+        refused(&format!("{link}/r"), "symlinks are refused");
+
+        let shared = dir.path("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        refused(&format!("{shared}/r"), "Local case scratch root ancestor");
+        assert!(!std::path::Path::new(&format!("{shared}/r")).exists());
+
+        let open = dir.path("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o750)).unwrap();
+        refused(&open, "Local case scratch root");
+        refused(&open, "must be owned by uid");
+    }
+
+    /// A Unix socket for a tmux server, `tmux-<uid>/default` in the directory of a fresh
+    /// directory variable, cannot be bound in a `buck-out` scratch path, whose absolute path is
+    /// too long for an `AF_UNIX` address, but can in a scratch root's.
+    #[cfg(unix)]
+    #[test]
+    fn a_tmux_socket_fits_in_a_scratch_root_but_not_in_buck_out() {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let bind = |fresh: &FreshDirs| {
+            let (_, directory) = fresh.values().unwrap().remove(0);
+            let server = format!("{directory}/tmux-{uid}");
+            std::fs::create_dir_all(&server).unwrap();
+            std::os::unix::net::UnixListener::bind(format!("{server}/default")).map(drop)
+        };
+        let temp = ProjectRootTemp::new().unwrap();
+        let fs = artifact_fs(&temp);
+        let stage = testing(&["a"], None);
+
+        let buck_out = fresh(&fs, "t", &stage, &["TMUX_TMPDIR"]).unwrap();
+        let e = bind(&buck_out).unwrap_err();
+        assert!(e.to_string().contains("path must be shorter than"), "{e}");
+
+        let dir = TempDir::new();
+        let root_path = dir.path("r");
+        assert!(
+            root_path.len() <= 70,
+            "this test needs a temporary directory of at most 64 bytes: {root_path}"
+        );
+        let root = scratch_root(&root_path).unwrap();
+        bind(&owned(&fs, "t", &stage, &["TMUX_TMPDIR"], &root)).unwrap();
     }
 }

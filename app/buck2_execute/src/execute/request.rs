@@ -33,6 +33,7 @@ use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::buck2_error;
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckIndexSet;
 use derive_more::Display;
@@ -426,6 +427,14 @@ pub struct CommandExecutionRequest {
     /// command starts. Only the local executor creates them, so a request carrying any must
     /// execute locally.
     scratch_dir_variables: Vec<ScratchDirVariable>,
+
+    /// An absolute directory outside the project that the local executor uses as this request's
+    /// scratch path in place of a `buck-out` one: it removes it and creates it again, owner-only,
+    /// before every run, and the scratch directory variables name directories inside it. The
+    /// caller owns the directory's location: it must lie in a root private to this user that no
+    /// other principal can change. A request with one has no scratch path input, and only the
+    /// local executor prepares it.
+    owned_scratch_path: Option<AbsNormPathBuf>,
 }
 
 /// A variable the local executor sets to an empty, owner-only directory of the request's
@@ -476,6 +485,7 @@ impl CommandExecutionRequest {
             disable_local_network_isolation: false,
             omit_local_invocation_identity_env: false,
             scratch_dir_variables: Vec::new(),
+            owned_scratch_path: None,
         }
     }
 
@@ -800,6 +810,15 @@ impl CommandExecutionRequest {
 
     pub fn scratch_dir_variables(&self) -> &[ScratchDirVariable] {
         &self.scratch_dir_variables
+    }
+
+    pub fn with_owned_scratch_path(mut self, path: Option<AbsNormPathBuf>) -> Self {
+        self.owned_scratch_path = path;
+        self
+    }
+
+    pub fn owned_scratch_path(&self) -> Option<&AbsNormPathBuf> {
+        self.owned_scratch_path.as_ref()
     }
 }
 

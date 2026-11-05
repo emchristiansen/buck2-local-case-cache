@@ -192,6 +192,7 @@ use sorted_vector_map::SortedVectorMap;
 use crate::command::InternalRunnerConfig;
 use crate::internal_runner::InternalTestOrchestrator;
 use crate::local_case_fresh_dirs::FreshDirs;
+use crate::local_case_fresh_dirs::ScratchRoot;
 use crate::local_result_cache::ConstrainedCase;
 use crate::local_result_cache::LocalCaseAdmission;
 use crate::local_result_cache::LocalCaseGap;
@@ -802,8 +803,24 @@ impl<'a> BuckTestOrchestrator<'a> {
             declared_outputs,
             worker,
         } = test_executable_expanded;
-        let fresh_dirs =
-            FreshDirs::for_stage(&test_target, stage.as_ref(), test_info.fresh_dir_env(), fs)?;
+        // A configured scratch root is validated for every request that would use it; an invalid
+        // one refuses the request rather than falling back to `buck-out`.
+        let scratch_root = match Self::local_case_scratch_root(dice).await? {
+            Some(root)
+                if matches!(stage.as_ref(), TestStage::Testing { .. })
+                    && !test_info.fresh_dir_env().is_empty() =>
+            {
+                Some(ScratchRoot::validate(root).await?)
+            }
+            _ => None,
+        };
+        let fresh_dirs = FreshDirs::for_stage(
+            &test_target,
+            stage.as_ref(),
+            test_info.fresh_dir_env(),
+            fs,
+            scratch_root.as_ref(),
+        )?;
         if let Some(fresh_dirs) = &fresh_dirs {
             // The executor sets the variables itself, after every other variable.
             if let Some(name) = fresh_dirs.names().find(|name| expanded_env.contains_key(*name)) {
@@ -1454,7 +1471,9 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
             worker,
         } = test_executable_expanded;
         // The command runs out of process after this returns, so no scratch lease could cover it.
-        if FreshDirs::for_stage(&test_target, &stage, test_info.fresh_dir_env(), fs)?.is_some() {
+        if FreshDirs::for_stage(&test_target, &stage, test_info.fresh_dir_env(), fs, None)?
+            .is_some()
+        {
             return Err(buck2_error::buck2_error!(
                 buck2_error::ErrorTag::Input,
                 "{} declares `fresh_dir_env`, which only Buck2's own test execution provides",
@@ -1589,6 +1608,23 @@ impl BuckTestOrchestrator<'_> {
                 BuckconfigKeyRef {
                     section: "test",
                     property: "local_case_result_cache_root",
+                },
+            )
+            .await?
+            .map(|root| root.to_string()))
+    }
+
+    /// The explicitly configured private root for owned per-case scratch paths, if any.
+    async fn local_case_scratch_root(
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<Option<String>> {
+        let cell_resolver = dice.get_cell_resolver().await?;
+        Ok(dice
+            .get_legacy_config_property(
+                cell_resolver.root_cell(),
+                BuckconfigKeyRef {
+                    section: "test",
+                    property: "local_case_scratch_root",
                 },
             )
             .await?
@@ -2467,7 +2503,7 @@ impl BuckTestOrchestrator<'_> {
         let inputs = ensured_inputs
             .into_iter()
             .map(|(_, v)| CommandExecutionInput::Artifact(Box::new(v)))
-            .chain(fresh_dirs.map(FreshDirs::input))
+            .chain(fresh_dirs.and_then(FreshDirs::input))
             .collect_vec();
 
         // NOTE: This looks a bit awkward, that's because fbcode's rustfmt and ours slightly
@@ -2508,6 +2544,7 @@ impl BuckTestOrchestrator<'_> {
             .with_required_local_resources(required_local_resources)?
             .with_disable_local_network_isolation(disable_local_network_isolation)
             .with_scratch_dir_variables(fresh_dirs.map(FreshDirs::variables).unwrap_or_default())
+            .with_owned_scratch_path(fresh_dirs.and_then(FreshDirs::owned_scratch_path))
             .with_is_test();
         if let Some(timeout) = timeout {
             request = request.with_timeout(timeout)

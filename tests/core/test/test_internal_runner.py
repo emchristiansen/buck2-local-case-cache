@@ -14,7 +14,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
+import stat
+import tempfile
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
@@ -596,3 +599,236 @@ async def test_fresh_dir_env_beside_an_unrelated_local_resource(buck: Buck) -> N
     )
     assert_exactly_one_pass(result)
     assert json.loads(started.read_text())["OTHER"] == "42"
+
+
+@buck_test(skip_for_os=["windows"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_socket_does_not_fit_in_buck_out(buck: Buck) -> None:
+    # A `buck-out` scratch path leaves too little of an AF_UNIX address for the socket.
+    await expect_failure(
+        buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            ":fresh_socket",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        ),
+        stderr_regex="AF_UNIX path too long",
+    )
+
+
+@buck_test(skip_for_os=["windows"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_socket_fits_in_a_scratch_root(buck: Buck) -> None:
+    # With a short scratch root the socket fits. The engine creates the root, owner-only; the
+    # case's scratch path in it is removed before each run, so the second run can bind the
+    # socket the first one left behind.
+    root = _short_scratch_root()
+    try:
+        for _ in range(2):
+            result = await buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                f"test.local_case_scratch_root={root}",
+                ":fresh_socket",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            )
+            assert_exactly_one_pass(result)
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        [scratch] = list(root.iterdir())
+        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+        assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
+    finally:
+        if root.exists():
+            shutil.rmtree(root)
+
+
+@buck_test(skip_for_os=["windows"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_invalid_scratch_root_is_refused(buck: Buck) -> None:
+    # An invalid root refuses the case before its child starts, rather than falling back to
+    # `buck-out`, and nothing is created. (The runner reports the refusal as a fatal result;
+    # which rule refused it is covered where the root is validated.)
+    started = buck.cwd / "started.json"
+    shared = buck.cwd / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    for root in ["relative", str(shared / "root")]:
+        result = await expect_failure(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                f"fresh_dirs.started={started}",
+                "-c",
+                f"test.local_case_scratch_root={root}",
+                ":fresh_started",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+        )
+        assert (
+            "Tests finished: Pass 0. Fail 0. Timeout 0. Fatal 1." in _plain_stderr(result)
+        ), result.stderr
+        assert not started.exists()
+    assert not (buck.cwd / "relative").exists()
+    assert not (shared / "root").exists()
+
+
+def _short_scratch_root() -> Path:
+    root = Path(tempfile.gettempdir()) / f"b2s{os.getpid()}"
+    assert len(str(root)) <= 70, f"the scratch root {root} is too long for this test"
+    assert not root.exists(), root
+    return root
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_holder_in_a_scratch_root_beside_parser_failure_releases_after_its_child(
+    buck: Buck,
+) -> None:
+    # The scratch path in a scratch root is held, like a `buck-out` one, until an abandoned
+    # child has gone.
+    await _without_forkserver(buck)
+    root = _short_scratch_root()
+    try:
+        await _holder_beside_parser_failure(
+            buck,
+            ":fresh_hold_beside_parser_failure",
+            "-c",
+            f"test.local_case_scratch_root={root}",
+        )
+    finally:
+        if root.exists():
+            shutil.rmtree(root)
+    await _expect_forkserver(buck, False)
+
+
+@buck_test()
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_concurrent_runs_of_a_case_in_a_scratch_root_do_not_share_directories(
+    buck: Buck,
+) -> None:
+    root = _short_scratch_root()
+    try:
+        results = await asyncio.gather(
+            *(
+                buck.test(
+                    "-c",
+                    "test.use_internal_runner=true",
+                    "-c",
+                    "fresh_dirs.hold=3",
+                    "-c",
+                    f"test.local_case_scratch_root={root}",
+                    ":internal_fresh_dirs",
+                    test_executor=INTERNAL_TEST_EXECUTOR,
+                )
+                for _ in range(2)
+            )
+        )
+        for result in results:
+            assert_exactly_one_pass(result)
+        [scratch] = list(root.iterdir())
+        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+    finally:
+        if root.exists():
+            shutil.rmtree(root)
+
+
+def _store_tools() -> tuple[str, str]:
+    # A Nix store shell and a Nix store `bin` directory with `mktemp`, so the case is bound.
+    shell = os.path.realpath(shutil.which("bash") or "")
+    mktemp = os.path.realpath(shutil.which("mktemp") or "")
+    assert shell.startswith("/nix/store/") and mktemp.startswith("/nix/store/"), (
+        "this test needs bash and mktemp from the Nix store",
+        shell,
+        mktemp,
+    )
+    return shell, os.path.dirname(mktemp)
+
+
+async def _tracked_fresh_dirs_produce_and_reuse(buck: Buck, *config: str) -> Path:
+    # The first passing run of the eligible case starts its child and publishes its result; an
+    # unchanged rerun reuses it and starts no child. A failing case, or one whose output its
+    # parser refuses, never passes and is never served from the store, and leaves the passing
+    # entry reusable. Returns the one scratch path every start ran in.
+    shell, path = _store_tools()
+    store = buck.cwd / "local-case-store"
+    events = buck.cwd / "events"
+    events.mkdir()
+
+    def run(mode: str):
+        return buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            f"test.local_case_result_cache_root={store}",
+            "-c",
+            f"fresh_dirs.shell={shell}",
+            "-c",
+            f"fresh_dirs.path={path}",
+            "-c",
+            f"fresh_dirs.events={events}",
+            "-c",
+            f"fresh_dirs.mode={mode}",
+            *config,
+            ":fresh_tracked",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+
+    def starts() -> int:
+        return len(list(events.iterdir()))
+
+    result = await run("pass")
+    assert_exactly_one_pass(result)
+    assert "Local test-result reuse" not in _plain_stderr(result), result.stderr
+    assert starts() == 1
+    assert any((store / "v1").iterdir())
+
+    result = await run("pass")
+    assert_exactly_one_pass(result)
+    assert "Local test-result reuse: 1" in _plain_stderr(result), result.stderr
+    assert starts() == 1
+
+    for mode, outcome in [("fail", "Fail 1."), ("refuse", "unparseable case output")]:
+        for _ in range(2):
+            before = starts()
+            failure = await expect_failure(run(mode))
+            stderr = _plain_stderr(failure)
+            assert outcome in stderr, stderr
+            assert "Pass 1." not in stderr, stderr
+            assert "Local test-result reuse" not in stderr, stderr
+            assert starts() == before + 1
+
+    result = await run("pass")
+    assert_exactly_one_pass(result)
+    assert "Local test-result reuse: 1" in _plain_stderr(result), result.stderr
+    assert starts() == 5
+    scratch_paths = {event.read_text() for event in events.iterdir()}
+    assert len(scratch_paths) == 1, scratch_paths
+    [scratch] = scratch_paths
+    return Path(scratch)
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_tracked_case_is_published_then_reused(buck: Buck) -> None:
+    scratch = await _tracked_fresh_dirs_produce_and_reuse(buck)
+    assert scratch.parent.name == "local_case_fresh", scratch
+    assert (buck.cwd / "buck-out") in scratch.parents, scratch
+
+
+@buck_test(skip_for_os=["windows", "darwin"])
+@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+async def test_fresh_dir_env_tracked_case_in_a_scratch_root_is_published_then_reused(
+    buck: Buck,
+) -> None:
+    root = _short_scratch_root()
+    try:
+        scratch = await _tracked_fresh_dirs_produce_and_reuse(
+            buck, "-c", f"test.local_case_scratch_root={root}"
+        )
+        assert scratch.parent == root, scratch
+        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+    finally:
+        if root.exists():
+            shutil.rmtree(root)

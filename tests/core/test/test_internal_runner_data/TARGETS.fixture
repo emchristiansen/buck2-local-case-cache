@@ -3,6 +3,8 @@ load(
     "fresh_dir_broker",
     "fresh_dir_case_test",
     "fresh_dir_env_test",
+    "fresh_socket_test",
+    "fresh_tracked_test",
     "provider_artifact_pair_test",
     "provider_pair_test",
     "python_test",
@@ -167,4 +169,25 @@ fresh_dir_env_test(
     broker_sets_other = True,
     fresh_dir_env = ["FRESH_A"],
     started = _STARTED,
+)
+
+# A socket in a fresh directory: too long an address in `buck-out`, but not in a short
+# `[test] local_case_scratch_root`.
+fresh_socket_test(
+    name = "fresh_socket",
+)
+
+fresh_dir_env_test(
+    name = "fresh_started",
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
+)
+
+# A fresh-directory case eligible for local result reuse (see `fresh_tracked_test`).
+fresh_tracked_test(
+    name = "fresh_tracked",
+    events = read_config("fresh_dirs", "events", ""),
+    mode = read_config("fresh_dirs", "mode", "pass"),
+    path = read_config("fresh_dirs", "path", ""),
+    shell = read_config("fresh_dirs", "shell", ""),
 )

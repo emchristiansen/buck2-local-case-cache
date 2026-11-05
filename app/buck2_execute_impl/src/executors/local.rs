@@ -87,6 +87,7 @@ use buck2_execute_local::status_decoder::DefaultStatusDecoder;
 use buck2_fs::IoResultExt;
 use buck2_fs::async_fs_util;
 use buck2_fs::fs_util;
+use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_fs::paths::abs_path::AbsPathBuf;
@@ -644,9 +645,9 @@ impl LocalExecutor {
         // The scratch directory variables and their values, installed after everything else.
         let mut scratch_dirs = Vec::new();
 
-        if let Some(scratch_path) = &scratch_path.path {
+        if let Some(location) = &scratch_path.path {
             // For the $TMPDIR - important it is absolute
-            scratch_path_abs = self.artifact_fs.fs().resolve(scratch_path);
+            scratch_path_abs = location.resolve(&self.artifact_fs);
 
             if cfg!(windows) {
                 const MAX_PATH: usize = 260;
@@ -1438,7 +1439,7 @@ pub async fn materialize_inputs(
                     ));
                 }
                 outputs.push(path.clone());
-                scratch.path = Some(path);
+                scratch.path = Some(ScratchLocation::Project(path));
             }
             CommandExecutionInput::IncrementalRemoteOutput(..) => {
                 // Ignore, should be already materialized
@@ -1446,6 +1447,21 @@ pub async fn materialize_inputs(
         }
     }
 
+    if let Some(owned) = request.owned_scratch_path() {
+        if scratch.path.is_some() {
+            return Err(buck2_error::internal_error!(
+                "Both a scratch path input and an owned scratch path for one action"
+            ));
+        }
+        if request.worker().is_some() {
+            return Err(buck2_error::internal_error!(
+                "An owned scratch path requested for a worker action"
+            ));
+        }
+        // Outside the project, so neither the materializer nor its leases know it; its owner
+        // excludes concurrent users.
+        scratch.path = Some(ScratchLocation::Owned(owned.clone()));
+    }
     if scratch.path.is_none() && !scratch.subdirectories.is_empty() {
         return Err(buck2_error::internal_error!(
             "Scratch subdirectories requested for an action without a scratch path"
@@ -1504,22 +1520,45 @@ pub async fn materialize_inputs(
 /// A scratch path discovered during `materialize_inputs`, with the empty subdirectories the
 /// request asks for inside it.
 pub struct ScratchPath {
-    path: Option<ProjectRelativePathBuf>,
+    path: Option<ScratchLocation>,
     subdirectories: Vec<ForwardRelativePathBuf>,
 }
 
+/// Where a request's scratch path is.
+enum ScratchLocation {
+    /// A `buck-out` scratch path of the project, from a scratch path input.
+    Project(ProjectRelativePathBuf),
+    /// The request's owned scratch path, an absolute directory outside the project.
+    Owned(AbsNormPathBuf),
+}
+
+impl ScratchLocation {
+    fn resolve(&self, artifact_fs: &ArtifactFs) -> AbsNormPathBuf {
+        match self {
+            Self::Project(path) => artifact_fs.fs().resolve(path),
+            Self::Owned(path) => path.clone(),
+        }
+    }
+}
+
 /// Make the scratch path an empty directory, holding only its requested empty subdirectories,
-/// which are owner-only, as a directory made by `mkdtemp` is.
+/// which are owner-only, as a directory made by `mkdtemp` is. An owned scratch path is itself
+/// owner-only too.
 pub async fn prep_scratch_path(
     scratch_path: &ScratchPath,
     artifact_fs: &ArtifactFs,
 ) -> buck2_error::Result<()> {
-    let Some(path) = scratch_path.path.as_ref() else {
+    let Some(location) = scratch_path.path.as_ref() else {
         return Ok(());
     };
-    CleanOutputPaths::clean(std::iter::once(path.as_ref()), artifact_fs.fs())?;
-    let path = artifact_fs.fs().resolve(path);
-    async_fs_util::create_dir_all(&path).await?;
+    match location {
+        ScratchLocation::Project(path) => {
+            CleanOutputPaths::clean(std::iter::once(path.as_ref()), artifact_fs.fs())?;
+            async_fs_util::create_dir_all(&artifact_fs.fs().resolve(path)).await?;
+        }
+        ScratchLocation::Owned(path) => prep_owned_scratch_path(path).await?,
+    }
+    let path = location.resolve(artifact_fs);
     for subdirectory in &scratch_path.subdirectories {
         let subdirectory = path.join(subdirectory);
         let mut builder = tokio::fs::DirBuilder::new();
@@ -1531,6 +1570,26 @@ pub async fn prep_scratch_path(
             .await
             .with_buck_error_context(|| format!("creating scratch subdirectory `{subdirectory}`"))?;
     }
+    Ok(())
+}
+
+/// Remove whatever the owned scratch path holds, never following a symlink, and create it again,
+/// empty and owner-only. Its parent, the owner's root, must exist.
+async fn prep_owned_scratch_path(path: &AbsNormPath) -> buck2_error::Result<()> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+    .with_buck_error_context(|| format!("removing owned scratch path `{path}`"))?;
+    let mut builder = tokio::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
+        .create(path)
+        .await
+        .with_buck_error_context(|| format!("creating owned scratch path `{path}`"))?;
     Ok(())
 }
 
@@ -1750,8 +1809,9 @@ fn scratch_dir_environment<'a>(
 ///
 /// Only requests whose environment is fully determined by the request are described: the
 /// inheritance must clear the daemon environment, and the request must have no local resources
-/// and no worker, and must omit the invocation identity variables. A request with a scratch path
-/// is described only given `scratch`, that path resolved to an absolute path by the caller, since
+/// and no worker, and must omit the invocation identity variables. A request with a scratch path,
+/// a scratch path input or an owned scratch path but not both, is described only given
+/// `scratch`, that path resolved to an absolute path by the caller, since
 /// the executor sets variables to it: `TMPDIR` first and the scratch directory variables last.
 /// Any other request returns `None`, since part of its child environment is chosen during
 /// execution.
@@ -1761,11 +1821,14 @@ pub fn determined_local_environment(
     scratch: Option<&AbsPath>,
 ) -> Option<Vec<(OsString, OsString)>> {
     let inheritance = request.local_environment_inheritance()?;
-    let has_scratch = request
+    let has_scratch_input = request
         .inputs()
         .iter()
         .any(|input| matches!(input, CommandExecutionInput::ScratchPath(..)));
+    let has_owned_scratch = request.owned_scratch_path().is_some();
+    let has_scratch = has_scratch_input || has_owned_scratch;
     if !inheritance.clear()
+        || (has_scratch_input && has_owned_scratch)
         || !request.omit_local_invocation_identity_env()
         || !request.required_local_resources().is_empty()
         || request.worker().is_some()
@@ -2366,6 +2429,137 @@ printf ran
         assert_eq!(sorted_described, sorted_expected);
         let position = |name: &str| described.iter().position(|(k, _)| k == name);
         assert!(position("TMPDIR") < position("FRESH_A"), "{described:?}");
+        Ok(())
+    }
+
+    /// An owned scratch path, an absolute directory outside the project, is prepared as a
+    /// `buck-out` one is: whatever a previous run left in it is removed without following a
+    /// symlink, and it is created again, owner-only, holding exactly the requested empty,
+    /// owner-only subdirectories, with `TMPDIR` set to it. A request with both an owned scratch
+    /// path and a scratch path input is refused, and no child starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_exec_request_prepares_an_owned_scratch_path() -> buck2_error::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+        use buck2_execute::execute::request::CommandExecutionPaths;
+        use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+        use buck2_hash::BuckIndexSet;
+
+        let (executor, root, _tmpdir) = test_executor()?;
+        // The owner's root, outside the project.
+        let owner_root = std::env::temp_dir().join(format!("b2o{}", std::process::id()));
+        std::fs::create_dir(&owner_root)?;
+        let owner_root = AbsNormPathBuf::new(owner_root)?;
+        let owned = owner_root.join(ForwardRelativePath::new("case")?);
+        let fresh_a = owned.join(ForwardRelativePath::new("0")?);
+        // Something an earlier run left behind, including a symlink out of the scratch path.
+        let kept = owner_root.join(ForwardRelativePath::new("kept")?);
+        fs_util::write(&kept, "x").map_err(|e| e.categorize_internal())?;
+        fs_util::create_dir_all(&fresh_a)?;
+        fs_util::write(fresh_a.join(ForwardRelativePath::new("earlier")?), "x")
+            .map_err(|e| e.categorize_internal())?;
+        std::os::unix::fs::symlink(&kept, owned.join(ForwardRelativePath::new("link")?))?;
+
+        let paths = || {
+            CommandExecutionPaths::new(
+                vec![],
+                BuckIndexSet::default(),
+                &executor.artifact_fs,
+                DigestConfig::testing_default(),
+                None,
+            )
+        };
+        // Passes only with exactly the one subdirectory, empty, in `TMPDIR` = the owned scratch
+        // path; then leaves files behind.
+        let script = r#"set -e
+s=$1
+test "$TMPDIR" = "$s"
+test "$FRESH_A" = "$s/0"
+set -- "$s"/* "$s"/.[!.]*
+test "$*" = "$s/0 $s/.[!.]*"
+set -- "$FRESH_A"/* "$FRESH_A"/.[!.]*
+test "$*" = "$FRESH_A/* $FRESH_A/.[!.]*"
+: > "$FRESH_A/left"
+: > "$s/.stale"
+printf ran
+"#;
+        let variables = vec![ScratchDirVariable {
+            name: "FRESH_A".to_owned(),
+            subdirectory: ForwardRelativePathBuf::new("0".to_owned())?,
+        }];
+        let request = CommandExecutionRequest::new(
+            vec![],
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                "sh".to_owned(),
+                owned.to_string(),
+            ],
+            paths()?,
+            Default::default(),
+        )
+        .with_skip_resource_control()
+        .with_scratch_dir_variables(variables.clone())
+        .with_owned_scratch_path(Some(owned.clone()));
+
+        for run in 0..2 {
+            let result = run_request(&executor, &request, &[]).await;
+            match &result.report.std_streams {
+                CommandStdStreams::Local { stdout, stderr } => assert_eq!(
+                    (stdout.as_slice(), result.report.exit_code),
+                    (b"ran".as_slice(), Some(0)),
+                    "run {run}: {}",
+                    String::from_utf8_lossy(stderr)
+                ),
+                _ => panic!("run {run} has no local streams"),
+            }
+            for directory in [&owned, &fresh_a] {
+                let mode = std::fs::metadata(directory)?.permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "run {run}: {directory}");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&kept)?, "x");
+
+        let described = determined_local_environment(
+            &request
+                .with_local_environment_inheritance(EnvironmentInheritance::empty())
+                .with_omit_local_invocation_identity_env(true),
+            &root,
+            Some(&owned),
+        )
+        .expect("the environment is determined given the owned scratch path");
+        let expected: Vec<(OsString, OsString)> = [
+            ("TMPDIR", owned.to_string()),
+            ("FRESH_A", fresh_a.to_string()),
+            ("PWD", root.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        assert_eq!(described, expected);
+
+        // Both kinds of scratch path at once.
+        let (both, _) = scratch_request(&executor, ": > started", vec![], &[])?;
+        let both = both.with_owned_scratch_path(Some(owned.clone()));
+        let result = run_request(&executor, &both, &[]).await;
+        assert_matches!(result.report.status, CommandExecutionStatus::Error { .. });
+        assert!(!root.as_path().join("started").exists());
+        assert_eq!(
+            determined_local_environment(
+                &both
+                    .with_local_environment_inheritance(EnvironmentInheritance::empty())
+                    .with_omit_local_invocation_identity_env(true),
+                &root,
+                Some(&owned),
+            ),
+            None
+        );
+
+        std::fs::remove_dir_all(&owner_root)?;
         Ok(())
     }
 

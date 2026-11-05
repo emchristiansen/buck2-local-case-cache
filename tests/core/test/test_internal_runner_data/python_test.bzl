@@ -283,3 +283,78 @@ fresh_dir_env_test = rule(
         "started": attrs.string(),
     },
 )
+
+# The case binds a tmux server's socket, `tmux-<uid>/default`, in its fresh `TMUX_TMPDIR`, as a
+# tmux server would.
+_BIND_TMUX_SOCKET = """
+import os, socket
+tmux = os.environ["TMUX_TMPDIR"]
+assert os.path.dirname(tmux) == os.environ["TMPDIR"], (tmux, os.environ["TMPDIR"])
+server = os.path.join(tmux, "tmux-%d" % os.getuid())
+os.mkdir(server, 0o700)
+socket.socket(socket.AF_UNIX).bind(os.path.join(server, "default"))
+print("case")
+"""
+
+def _fresh_socket_impl(_ctx):
+    return [
+        DefaultInfo(),
+        InternalRunnerTestInfo(
+            type = "custom",
+            command = ["fbpython", "-c", _BIND_TMUX_SOCKET],
+            listing_command = ["fbpython", "-c", "print('case')"],
+            parse_test_listing = parse_internal_listing,
+            parse_test_result = parse_internal_result_with_details,
+            fresh_dir_env = ["TMUX_TMPDIR"],
+        ),
+    ]
+
+fresh_socket_test = rule(impl = _fresh_socket_impl, attrs = {})
+
+# A case eligible for local result reuse, with a fresh directory: its command is bound, being a
+# Nix store shell running a script artifact with only a Nix store `PATH`, and its parser is
+# self-contained. Each real start of the case leaves a file holding its `TMPDIR` in the events
+# directory (outside its scratch path), so a reused result is one that started no child. `fresh_dirs.mode` chooses its
+# outcome: `pass`, `fail`, or `refuse`, which prints output its parser refuses.
+_TRACKED_CASE = """set -e
+events=$1
+test "$FRESH_A" = "$TMPDIR/0"
+set -- "$FRESH_A"/* "$FRESH_A"/.[!.]*
+test "$*" = "$FRESH_A/* $FRESH_A/.[!.]*"
+: > "$FRESH_A/left"
+printf '%s' "$TMPDIR" > "$(mktemp "$events/start.XXXXXX")"
+case "$CASE_MODE" in
+pass) echo case ;;
+fail) echo case; exit 1 ;;
+refuse) echo UNPARSEABLE ;;
+*) exit 2 ;;
+esac
+"""
+
+def _fresh_tracked_impl(ctx):
+    script = ctx.actions.write("case.sh", _TRACKED_CASE, is_executable = True)
+    return [
+        DefaultInfo(),
+        InternalRunnerTestInfo(
+            type = "custom",
+            command = [ctx.attrs.shell, script, ctx.attrs.events],
+            env = {"CASE_MODE": ctx.attrs.mode, "PATH": ctx.attrs.path},
+            listing_command = [ctx.attrs.shell, "-c", "echo case"],
+            parse_test_listing = parse_internal_listing,
+            parse_test_result = parse_named_result,
+            supports_test_execution_caching = True,
+            fresh_dir_env = ["FRESH_A"],
+        ),
+    ]
+
+fresh_tracked_test = rule(
+    impl = _fresh_tracked_impl,
+    attrs = {
+        "events": attrs.string(),
+        "mode": attrs.string(),
+        # A Nix store `bin` directory with `mktemp`.
+        "path": attrs.string(),
+        # A Nix store shell.
+        "shell": attrs.string(),
+    },
+)

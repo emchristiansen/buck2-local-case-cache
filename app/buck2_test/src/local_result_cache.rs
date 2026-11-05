@@ -313,12 +313,14 @@ impl LocalCaseCandidate {
             Some(LocalCaseGap::DeclaredOutputs)
         } else if request.worker().is_some() {
             Some(LocalCaseGap::Worker)
-        } else if request.inputs().iter().any(|input| {
-            matches!(
-                input,
-                buck2_execute::execute::request::CommandExecutionInput::ScratchPath(..)
-            )
-        }) && !fresh_dirs.is_some_and(|fresh_dirs| fresh_dirs.admits(&request))
+        } else if (request.owned_scratch_path().is_some()
+            || request.inputs().iter().any(|input| {
+                matches!(
+                    input,
+                    buck2_execute::execute::request::CommandExecutionInput::ScratchPath(..)
+                )
+            }))
+            && !fresh_dirs.is_some_and(|fresh_dirs| fresh_dirs.admits(&request))
         {
             Some(LocalCaseGap::ScratchPath)
         } else if !request
@@ -748,6 +750,7 @@ pub(crate) use store::Lease;
 pub(crate) use store::Lookup;
 pub(crate) use store::PendingCase;
 pub(crate) use store::ReusedCase;
+pub(crate) use store::validate_scratch_root;
 
 /// What the orchestrator hands the internal runner for one case: nothing, a reused entry that the
 /// runner must still confirm through its parser, or a captured success awaiting confirmation.
@@ -972,16 +975,26 @@ mod store {
     /// Require an opened object to be of `kind`, owned by this user, inaccessible to others and,
     /// for regular files, not hard-linked elsewhere.
     fn require_private(fd: &OwnedFd, name: &str, kind: libc::mode_t) -> buck2_error::Result<()> {
+        require_private_as(fd, name, kind, "Local case result entry")
+    }
+
+    /// `require_private`, naming the object `what` in its errors.
+    fn require_private_as(
+        fd: &OwnedFd,
+        name: &str,
+        kind: libc::mode_t,
+        what: &str,
+    ) -> buck2_error::Result<()> {
         let stat = fstat(fd, name)?;
         let actual_kind = stat.st_mode & libc::S_IFMT;
         if actual_kind != kind {
             return Err(store_error(format!(
-                "Local case result entry `{name}` has file type {actual_kind:o}, expected {kind:o}"
+                "{what} `{name}` has file type {actual_kind:o}, expected {kind:o}"
             )));
         }
         if stat.st_uid != euid() || stat.st_mode & 0o077 != 0 {
             return Err(store_error(format!(
-                "Local case result entry `{name}` must be owned by uid {} and inaccessible to \
+                "{what} `{name}` must be owned by uid {} and inaccessible to \
                  others (found uid {}, mode {:o})",
                 euid(),
                 stat.st_uid,
@@ -1028,13 +1041,47 @@ mod store {
     const ANCESTOR_FLAGS: libc::c_int =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
+    /// A private root a configuration names, validated by the same walk whatever it holds.
+    #[derive(Clone, Copy)]
+    enum ConfiguredRoot {
+        /// `[test] local_case_result_cache_root`, holding the store.
+        Results,
+        /// `[test] local_case_scratch_root`, holding owned per-case scratch paths.
+        Scratch,
+    }
+
+    impl ConfiguredRoot {
+        fn key(self) -> &'static str {
+            match self {
+                Self::Results => "[test] local_case_result_cache_root",
+                Self::Scratch => "[test] local_case_scratch_root",
+            }
+        }
+
+        /// What the root's ancestors' errors call the root.
+        fn noun(self) -> &'static str {
+            match self {
+                Self::Results => "Local case result root",
+                Self::Scratch => "Local case scratch root",
+            }
+        }
+
+        /// What the root's own errors call it.
+        fn entry(self) -> &'static str {
+            match self {
+                Self::Results => "Local case result entry",
+                Self::Scratch => "Local case scratch root",
+            }
+        }
+    }
+
     /// The components of a configured root, which must be an absolute, lexically canonical path
     /// below `/`: no trailing slash and no empty, `.` or `..` component.
-    fn root_components(path: &str) -> buck2_error::Result<Vec<CString>> {
+    fn root_components(path: &str, root: ConfiguredRoot) -> buck2_error::Result<Vec<CString>> {
         let invalid = |why: &str| {
             store_error(format!(
-                "[test] local_case_result_cache_root `{path}` {why}; it must be an absolute, \
-                 lexically canonical directory path"
+                "{} `{path}` {why}; it must be an absolute, lexically canonical directory path",
+                root.key()
             ))
         };
         let Some(relative) = path.strip_prefix('/') else {
@@ -1056,11 +1103,16 @@ mod store {
     /// An ancestor of the root must be a directory that no other principal can rename entries
     /// in: owned by root or this user and writable by neither group nor others, unless it is a
     /// root-owned sticky directory such as `/tmp`.
-    fn require_trusted_ancestor(fd: &OwnedFd, name: &str) -> buck2_error::Result<()> {
+    fn require_trusted_ancestor(
+        fd: &OwnedFd,
+        name: &str,
+        root: ConfiguredRoot,
+    ) -> buck2_error::Result<()> {
         let stat = fstat(fd, name)?;
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(store_error(format!(
-                "Local case result root ancestor `{name}` is not a directory"
+                "{} ancestor `{name}` is not a directory",
+                root.noun()
             )));
         }
         let owner_trusted = stat.st_uid == 0 || stat.st_uid == euid();
@@ -1068,9 +1120,10 @@ mod store {
         let root_sticky = stat.st_uid == 0 && stat.st_mode & libc::S_ISVTX != 0;
         if !owner_trusted || (shared_write && !root_sticky) {
             return Err(store_error(format!(
-                "Local case result root ancestor `{name}` may be changed by another user \
+                "{} ancestor `{name}` may be changed by another user \
                  (uid {}, mode {:o}); every ancestor must be owned by root or uid {} and not \
                  writable by others unless it is a root-owned sticky directory",
+                root.noun(),
                 stat.st_uid,
                 stat.st_mode & 0o7777,
                 euid()
@@ -1083,8 +1136,8 @@ mod store {
         /// Open (creating the last component if absent) the configured root by walking it from
         /// `/` one component at a time with `O_NOFOLLOW`. A symlink anywhere in the path, an
         /// ancestor another principal could change, or a root that is not private is refused.
-        fn open_root(path: &str) -> buck2_error::Result<Self> {
-            let components = root_components(path)?;
+        fn open_root(path: &str, root: ConfiguredRoot) -> buck2_error::Result<Self> {
+            let components = root_components(path, root)?;
             let (last, ancestors) = components
                 .split_last()
                 .internal_error("root has components")?;
@@ -1096,7 +1149,7 @@ mod store {
             // SAFETY: freshly opened descriptor.
             let mut parent = unsafe { OwnedFd::from_raw_fd(fd) };
             let mut walked = String::new();
-            require_trusted_ancestor(&parent, "/")?;
+            require_trusted_ancestor(&parent, "/", root)?;
             for component in ancestors {
                 walked.push('/');
                 walked.push_str(&component.to_string_lossy());
@@ -1111,7 +1164,7 @@ mod store {
                 }
                 // SAFETY: freshly opened descriptor.
                 parent = unsafe { OwnedFd::from_raw_fd(fd) };
-                require_trusted_ancestor(&parent, &walked)?;
+                require_trusted_ancestor(&parent, &walked, root)?;
             }
             // SAFETY: `parent` is an open directory and `last` a valid component.
             if unsafe { libc::mkdirat(parent.as_raw_fd(), last.as_ptr(), 0o700) } != 0
@@ -1132,7 +1185,7 @@ mod store {
             }
             // SAFETY: freshly opened descriptor.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            require_private(&fd, path, libc::S_IFDIR)?;
+            require_private_as(&fd, path, libc::S_IFDIR, root.entry())?;
             Ok(Self {
                 fd,
                 name: path.to_owned(),
@@ -1337,6 +1390,14 @@ mod store {
         Miss(KeyGuard),
     }
 
+    /// Validate `[test] local_case_scratch_root` exactly as the store's root is validated, and
+    /// create it, owner-only, if absent (`Dir::open_root`): an absolute, lexically canonical path
+    /// of real directories, no ancestor another principal could change, and the root itself
+    /// private to this user. This blocks on the filesystem.
+    pub(crate) fn validate_scratch_root(path: &str) -> buck2_error::Result<()> {
+        Dir::open_root(path, ConfiguredRoot::Scratch).map(drop)
+    }
+
     impl LocalCaseStore {
         /// Open the store under an explicitly configured root. This blocks on the filesystem.
         ///
@@ -1347,7 +1408,7 @@ mod store {
         /// names a different directory, the store is refused rather than silently switching
         /// key, lock and generation namespaces, until the daemon restarts.
         pub(crate) fn open(path: &str) -> buck2_error::Result<Self> {
-            let root = Dir::open_root(path)?;
+            let root = Dir::open_root(path, ConfiguredRoot::Results)?;
             let stat = fstat(&root.fd, path)?;
             let (device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
             let mut pinned = PINNED_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1902,6 +1963,13 @@ mod store {
             buck2_error::ErrorTag::Input,
             "Local case result reuse is supported only on Linux and macOS"
         )
+    }
+
+    pub(crate) fn validate_scratch_root(_path: &str) -> buck2_error::Result<()> {
+        Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "[test] local_case_scratch_root is supported only on Linux and macOS"
+        ))
     }
 
     pub(crate) enum Never {}
@@ -2595,8 +2663,9 @@ mod tests {
             variant: None,
             repeat_count: None,
         };
-        let fresh =
-            FreshDirs::for_stage(&target, &stage, ["FRESH_A"], &fs).unwrap().unwrap();
+        let fresh = FreshDirs::for_stage(&target, &stage, ["FRESH_A"], &fs, None)
+            .unwrap()
+            .unwrap();
         // Two keys of one case: the second differs only in an unrelated variable.
         let key = Material::new().key();
         let mut other = Material::new();
@@ -2956,9 +3025,10 @@ mod tests {
     }
 
     /// The only scratch path a case may carry is the engine's own fresh-directory scratch path,
-    /// set up exactly as the engine sets it up for that case. The key then records the
-    /// environment the executor installs: `TMPDIR` set to that path, then each declared name set
-    /// to its directory. Any other scratch path keeps the case out of the store.
+    /// in `buck-out` or in a scratch root, set up exactly as the engine sets it up for that case.
+    /// The key then records the environment the executor installs: `TMPDIR` set to that path,
+    /// then each declared name set to its directory. Any other scratch path keeps the case out
+    /// of the store.
     #[test]
     fn only_the_engines_fresh_scratch_path_is_admitted_and_keyed() {
         use buck2_common::file_ops::metadata::FileMetadata;
@@ -3002,117 +3072,134 @@ mod tests {
             variant: None,
             repeat_count: None,
         };
-        let names = ["FRESH_A", "FRESH_B"];
-        let fresh = FreshDirs::for_stage(&target, &stage("module::case"), names, &fs)
+        // In `buck-out`, and in a scratch root.
+        let scratch_root = project.root().as_path().join("scratch-root");
+        let owned_root = tokio::runtime::Builder::new_current_thread()
+            .build()
             .unwrap()
+            .block_on(crate::local_case_fresh_dirs::ScratchRoot::validate(
+                scratch_root.to_str().unwrap().to_owned(),
+            ))
             .unwrap();
-        let foreign = FreshDirs::for_stage(&target, &stage("module::other"), names, &fs)
-            .unwrap()
-            .unwrap();
-        let store = std::fs::canonicalize("/bin/sh").unwrap();
-        assert!(
-            store.starts_with("/nix/store"),
-            "the test needs a Nix store host"
-        );
-        let store = store.parent().unwrap().to_str().unwrap().to_owned();
-        let script = "buck-out/v2/gen/t/runner";
-        let body = b"#!/bin/sh\necho\n";
-        // The request the orchestrator builds for a case whose scratch path is `scratch`.
-        let make = |scratch: &FreshDirs| {
-            let runner = CommandExecutionInput::IncrementalRemoteOutput(
-                ProjectRelativePathBuf::unchecked_new(script.to_owned()),
-                DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
-                    digest: TrackedFileDigest::from_content(
-                        body,
-                        digest_config.cas_digest_config(),
-                    ),
-                    is_executable: true,
-                })),
+        for root in [None, Some(owned_root)] {
+            let names = ["FRESH_A", "FRESH_B"];
+            let fresh =
+                FreshDirs::for_stage(&target, &stage("module::case"), names, &fs, root.as_ref())
+                    .unwrap()
+                    .unwrap();
+            let foreign =
+                FreshDirs::for_stage(&target, &stage("module::other"), names, &fs, root.as_ref())
+                    .unwrap()
+                    .unwrap();
+            let store = std::fs::canonicalize("/bin/sh").unwrap();
+            assert!(
+                store.starts_with("/nix/store"),
+                "the test needs a Nix store host"
             );
-            let paths = CommandExecutionPaths::new(
-                vec![runner, scratch.input()],
-                Default::default(),
-                &fs,
-                digest_config,
-                None,
-            )
-            .unwrap();
-            let mut env: sorted_vector_map::SortedVectorMap<String, String> =
-                sorted_vector_map::SortedVectorMap::new();
-            env.insert("PATH".to_owned(), store.clone());
-            CommandExecutionRequest::new(
-                vec![],
-                vec![script.to_owned(), "module::case".to_owned()],
-                paths,
-                env,
-            )
-            .with_local_environment_inheritance(EnvironmentInheritance::empty())
-            .with_executor_preference(ExecutorPreference::LocalPreferred)
-            .with_scratch_dir_variables(scratch.variables())
-        };
-        let facts = || RequestFacts {
-            project_fs: project,
-            buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
-        };
-        let cache_root = project.root().as_path().join("cache-root");
-        let candidate = || LocalCaseCandidate {
-            root: cache_root.to_str().unwrap().to_owned(),
-            reuse: true,
-            case: Material::new().case,
-        };
+            let store = store.parent().unwrap().to_str().unwrap().to_owned();
+            let script = "buck-out/v2/gen/t/runner";
+            let body = b"#!/bin/sh\necho\n";
+            // The request the orchestrator builds for a case whose scratch path is `scratch`.
+            let make = |scratch: &FreshDirs| {
+                let runner = CommandExecutionInput::IncrementalRemoteOutput(
+                    ProjectRelativePathBuf::unchecked_new(script.to_owned()),
+                    DirectoryEntry::Leaf(ActionDirectoryMember::File(FileMetadata {
+                        digest: TrackedFileDigest::from_content(
+                            body,
+                            digest_config.cas_digest_config(),
+                        ),
+                        is_executable: true,
+                    })),
+                );
+                let paths = CommandExecutionPaths::new(
+                    std::iter::once(runner).chain(scratch.input()).collect(),
+                    Default::default(),
+                    &fs,
+                    digest_config,
+                    None,
+                )
+                .unwrap();
+                let mut env: sorted_vector_map::SortedVectorMap<String, String> =
+                    sorted_vector_map::SortedVectorMap::new();
+                env.insert("PATH".to_owned(), store.clone());
+                CommandExecutionRequest::new(
+                    vec![],
+                    vec![script.to_owned(), "module::case".to_owned()],
+                    paths,
+                    env,
+                )
+                .with_local_environment_inheritance(EnvironmentInheritance::empty())
+                .with_executor_preference(ExecutorPreference::LocalPreferred)
+                .with_scratch_dir_variables(scratch.variables())
+                .with_owned_scratch_path(scratch.owned_scratch_path())
+            };
+            let facts = || RequestFacts {
+                project_fs: project,
+                buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
+            };
+            let cache_root = project.root().as_path().join("cache-root");
+            let candidate = || LocalCaseCandidate {
+                root: cache_root.to_str().unwrap().to_owned(),
+                reuse: true,
+                case: Material::new().case,
+            };
 
-        // Another case's scratch path, or a scratch path without the engine's setup, is refused
-        // and the request given back unchanged.
-        let (refused, case) =
-            candidate().constrain(make(&foreign), facts(), Some(&fresh), |_| true);
-        assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
-        assert_eq!(refused.executor_preference(), ExecutorPreference::LocalPreferred);
-        let (_, case) = candidate().constrain(make(&fresh), facts(), None, |_| true);
-        assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
+            // Another case's scratch path, or a scratch path without the engine's setup, is refused
+            // and the request given back unchanged.
+            let (refused, case) =
+                candidate().constrain(make(&foreign), facts(), Some(&fresh), |_| true);
+            assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
+            assert_eq!(
+                refused.executor_preference(),
+                ExecutorPreference::LocalPreferred
+            );
+            let (_, case) = candidate().constrain(make(&fresh), facts(), None, |_| true);
+            assert_eq!(case.err(), Some(LocalCaseGap::ScratchPath));
 
-        let (constrained, case) =
-            candidate().constrain(make(&fresh), facts(), Some(&fresh), |_| true);
-        let case = case.expect("the engine's own fresh scratch path is admitted");
-        assert_eq!(
-            constrained.executor_preference(),
-            ExecutorPreference::LocalRequired
-        );
-        let action_digest =
-            ActionDigest::from_content(b"action", digest_config.cas_digest_config());
-        let working_directory = project.resolve(constrained.working_directory());
-        let key = case
-            .key(
-                &constrained,
-                PreparedFacts {
-                    action_digest: &action_digest,
-                    working_directory: &working_directory,
-                    network_access: "None".to_owned(),
-                    digest_config: digest_config.cas_digest_config(),
-                },
-            )
-            .unwrap();
-        // The recorded environment, in installation order: the scratch directory variables last.
-        let mut expected = KeyRecord::default();
-        let scratch = fresh.absolute().to_string();
-        let env = fresh.values().unwrap();
-        for (name, value) in [
-            ("TMPDIR", scratch.as_str()),
-            ("PATH", store.as_str()),
-            ("FRESH_A", env[0].1.as_str()),
-            ("FRESH_B", env[1].1.as_str()),
-        ] {
-            expected.field("env_name", name.as_bytes());
-            expected.field("env_value", value.as_bytes());
+            let (constrained, case) =
+                candidate().constrain(make(&fresh), facts(), Some(&fresh), |_| true);
+            let case = case.expect("the engine's own fresh scratch path is admitted");
+            assert_eq!(
+                constrained.executor_preference(),
+                ExecutorPreference::LocalRequired
+            );
+            let action_digest =
+                ActionDigest::from_content(b"action", digest_config.cas_digest_config());
+            let working_directory = project.resolve(constrained.working_directory());
+            let key = case
+                .key(
+                    &constrained,
+                    PreparedFacts {
+                        action_digest: &action_digest,
+                        working_directory: &working_directory,
+                        network_access: "None".to_owned(),
+                        digest_config: digest_config.cas_digest_config(),
+                    },
+                )
+                .unwrap();
+            // The recorded environment, in installation order: the scratch directory variables last.
+            let mut expected = KeyRecord::default();
+            let scratch = fresh.absolute().to_string();
+            let env = fresh.values().unwrap();
+            for (name, value) in [
+                ("TMPDIR", scratch.as_str()),
+                ("PATH", store.as_str()),
+                ("FRESH_A", env[0].1.as_str()),
+                ("FRESH_B", env[1].1.as_str()),
+            ] {
+                expected.field("env_name", name.as_bytes());
+                expected.field("env_value", value.as_bytes());
+            }
+            assert!(
+                key.record
+                    .windows(expected.0.len())
+                    .any(|window| window == expected.0.as_slice()),
+                "the key does not record TMPDIR and the fresh directories in installation order"
+            );
+            assert_eq!(env[0].1, format!("{scratch}/0"));
+            // Neither touched the store.
+            assert!(!cache_root.exists());
         }
-        assert!(
-            key.record
-                .windows(expected.0.len())
-                .any(|window| window == expected.0.as_slice()),
-            "the key does not record TMPDIR and the fresh directories in installation order"
-        );
-        assert_eq!(env[0].1, format!("{scratch}/0"));
-        // Neither touched the store.
-        assert!(!cache_root.exists());
     }
 
     #[test]
