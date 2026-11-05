@@ -66,6 +66,21 @@ pub fn get_last_command_execution_kind(
     }
 }
 
+/// Returns whether a test run's result was reused from the local test-result cache rather than
+/// produced by running the test. The `TestRunEnd` command report is the single authoritative
+/// record of such a hit; the lookup/hit executor stages that precede it are not counted.
+pub fn is_local_test_result_reuse(test_run: &buck2_data::TestRunEnd) -> bool {
+    matches!(
+        test_run
+            .command_report
+            .as_ref()
+            .and_then(|c| c.details.as_ref())
+            .and_then(|d| d.command_kind.as_ref())
+            .and_then(|k| k.command.as_ref()),
+        Some(buck2_data::command_execution_kind::Command::LocalTestResultCache(_))
+    )
+}
+
 pub struct ExecTime {
     pub exec_time_ms: u64,
     pub(crate) cached_exec_time_ms: u64,

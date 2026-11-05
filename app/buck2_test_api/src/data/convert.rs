@@ -49,6 +49,7 @@ use crate::data::RemoteFile;
 use crate::data::RemoteObject;
 use crate::data::TestExecutable;
 use crate::data::TestResult;
+use crate::data::TestResultOrigin;
 use crate::data::TestStage;
 use crate::data::TestStatus;
 
@@ -407,6 +408,8 @@ impl TryFrom<buck2_test_proto::TestResult> for TestResult {
             duration,
             max_memory_used_bytes,
             details,
+            // An external test runner executes every case it reports.
+            origin: TestResultOrigin::Fresh,
         })
     }
 }
@@ -416,6 +419,16 @@ impl TryInto<buck2_test_proto::TestResult> for TestResult {
 
     fn try_into(self) -> Result<buck2_test_proto::TestResult, Self::Error> {
         use buck2_test_proto::test_result::*;
+
+        // The external test runner protocol has no reuse provenance; refuse to present a reused
+        // result as a fresh one.
+        if let TestResultOrigin::Reused(reused) = &self.origin {
+            return Err(buck2_error::internal_error!(
+                "Reused test result `{}` (origin attempt `{}`) cannot be sent over the test runner protocol",
+                self.name,
+                reused.origin_attempt
+            ));
+        }
 
         Ok(buck2_test_proto::TestResult {
             target: Some(
@@ -1198,6 +1211,33 @@ mod tests {
         let proto: P = s.clone().try_into().unwrap();
         let roundtrip: S = proto.try_into().unwrap();
         assert_eq!(*s, roundtrip);
+    }
+
+    #[test]
+    fn test_result_roundtrip_is_fresh_and_reuse_is_refused() {
+        let fresh = TestResult {
+            target: ConfiguredTargetHandle(1),
+            name: "case".to_owned(),
+            status: TestStatus::PASS,
+            msg: None,
+            duration: Some(Duration::from_secs(9)),
+            max_memory_used_bytes: None,
+            details: "details".to_owned(),
+            origin: TestResultOrigin::Fresh,
+        };
+        assert_roundtrips::<buck2_test_proto::TestResult, TestResult>(&fresh);
+
+        let reused = TestResult {
+            origin: TestResultOrigin::Reused(crate::data::ReusedTestResult {
+                origin_attempt: "origin".to_owned(),
+                entry_manifest: "manifest".to_owned(),
+                current_attempt: "current".to_owned(),
+                current_execution_time: Duration::ZERO,
+            }),
+            ..fresh
+        };
+        let refused: Result<buck2_test_proto::TestResult, _> = reused.try_into();
+        assert!(refused.is_err());
     }
 
     #[test]

@@ -262,3 +262,121 @@ G = f(1)
 
     a.pass("load('x.bzl', 'G')\nG()");
 }
+
+/// The self-contained source of `func` in a module `parsers.bzl` holding `code`.
+fn self_contained_source(a: &mut Assert, code: &str, func: &str) -> Result<String, String> {
+    let module = a.module("parsers", code);
+    let func = module.get(func).unwrap();
+    func.as_ref()
+        .value()
+        .self_contained_function_source()
+        .map(|source| {
+            assert_eq!(source.filename, "parsers.bzl");
+            source.source.to_owned()
+        })
+}
+
+const PURE_PARSERS: &str = r#"
+"""Parsers that read only their arguments and the standard builtins."""
+
+def parse_listing(stdout: str) -> list:
+    if not stdout.endswith("\n"):
+        fail("incomplete listing: {}".format(repr(stdout)))
+    return [{"filter": name, "name": name} for name in stdout[:-1].split("\n") if name]
+
+def parse_result(stdout, stderr, exit_code = 0):
+    cases = []
+    for index, line in enumerate(stdout.split("\n")):
+        name, _separator, outcome = line.partition(" ... ")
+        if type(outcome) == "string" and outcome.isdigit():
+            cases.append((name, int(outcome), index))
+    for _index in range(len(cases)):
+        pass
+    # A local may share a name with a builtin the host provides; it is still a local.
+    print = len
+    return _summary(cases, stderr, exit_code, print(stdout))
+
+def _summary(cases, stderr, exit_code, length):
+    return [{
+        "cases": tuple(cases),
+        "length": length,
+        "message": None if exit_code == 0 else stderr,
+        "status": "PASS" if exit_code == 0 else "FAIL",
+    }]
+"#;
+
+#[test]
+fn test_self_contained_function_source_admits_standard_builtins_and_methods() {
+    let mut a = Assert::new();
+    for func in ["parse_listing", "parse_result"] {
+        assert_eq!(
+            self_contained_source(&mut a, PURE_PARSERS, func).as_deref(),
+            Ok(PURE_PARSERS)
+        );
+    }
+}
+
+#[test]
+fn test_self_contained_function_source_rejects_host_builtin() {
+    // A host global such as Buck's `read_config` can return different values for the same
+    // source, so the source alone does not determine the function.
+    let mut a = Assert::new();
+    a.globals_add(|g| g.set("read_config", "PASS"));
+    let code = r#"
+def parse_listing(stdout):
+    return [{"name": "case", "filter": "case"}]
+
+def parse_result(stdout, stderr, exit_code):
+    return [{"name": "case", "status": read_config}]
+"#;
+    for func in ["parse_listing", "parse_result"] {
+        let err = self_contained_source(&mut a, code, func).unwrap_err();
+        assert!(
+            err.contains("neither its own nor a standard Starlark builtin")
+                && err.contains("read_config"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn test_self_contained_function_source_rejects_non_standard_builtin_in_helper() {
+    // `print` is a library extension, not a standard builtin; a helper's use counts as well.
+    let mut a = Assert::new();
+    let code = r#"
+def parse(stdout):
+    return _helper(stdout)
+
+def _helper(stdout):
+    print(stdout)
+    return []
+"#;
+    let err = self_contained_source(&mut a, code, "parse").unwrap_err();
+    assert!(err.contains("print"), "{err}");
+}
+
+#[test]
+fn test_self_contained_function_source_rejects_module_value_and_load() {
+    let mut a = Assert::new();
+    let err = self_contained_source(
+        &mut a,
+        "STATUS = 'PASS'\ndef parse(x):\n    return STATUS\n",
+        "parse",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("top-level statement other than `def`"),
+        "{err}"
+    );
+    a.module("other", "def helper():\n    return 1\n");
+    let err = self_contained_source(
+        &mut a,
+        "load('other', 'helper')\ndef parse(x):\n    return helper()\n",
+        "parse",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("top-level statement other than `def`"),
+        "{err}"
+    );
+}

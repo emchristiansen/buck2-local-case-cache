@@ -231,9 +231,11 @@ impl<'v> InternalRunnerTestInfo<'v> {
 
     /// The content that alone determines the listing and result parsers, if both are
     /// self-contained: each is the top-level `def` bound to its own name in a file whose module
-    /// loads nothing, imports nothing and binds only such `def`s with literal defaults. The
-    /// identity is each callable's name and its file's name and complete text. A parser that
-    /// reaches any other file or module-level value has no such identity, and the error says why.
+    /// loads nothing, imports nothing, binds only such `def`s with literal defaults and reads no
+    /// global other than the Starlark-standard builtins. The identity is each callable's name and
+    /// its file's name and complete text. A parser that reaches any other file, module-level
+    /// value or host builtin (such as `read_config`, whose result depends on the configuration)
+    /// has no such identity, and the error says why.
     pub fn self_contained_parser_identity(&self) -> Result<String, String> {
         fn callable(role: &str, value: Value<'_>) -> Result<String, String> {
             let source = value

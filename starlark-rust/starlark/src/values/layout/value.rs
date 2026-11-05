@@ -706,8 +706,12 @@ impl<'v> Value<'v> {
     /// when the function is the top-level `def` bound to its own name in that file, captures
     /// nothing, and the file's module is self-contained: its top-level statements are only `def`
     /// statements whose defaults are literals, and string docstrings, and its frozen module binds
-    /// no other names (no `load`, no implicit import, no module-level value). Builtins remain;
-    /// they belong to the interpreter.
+    /// no other names (no `load`, no implicit import, no module-level value). The only other
+    /// names the file may read are the Starlark-standard builtins ([`Globals::standard`]), whose
+    /// results depend on their arguments alone; any other builtin the host interpreter provides
+    /// (one that may read configuration or other context) makes the function ineligible.
+    ///
+    /// [`Globals::standard`]: crate::environment::Globals::standard
     pub fn self_contained_function_source(self) -> Result<SelfContainedSource<'v>, String> {
         crate::eval::compiler::def::self_contained_function_source(self)
     }

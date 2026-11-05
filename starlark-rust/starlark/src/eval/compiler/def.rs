@@ -1085,6 +1085,23 @@ pub(crate) fn self_contained_function_source<'v>(
             "`{name}` in `{filename}` is not the top-level function bound to its name"
         ));
     }
+    // The file's text determines its functions only if every name they read is a local, one of
+    // the file's own functions, or a builtin whose result depends on its arguments alone. The
+    // host interpreter may also provide builtins that read their context (Buck's `read_config`,
+    // for example), so the file is compiled anew against the Starlark-standard builtins only:
+    // the compiler's own name resolution then rejects any other global the file mentions.
+    let pure_builtins = Globals::standard();
+    crate::environment::Module::with_temp_heap(|module| {
+        Evaluator::new(&module)
+            .eval_module(ast, &pure_builtins)
+            .map(|_| ())
+    })
+    .map_err(|e| {
+        format!(
+            "`{filename}` reads a name that is neither its own nor a standard Starlark builtin: {}",
+            e.without_diagnostic()
+        )
+    })?;
     Ok(SelfContainedSource {
         filename,
         source: codemap.source(),
