@@ -1042,4 +1042,61 @@ mod tests {
 
         Ok(())
     }
+
+    fn final_header(action_stats: &ActionStats) -> buck2_error::Result<String> {
+        Ok(SimpleHeader::new_for_data(HeaderData {
+            header: "test",
+            action_stats,
+            elapsed_str: "0.0s".to_owned(),
+            finished: 2,
+            remaining: 0,
+        })
+        .draw(
+            Dimensions {
+                width: 120,
+                height: 10,
+            },
+            DrawMode::Final,
+        )?
+        .fmt_for_test()
+        .to_string())
+    }
+
+    #[test]
+    fn test_simple_header_final_shows_local_test_result_reuse() -> buck2_error::Result<()> {
+        // Only reused test results: no build command ran, so no build cache-hit rate.
+        let reuse_only = ActionStats {
+            local_test_result_cached_actions: 2,
+            ..Default::default()
+        };
+        pretty_assertions::assert_eq!(
+            final_header(&reuse_only)?,
+            indoc::indoc!(
+                r#"
+                Jobs completed: 2. Time elapsed: 0.0s.
+                Local test-result reuse: 2
+                "#
+            )
+        );
+
+        // Reuse beside build commands keeps the build totals unchanged.
+        let mixed = ActionStats {
+            local_actions: 1,
+            remote_actions: 2,
+            cached_actions: 3,
+            local_test_result_cached_actions: 2,
+            ..Default::default()
+        };
+        pretty_assertions::assert_eq!(
+            final_header(&mixed)?,
+            indoc::indoc!(
+                r#"
+                Jobs completed: 2. Time elapsed: 0.0s.
+                Cache hits: 50%. Commands: 6 (cached: 3, remote: 2, local: 1). Local test-result reuse: 2
+                "#
+            )
+        );
+
+        Ok(())
+    }
 }

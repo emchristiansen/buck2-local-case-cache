@@ -487,6 +487,14 @@ where
                     self.observer().action_stats().total_executed_actions()
                 )?;
             }
+            // Reused test results are not build commands: they get their own line rather than
+            // entering the command or cache counts above.
+            if self.observer().action_stats().local_test_result_cached_actions > 0 {
+                echo!(
+                    "Local test-result reuse: {}",
+                    self.observer().action_stats().local_test_result_cached_actions
+                )?;
+            }
         }
 
         if let Some(re) = self
