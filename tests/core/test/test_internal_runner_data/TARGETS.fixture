@@ -1,4 +1,4 @@
-load(":python_test.bzl", "provider_pair_test", "python_test")
+load(":python_test.bzl", "provider_artifact_pair_test", "provider_pair_test", "python_test")
 
 python_test(
     name = "trivial_pass",
@@ -60,4 +60,8 @@ for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
     with open(path) as f:
         assert f.read() == token, path
 """.format(hold = read_config("fresh_dirs", "hold", "0")),
+)
+
+provider_artifact_pair_test(
+    name = "provider_artifact_pair",
 )

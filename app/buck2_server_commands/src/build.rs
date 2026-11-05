@@ -22,6 +22,7 @@ use buck2_build_api::build::BuildTargetResult;
 use buck2_build_api::build::ConfiguredBuildEventVariant;
 use buck2_build_api::build::HasCreateUnhashedSymlinkLock;
 use buck2_build_api::build::ProvidersToBuild;
+use buck2_build_api::build::TestArtifacts;
 use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::write_build_report;
 use buck2_build_api::build::detailed_aggregated_metrics::dice::HasDetailedAggregatedMetrics;
@@ -821,7 +822,7 @@ fn build_providers_to_providers_to_build(build_providers: &BuildProviders) -> Pr
     }
 
     if build_providers.test_info != BuildProviderAction::Skip as i32 {
-        providers_to_build.tests = true;
+        providers_to_build.tests = TestArtifacts::Preferred;
     }
 
     if build_providers.run_info != BuildProviderAction::Skip as i32 {

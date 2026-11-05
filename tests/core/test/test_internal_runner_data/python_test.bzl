@@ -65,6 +65,7 @@ def _provider_pair_impl(ctx):
             type = "custom",
             command = _pair_command("internal", expected, "INTERNAL_ONLY", "EXTERNAL_ONLY"),
             env = {"INTERNAL_ONLY": "1"},
+            labels = ["internal_provider"],
             listing_command = ["fbpython", "-c", "print('case')"],
             parse_test_listing = parse_internal_listing,
             parse_test_result = parse_internal_result,
@@ -72,6 +73,7 @@ def _provider_pair_impl(ctx):
         ExternalRunnerTestInfo(
             command = _pair_command("external", expected, "EXTERNAL_ONLY", "INTERNAL_ONLY"),
             env = {"EXTERNAL_ONLY": "1"},
+            labels = ["external_provider"],
             type = "custom",
         ),
     ]
@@ -82,4 +84,36 @@ provider_pair_test = rule(
         # `internal` or `external`: the provider the test run is expected to use.
         "expected": attrs.string(),
     },
+)
+
+_READS_EXTERNAL = "import sys; sys.exit(0 if open(sys.argv[1]).read() == 'external' else 1)"
+
+# Each provider's command reads a generated input of its own. The Internal provider's input comes
+# from an action that always fails, so building the Internal provider's artifacts fails the
+# target; the External provider's command passes only if its own distinct input was built.
+def _provider_artifact_pair_impl(ctx):
+    internal_input = ctx.actions.declare_output("internal_input.txt")
+    ctx.actions.run(
+        cmd_args("fbpython", "-c", "import sys; sys.exit(1)", hidden = internal_input.as_output()),
+        category = "internal_only_input",
+    )
+    external_input = ctx.actions.write("external_input.txt", "external")
+    return [
+        DefaultInfo(),
+        InternalRunnerTestInfo(
+            type = "custom",
+            command = ["fbpython", "-c", _READS_EXTERNAL, internal_input],
+            listing_command = ["fbpython", "-c", "print('case')"],
+            parse_test_listing = parse_internal_listing,
+            parse_test_result = parse_internal_result,
+        ),
+        ExternalRunnerTestInfo(
+            command = ["fbpython", "-c", _READS_EXTERNAL, external_input],
+            type = "custom",
+        ),
+    ]
+
+provider_artifact_pair_test = rule(
+    impl = _provider_artifact_pair_impl,
+    attrs = {},
 )

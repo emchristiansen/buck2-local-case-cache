@@ -10,15 +10,18 @@
 
 use std::sync::Arc;
 
+use allocative::Allocative;
 use buck2_common::tenting::TentingStatus;
 use buck2_core::cells::name::CellName;
 use buck2_test_api::data::ConfiguredTarget;
 use buck2_test_api::data::ExternalRunnerSpec;
 use buck2_test_api::data::ExternalRunnerSpecValue;
 use buck2_test_api::protocol::TestExecutor;
+use dupe::Dupe;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use itertools::Itertools;
+use pagable::Pagable;
 
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::provider::builtin::external_runner_test_info::ExternalRunnerTestInfo;
@@ -188,9 +191,32 @@ impl<'v> TestProvider<'v> for InternalRunnerTestInfo<'v> {
     }
 }
 
-/// The test provider whose artifacts building a target's test outputs includes. This is not the
-/// runner choice: `buck2 test` runs the provider `[test] use_internal_runner` selects, which can
-/// be the `ExternalRunnerTestInfo` of a target that also has an `InternalRunnerTestInfo`.
+/// The kind of test provider a test run chose for a target.
+#[derive(Allocative, Debug, Clone, Copy, Dupe, Eq, PartialEq, Hash, Pagable)]
+pub enum TestProviderKind {
+    Internal,
+    External,
+}
+
+/// The target's test provider of `kind`, if it has one.
+pub fn test_provider_of_kind<'v>(
+    providers: &ProviderCollection<'v>,
+    kind: TestProviderKind,
+) -> Option<&'v dyn TestProvider<'v>> {
+    match kind {
+        TestProviderKind::Internal => providers
+            .builtin_provider::<InternalRunnerTestInfo>()
+            .map(|provider| provider.as_ref() as &dyn TestProvider),
+        TestProviderKind::External => providers
+            .builtin_provider::<ExternalRunnerTestInfo>()
+            .map(|provider| provider.as_ref() as &dyn TestProvider),
+    }
+}
+
+/// The test provider a build that runs no test uses for a target's test artifacts. A test run
+/// instead chooses its provider with `[test] use_internal_runner` (`OwnedTestInfo::select` in
+/// buck2_test), which can be the `ExternalRunnerTestInfo` of a target that also has an
+/// `InternalRunnerTestInfo`, and builds that provider's artifacts.
 pub fn test_provider_from_collection<'v>(
     providers: &ProviderCollection<'v>,
 ) -> Option<&'v dyn TestProvider<'v>> {

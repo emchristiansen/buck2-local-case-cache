@@ -61,6 +61,7 @@ use crate::build::outputs::get_outputs_for_top_level_target;
 use crate::build_signals::HasBuildSignals;
 use crate::interpreter::rule_defs::provider::builtin::run_info::OwnedRunInfo;
 use crate::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
+use crate::interpreter::rule_defs::provider::test_provider::TestProviderKind;
 use crate::keep_going::KeepGoing;
 use crate::materialize::HasMaterializationQueueTracker;
 use crate::materialize::MaterializationAndUploadContext;
@@ -799,7 +800,23 @@ pub struct ProvidersToBuild {
     /// "which provider outputs to build" family ({default, default_other, run, tests}); distinct from
     /// `BuildConfiguredLabelOptions::return_run_args`, which resolves the run command line.
     pub run: bool,
-    pub tests: bool,
+    pub tests: TestArtifacts,
+}
+
+/// Which test provider's input artifacts to build.
+#[derive(
+    Default, Allocative, Debug, Clone, Copy, Dupe, Eq, PartialEq, Hash, Pagable
+)]
+pub enum TestArtifacts {
+    #[default]
+    None,
+    /// The provider [`test_provider_from_collection`] picks, for builds that run no test.
+    ///
+    /// [`test_provider_from_collection`]: crate::interpreter::rule_defs::provider::test_provider::test_provider_from_collection
+    Preferred,
+    /// The provider a test run chose to run, which for a target with both providers depends on
+    /// the run's `[test] use_internal_runner`.
+    Selected(TestProviderKind),
 }
 
 impl Debug for ProviderArtifacts {
