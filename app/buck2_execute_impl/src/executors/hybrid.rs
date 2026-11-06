@@ -29,7 +29,6 @@ use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::prepared::PreparedCommandExecutor;
-use buck2_execute::execute::request::CommandExecutionPaths;
 use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::result::CommandExecutionErrorType;
 use buck2_execute::execute::result::CommandExecutionResult;
@@ -100,11 +99,51 @@ where
         self.executor_preference
             .and(command.request.executor_preference())
     }
+}
 
-    /// Indicate whether an action is too big to run on RE.
-    fn is_action_too_large_for_remote(&self, paths: &CommandExecutionPaths) -> bool {
-        paths.input_files_bytes() > self.re_max_input_files_bytes
+/// A request whose required route cannot run on this executor.
+#[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
+enum HybridRouteError {
+    #[error(
+        "Remote execution is required, but the action's inputs ({input_bytes} bytes) exceed the remote execution limit ({limit} bytes); it is never run locally instead"
+    )]
+    RemoteRequiredActionTooLarge { input_bytes: u64, limit: u64 },
+}
+
+/// The executor a hybrid request runs on, chosen before either leg starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HybridRoute {
+    /// Only the local executor runs, recorded with this scheduling mode.
+    Local(SchedulingMode),
+    /// Only the remote executor runs.
+    Remote,
+    /// Both executors are eligible, as the hybrid level and preference decide.
+    Race,
+}
+
+/// A required remote route has no local leg: an action too large for remote
+/// execution fails instead. Every other preference keeps its hybrid route, and
+/// a too-large action still runs locally when remote execution is not required.
+fn select_route(
+    preference: ExecutorPreference,
+    input_bytes: u64,
+    limit: u64,
+) -> Result<HybridRoute, HybridRouteError> {
+    let action_too_large = input_bytes > limit;
+    if preference.requires_remote() {
+        if action_too_large {
+            return Err(HybridRouteError::RemoteRequiredActionTooLarge { input_bytes, limit });
+        }
+        return Ok(HybridRoute::Remote);
     }
+    if action_too_large {
+        return Ok(HybridRoute::Local(SchedulingMode::LocalActionTooLarge));
+    }
+    if preference.requires_local() {
+        return Ok(HybridRoute::Local(SchedulingMode::LocalOnly));
+    }
+    Ok(HybridRoute::Race)
 }
 
 #[async_trait]
@@ -122,6 +161,15 @@ where
 
         let executor_preference = match executor_preference {
             Ok(executor_preference) => executor_preference,
+            Err(e) => return manager.error("prepare_hybrid", e),
+        };
+
+        let route = match select_route(
+            executor_preference,
+            command.request.paths().input_files_bytes(),
+            self.re_max_input_files_bytes,
+        ) {
+            Ok(route) => route,
             Err(e) => return manager.error("prepare_hybrid", e),
         };
 
@@ -186,25 +234,23 @@ where
             manager.inner.liveliness_observer.dupe(),
             manager.inner.waiting_data.clone(),
         )
-        .with_intend_to_fallback_on_failure(fallback_on_failure);
+        // A remote-only route has no local leg to fall back to.
+        .with_intend_to_fallback_on_failure(fallback_on_failure && route != HybridRoute::Remote);
         let was_result_delayed = remote_manager.inner.was_result_delayed.dupe();
         let remote_result = self.remote_exec_cmd(command, remote_manager, cancellations);
 
-        let action_too_large = self.is_action_too_large_for_remote(command.request.paths());
-        if executor_preference.requires_local() || action_too_large {
-            let mut res = local_result.await;
-            if action_too_large {
-                res.scheduling_mode = Some(SchedulingMode::LocalActionTooLarge);
-            } else {
-                res.scheduling_mode = Some(SchedulingMode::LocalOnly);
+        match route {
+            HybridRoute::Local(scheduling_mode) => {
+                let mut res = local_result.await;
+                res.scheduling_mode = Some(scheduling_mode);
+                return res;
             }
-            return res;
-        };
-
-        if executor_preference.requires_remote() {
-            let mut res = remote_result.await;
-            res.scheduling_mode = Some(SchedulingMode::RemoteOnly);
-            return res;
+            HybridRoute::Remote => {
+                let mut res = remote_result.await;
+                res.scheduling_mode = Some(SchedulingMode::RemoteOnly);
+                return res;
+            }
+            HybridRoute::Race => {}
         }
 
         let jobs = HybridExecutorJobs {
@@ -592,5 +638,105 @@ impl FallbackTracker {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_data::SchedulingMode;
+    use buck2_execute::execute::request::ExecutorPreference;
+
+    use super::HybridRoute;
+    use super::HybridRouteError;
+    use super::select_route;
+
+    const LIMIT: u64 = 1024 * 1024;
+    const SMALL: u64 = 1024;
+    const LARGE: u64 = 2 * 1024 * 1024;
+
+    #[test]
+    fn test_remote_required_too_large_action_fails_and_never_runs_locally() {
+        assert!(matches!(
+            select_route(ExecutorPreference::RemoteRequired, LARGE, LIMIT),
+            Err(HybridRouteError::RemoteRequiredActionTooLarge {
+                input_bytes: LARGE,
+                limit: LIMIT
+            })
+        ));
+    }
+
+    #[test]
+    fn test_remote_required_action_at_the_limit_runs_only_remotely() {
+        assert_eq!(
+            select_route(ExecutorPreference::RemoteRequired, LIMIT, LIMIT).unwrap(),
+            HybridRoute::Remote
+        );
+        assert_eq!(
+            select_route(ExecutorPreference::RemoteRequired, SMALL, LIMIT).unwrap(),
+            HybridRoute::Remote
+        );
+    }
+
+    #[test]
+    fn test_remote_only_strategy_requires_remote_for_every_action_preference() {
+        // `RemoteOnly` merges `RemoteRequired` with each action's own preference,
+        // and the paranoid executor further merges `DefaultErasePreferences`.
+        for action in [
+            ExecutorPreference::Default,
+            ExecutorPreference::LocalPreferred,
+            ExecutorPreference::RemotePreferred,
+            ExecutorPreference::DefaultErasePreferences,
+        ] {
+            for merged in [
+                ExecutorPreference::RemoteRequired.and(action).unwrap(),
+                ExecutorPreference::RemoteRequired
+                    .and(ExecutorPreference::DefaultErasePreferences)
+                    .unwrap()
+                    .and(action)
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    select_route(merged, SMALL, LIMIT).unwrap(),
+                    HybridRoute::Remote
+                );
+                assert!(select_route(merged, LARGE, LIMIT).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_only_action_is_incompatible_with_required_remote() {
+        assert!(
+            ExecutorPreference::RemoteRequired
+                .and(ExecutorPreference::LocalRequired)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_routes_without_required_remote_are_unchanged() {
+        assert_eq!(
+            select_route(ExecutorPreference::LocalRequired, SMALL, LIMIT).unwrap(),
+            HybridRoute::Local(SchedulingMode::LocalOnly)
+        );
+        assert_eq!(
+            select_route(ExecutorPreference::LocalRequired, LARGE, LIMIT).unwrap(),
+            HybridRoute::Local(SchedulingMode::LocalActionTooLarge)
+        );
+        for preference in [
+            ExecutorPreference::Default,
+            ExecutorPreference::LocalPreferred,
+            ExecutorPreference::RemotePreferred,
+            ExecutorPreference::DefaultErasePreferences,
+        ] {
+            assert_eq!(
+                select_route(preference, LARGE, LIMIT).unwrap(),
+                HybridRoute::Local(SchedulingMode::LocalActionTooLarge)
+            );
+            assert_eq!(
+                select_route(preference, SMALL, LIMIT).unwrap(),
+                HybridRoute::Race
+            );
+        }
     }
 }

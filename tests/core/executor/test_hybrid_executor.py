@@ -332,6 +332,69 @@ async def test_remote_only(buck: Buck) -> None:
 
 
 @buck_test()
+async def test_remote_only_refuses_too_large_action_instead_of_running_it_locally(
+    buck: Buck,
+) -> None:
+    # The fixture platform's remote input limit is 1 MiB; `cp_big` copies 2 MiB.
+    await expect_failure(
+        buck.build(
+            "root//executor_threshold_tests:cp_big",
+            "--remote-only",
+            "-c",
+            f"test.cache_buster={random_string()}",
+        ),
+        stderr_regex="exceed the remote execution limit",
+    )
+    out = await read_what_ran(buck)
+    assert [line for line in out if line["reproducer"]["executor"] != "Re"] == []
+
+
+@buck_test()
+async def test_remote_only_mixed_build_runs_nothing_locally(buck: Buck) -> None:
+    await expect_failure(
+        buck.build(
+            "root//executor_threshold_tests/...",
+            "--remote-only",
+            "--keep-going",
+            "-c",
+            f"test.cache_buster={random_string()}",
+        ),
+        stderr_regex="exceed the remote execution limit",
+    )
+    out = await read_what_ran(buck)
+    executors = {line["identity"]: line["reproducer"]["executor"] for line in out}
+    assert "root//executor_threshold_tests:cp_small (<unspecified>) (cp)" in executors
+    assert set(executors.values()) == {"Re"}
+
+
+@buck_test()
+@pytest.mark.parametrize(
+    "target",
+    [
+        # Rule-declared local-only, and local-only by its platform's fallback-free hybrid.
+        "root//executor_preference_tests:local_only_with_local_only",
+        "root//executor_fallback_tests:local_only_no_fallback",
+        # Hybrid platforms that would otherwise fall back to local execution.
+        "root//executor_fallback_tests:local_only",
+        "root//executor_fallback_tests:local_only_full_hybrid",
+    ],
+)
+async def test_remote_only_never_runs_local_only_or_fallback_actions_locally(
+    buck: Buck, target: str
+) -> None:
+    await expect_failure(
+        buck.build(
+            target,
+            "--remote-only",
+            "-c",
+            f"test.cache_buster={random_string()}",
+        )
+    )
+    out = await read_what_ran(buck)
+    assert [line for line in out if line["reproducer"]["executor"] != "Re"] == []
+
+
+@buck_test()
 async def test_build_fails_with_mutually_exclusive_executors(buck: Buck) -> None:
     with pytest.raises(BuckException):
         await buck.build(
