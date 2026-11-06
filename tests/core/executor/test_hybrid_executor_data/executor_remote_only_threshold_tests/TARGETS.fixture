@@ -1,0 +1,24 @@
+load("@root//:rules.bzl", "cp", "file")
+
+# Produced remotely, so `--remote-only` reaches each copy's own route.
+file(
+    name = "small",
+    file_size = 1 * 1024,
+    local_only = False,
+)
+
+file(
+    name = "big",
+    file_size = 2 * 1024 * 1024,
+    local_only = False,
+)
+
+cp(
+    name = "cp_small",
+    file = ":small",
+)
+
+cp(
+    name = "cp_big",
+    file = ":big",
+)

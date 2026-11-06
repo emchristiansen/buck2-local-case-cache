@@ -335,10 +335,11 @@ async def test_remote_only(buck: Buck) -> None:
 async def test_remote_only_refuses_too_large_action_instead_of_running_it_locally(
     buck: Buck,
 ) -> None:
-    # The fixture platform's remote input limit is 1 MiB; `cp_big` copies 2 MiB.
+    # The fixture platform's remote input limit is 1 MiB; `cp_big` copies 2 MiB
+    # that a remote action produced, so the copy itself reaches its route.
     await expect_failure(
         buck.build(
-            "root//executor_threshold_tests:cp_big",
+            "root//executor_remote_only_threshold_tests:cp_big",
             "--remote-only",
             "-c",
             f"test.cache_buster={random_string()}",
@@ -346,14 +347,17 @@ async def test_remote_only_refuses_too_large_action_instead_of_running_it_locall
         stderr_regex="exceed the remote execution limit",
     )
     out = await read_what_ran(buck)
-    assert [line for line in out if line["reproducer"]["executor"] != "Re"] == []
+    executors = {line["identity"]: line["reproducer"]["executor"] for line in out}
+    assert executors == {
+        "root//executor_remote_only_threshold_tests:big (<unspecified>) (head)": "Re"
+    }
 
 
 @buck_test()
 async def test_remote_only_mixed_build_runs_nothing_locally(buck: Buck) -> None:
     await expect_failure(
         buck.build(
-            "root//executor_threshold_tests/...",
+            "root//executor_remote_only_threshold_tests/...",
             "--remote-only",
             "--keep-going",
             "-c",
@@ -363,8 +367,11 @@ async def test_remote_only_mixed_build_runs_nothing_locally(buck: Buck) -> None:
     )
     out = await read_what_ran(buck)
     executors = {line["identity"]: line["reproducer"]["executor"] for line in out}
-    assert "root//executor_threshold_tests:cp_small (<unspecified>) (cp)" in executors
-    assert set(executors.values()) == {"Re"}
+    assert executors == {
+        "root//executor_remote_only_threshold_tests:small (<unspecified>) (head)": "Re",
+        "root//executor_remote_only_threshold_tests:big (<unspecified>) (head)": "Re",
+        "root//executor_remote_only_threshold_tests:cp_small (<unspecified>) (cp)": "Re",
+    }
 
 
 @buck_test()

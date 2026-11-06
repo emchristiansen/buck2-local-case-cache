@@ -119,7 +119,7 @@ def _file_impl(ctx):
         ],
         category = "head",
         env = {"cache_buster": ctx.attrs.cache_buster},
-        local_only = True,
+        local_only = ctx.attrs.local_only,
     )
     return [DefaultInfo(default_output = out)]
 
@@ -129,6 +129,7 @@ file = rule(
         "cache_buster": attrs.string(default = read_config("test", "cache_buster", "")),
         "executable": attrs.bool(default = False),
         "file_size": attrs.int(),
+        "local_only": attrs.bool(default = True),
     },
 )
 
