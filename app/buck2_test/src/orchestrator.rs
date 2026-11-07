@@ -726,6 +726,30 @@ impl<'a> BuckTestOrchestrator<'a> {
         ))
     }
 
+    /// Whether a cacheable listing may reuse its DICE result. An admitted local-workspace test
+    /// may read files of its live workspace that are no input of its listing key, so its listing
+    /// runs again for every request; every other cacheable listing reuses a successful result.
+    /// This resolves the same provider, effective test execution caching and executor admission
+    /// that executing the listing uses, before any DICE lookup.
+    async fn listing_reuses_dice_result(
+        dice: &mut DiceComputations<'_>,
+        key: &TestExecutionKey,
+        internal_runner_config: &InternalRunnerConfig,
+    ) -> buck2_error::Result<bool> {
+        let test_info = Self::get_test_info(dice, &key.test_target, internal_runner_config).await?;
+        let effective_test_execution_caching =
+            test_info.supports_test_execution_caching() && !key.disable_test_execution_caching;
+        let (_, local_execution) = Self::provider_executor_admission(
+            dice,
+            &test_info,
+            key.executor_override.as_deref(),
+            key.stage.as_ref(),
+            effective_test_execution_caching,
+        )
+        .await?;
+        Ok(local_execution != LocalExecution::AdmittedLocalWorkspaceTest)
+    }
+
     async fn prepare_and_execute_no_dice(
         dice: &mut DiceComputations<'_>,
         key: TestExecutionKey,
@@ -1099,7 +1123,15 @@ async fn prepare_and_execute(
     local_case_request: Option<LocalCaseRequest>,
 ) -> Result<ExecuteData, ExecuteError> {
     let execute_on_dice = match key.stage.as_ref() {
-        TestStage::Listing { cacheable, .. } => *cacheable,
+        TestStage::Listing { cacheable, .. } => {
+            *cacheable
+                && BuckTestOrchestrator::listing_reuses_dice_result(
+                    ctx,
+                    &key,
+                    internal_runner_config,
+                )
+                .await?
+        }
         TestStage::Testing { .. } => false,
     };
     if execute_on_dice {
@@ -2418,22 +2450,18 @@ impl BuckTestOrchestrator<'_> {
         }
     }
 
-    async fn get_test_executor(
+    /// The executor the provider explicitly selected for one listing or test command (the named
+    /// `executor_override`, else for a listing the `listing` override or the default, else the
+    /// default), and that command's local-execution admission. Both executor construction and
+    /// the choice of DICE result reuse use this one resolution, so they cannot disagree about
+    /// which commands are admitted local-workspace tests.
+    async fn provider_executor_admission<'t>(
         dice: &mut DiceComputations<'_>,
-        test_target: &ConfiguredProvidersLabel,
-        test_info: &OwnedTestInfo,
-        executor_override: Option<Arc<ExecutorConfigOverride>>,
-        fs: &ArtifactFs,
+        test_info: &'t OwnedTestInfo,
+        executor_override: Option<&ExecutorConfigOverride>,
         stage: &TestStage,
         supports_test_execution_caching: bool,
-    ) -> buck2_error::Result<TestExecutor> {
-        // NOTE: get_providers() implicitly calls this already but it's not the end of the world
-        // since this will get cached in DICE.
-        let node = dice
-            .get_configured_target_node(test_target.target())
-            .await
-            .require_compatible()?;
-
+    ) -> buck2_error::Result<(Option<&'t CommandExecutorConfig>, LocalExecution)> {
         let resolved_executor_override = match executor_override {
             Some(executor_override) => Some(
                 &test_info
@@ -2458,13 +2486,40 @@ impl BuckTestOrchestrator<'_> {
             },
         };
 
-        let provider_executor = resolved_executor_override.as_ref().map(|a| &***a);
+        let provider_executor = resolved_executor_override.map(|a| &**a);
         let local_execution = Self::local_execution_for_test(
             test_info.kind(),
             provider_executor,
             test_info.supports_test_execution_caching() || supports_test_execution_caching,
             Self::local_test_admissions(dice).await?,
         );
+        Ok((provider_executor, local_execution))
+    }
+
+    async fn get_test_executor(
+        dice: &mut DiceComputations<'_>,
+        test_target: &ConfiguredProvidersLabel,
+        test_info: &OwnedTestInfo,
+        executor_override: Option<Arc<ExecutorConfigOverride>>,
+        fs: &ArtifactFs,
+        stage: &TestStage,
+        supports_test_execution_caching: bool,
+    ) -> buck2_error::Result<TestExecutor> {
+        // NOTE: get_providers() implicitly calls this already but it's not the end of the world
+        // since this will get cached in DICE.
+        let node = dice
+            .get_configured_target_node(test_target.target())
+            .await
+            .require_compatible()?;
+
+        let (provider_executor, local_execution) = Self::provider_executor_admission(
+            dice,
+            test_info,
+            executor_override.as_deref(),
+            stage,
+            supports_test_execution_caching,
+        )
+        .await?;
         let executor_config = Self::executor_config_with_remote_cache_override(
             node,
             provider_executor,
@@ -3914,6 +3969,488 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Listing reuse through the real orchestration path: real analysis of a test rule's
+    /// `ExternalRunnerTestInfo`, real `[test]` buckconfig, real DICE `TestExecutionKey`
+    /// computation and executor admission, with only the command executor replaced by one that
+    /// counts listing executions and returns the current bytes of an undeclared workspace file.
+    mod listing_reuse {
+        use std::path::Path;
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+        use std::sync::Once;
+
+        use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
+        use buck2_build_api::actions::execute::dice_data::HasCommandExecutor;
+        use buck2_build_api::actions::execute::dice_data::SetCommandExecutor;
+        use buck2_build_api::actions::execute::dice_data::SetReClient;
+        use buck2_build_api::actions::execute::dice_data::set_fallback_executor_config;
+        use buck2_build_api::actions::impls::run_action_knobs::RunActionKnobs;
+        use buck2_build_api::build::detailed_aggregated_metrics::dice::SetDetailedAggregatedMetricsHandle;
+        use buck2_build_api::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsHandle;
+        use buck2_build_api::interpreter::rule_defs::command_executor_config::register_command_executor_config;
+        use buck2_build_api::interpreter::rule_defs::register_rule_defs;
+        use buck2_build_api::keep_going::HasKeepGoing;
+        use buck2_build_api::spawner::BuckSpawner;
+        use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+        use buck2_common::package_listing::listing::PackageListing;
+        use buck2_common::package_listing::listing::testing::PackageListingExt;
+        use buck2_configured::execution::ExecutionPlatformsKey;
+        use buck2_core::build_file_path::BuildFilePath;
+        use buck2_core::bzl::ImportPath;
+        use buck2_core::cells::CellAliasResolver;
+        use buck2_core::cells::cell_path::CellPath;
+        use buck2_core::cells::cell_path_with_allowed_relative_dir::CellPathWithAllowedRelativeDir;
+        use buck2_core::execution_types::executor_config::CommandExecutorConfig;
+        use buck2_core::package::PackageLabel;
+        use buck2_core::pattern::pattern::InferTargetNames;
+        use buck2_execute::digest_config::SetDigestConfig;
+        use buck2_execute::execute::action_digest::ActionDigest;
+        use buck2_execute::execute::blocking::SetBlockingExecutor;
+        use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
+        use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
+        use buck2_execute::execute::kind::CommandExecutionKind;
+        use buck2_execute::execute::manager::CommandExecutionManager;
+        use buck2_execute::execute::output::CommandStdStreams;
+        use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
+        use buck2_execute::execute::prepared::PreparedCommand;
+        use buck2_execute::execute::prepared::PreparedCommandExecutor;
+        use buck2_execute::execute::request::ExecutorPreference;
+        use buck2_execute::execute::result::CommandExecutionMetadata;
+        use buck2_execute::execute::result::CommandExecutionResult;
+        use buck2_execute::materialize::materializer::SetMaterializer;
+        use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
+        use buck2_execute_impl::materializers::deferred::NoDiskDeferredMaterializer;
+        use buck2_hash::IntentionallyStdHashMap;
+        use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
+        use buck2_interpreter::extra::InterpreterHostArchitecture;
+        use buck2_interpreter::extra::InterpreterHostPlatform;
+        use buck2_interpreter::file_loader::LoadedModules;
+        use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
+        use buck2_interpreter_for_build::interpreter::calculation::InterpreterResultsKey;
+        use buck2_interpreter_for_build::interpreter::configuror::BuildInterpreterConfiguror;
+        use buck2_interpreter_for_build::interpreter::dice_calculation_delegate::testing::EvalImportKey;
+        use buck2_interpreter_for_build::interpreter::interpreter_setup::setup_interpreter_basic;
+        use buck2_interpreter_for_build::interpreter::testing::Tester;
+        use buck2_interpreter_for_build::rule::register_rule_function;
+        use buck2_resource_control::HasResourceControl;
+        use buck2_test_api::data::ArgValueContent;
+        use buck2_test_api::data::ExternalRunnerSpecValue;
+        use buck2_util::time_span::TimeSpan;
+        use indoc::indoc;
+        use starlark_map::ordered_map::OrderedMap;
+
+        use super::*;
+
+        const RULES: &str = indoc!(
+            r#"
+            def _local():
+                return CommandExecutorConfig(local_enabled = True, remote_enabled = False)
+
+            def _impl(ctx):
+                mode = ctx.attrs.mode
+                if mode == "default_local" or mode == "cache_capable":
+                    executors = {"default_executor": _local()}
+                elif mode == "listing_override":
+                    executors = {"executor_overrides": {"listing": _local()}}
+                elif mode == "named_override":
+                    executors = {"executor_overrides": {"named": _local()}}
+                elif mode == "platform_fallback":
+                    executors = {}
+                else:
+                    fail("unknown mode " + mode)
+                return [
+                    DefaultInfo(),
+                    ExternalRunnerTestInfo(
+                        type = "custom",
+                        command = ["discover"],
+                        supports_test_execution_caching = mode == "cache_capable",
+                        **executors
+                    ),
+                ]
+
+            live_test = rule(impl = _impl, attrs = {"mode": attrs.string()})
+            "#
+        );
+
+        const BUILD: &str = indoc!(
+            r#"
+            load(":rules.bzl", "live_test")
+
+            live_test(name = "default_local", mode = "default_local")
+            live_test(name = "cache_capable", mode = "cache_capable")
+            live_test(name = "listing_override", mode = "listing_override")
+            live_test(name = "named_override", mode = "named_override")
+            live_test(name = "platform_fallback", mode = "platform_fallback")
+            "#
+        );
+
+        /// The undeclared live-workspace file the listing reads, relative to the project root.
+        const LIVE_FILE: &str = "cell/pkg/live_cases.txt";
+
+        fn init_late_bindings() {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                buck2_action_impl::init_late_bindings();
+                buck2_analysis::init_late_bindings();
+                buck2_anon_target::init_late_bindings();
+                buck2_configured::init_late_bindings();
+                buck2_events::init_late_bindings();
+                buck2_interpreter_for_build::init_late_bindings();
+                buck2_build_api::init_late_bindings();
+                buck2_transition::init_late_bindings();
+            });
+        }
+
+        /// Runs every listing by reading the live file's current bytes as its stdout, and records
+        /// each execution.
+        struct LiveFileListing {
+            live_file: PathBuf,
+            executions: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+
+        #[async_trait]
+        impl PreparedCommandExecutor for LiveFileListing {
+            async fn exec_cmd(
+                &self,
+                command: &PreparedCommand<'_, '_>,
+                manager: CommandExecutionManager,
+                _cancellations: &CancellationContext,
+            ) -> CommandExecutionResult {
+                let manager = manager.claim().await;
+                let stdout = std::fs::read(&self.live_file).expect("live file is readable");
+                self.executions.lock().unwrap().push(stdout.clone());
+                manager.success(
+                    CommandExecutionKind::Local {
+                        digest: ActionDigest::empty(command.digest_config.cas_digest_config()),
+                        command: Default::default(),
+                        env: Default::default(),
+                    },
+                    BuckIndexMap::default(),
+                    CommandStdStreams::Local {
+                        stdout,
+                        stderr: Vec::new(),
+                    },
+                    CommandExecutionMetadata::empty(TimeSpan::empty_now()),
+                )
+            }
+
+            fn is_local_execution_possible(&self, _executor_preference: ExecutorPreference) -> bool {
+                false
+            }
+        }
+
+        /// Hands out the counting executor, uncached, and records the admission of every command
+        /// it is asked for.
+        struct Executors {
+            live_file: PathBuf,
+            executions: Arc<Mutex<Vec<Vec<u8>>>>,
+            admissions: Arc<Mutex<Vec<LocalExecution>>>,
+        }
+
+        impl HasCommandExecutor for Executors {
+            fn get_command_executor(
+                &self,
+                _artifact_fs: &ArtifactFs,
+                _config: &CommandExecutorConfig,
+                local_execution: LocalExecution,
+            ) -> buck2_error::Result<CommandExecutorResponse> {
+                self.admissions.lock().unwrap().push(local_execution);
+                Ok(CommandExecutorResponse {
+                    executor: Arc::new(LiveFileListing {
+                        live_file: self.live_file.clone(),
+                        executions: self.executions.dupe(),
+                    }),
+                    action_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
+                    remote_dep_file_cache_checker: Arc::new(NoOpCommandOptionalExecutor {}),
+                    platform: Default::default(),
+                    cache_uploader: Arc::new(NoOpCacheUploader {}),
+                    output_trees_download_config:
+                        buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig::new(
+                            None, true,
+                        ),
+                })
+            }
+        }
+
+        /// What two identical cacheable listing requests observed.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Observed {
+            /// The stdout each `prepare_and_execute` call returned.
+            returned: [Vec<u8>; 2],
+            /// The bytes each actual listing execution read.
+            executions: Vec<Vec<u8>>,
+            /// The admission of every executor the orchestrator prepared.
+            admissions: Vec<LocalExecution>,
+        }
+
+        /// One test target, one DICE transaction and two identical `Listing { cacheable: true }`
+        /// requests through `prepare_and_execute`, with the live file changed between them.
+        async fn list_twice(
+            mode: &str,
+            local_workspace_tests: bool,
+            executor_override: Option<&str>,
+            disable_test_execution_caching: bool,
+        ) -> buck2_error::Result<Observed> {
+            init_late_bindings();
+            let bzlfile = ImportPath::testing_new("cell//pkg:rules.bzl");
+            let resolver = CellResolver::testing_with_names_and_paths(&[
+                (
+                    CellName::testing_new("root"),
+                    CellRootPathBuf::testing_new(""),
+                ),
+                (
+                    CellName::testing_new("cell"),
+                    CellRootPathBuf::testing_new("cell"),
+                ),
+            ]);
+            let mut interpreter = Tester::with_cells((
+                CellAliasResolver::new(
+                    CellName::testing_new("cell"),
+                    IntentionallyStdHashMap::new(),
+                )?,
+                resolver.dupe(),
+                LegacyBuckConfig::empty(),
+                CellPathWithAllowedRelativeDir::new(CellPath::testing_new("cell//pkg"), None),
+            ))?;
+            interpreter.additional_globals(register_rule_function);
+            interpreter.additional_globals(register_rule_defs);
+            interpreter.additional_globals(register_command_executor_config);
+            let module = interpreter.eval_import(&bzlfile, RULES, LoadedModules::default())?;
+            let eval_res = interpreter.eval_build_file_with_loaded_modules(
+                &BuildFilePath::testing_new("cell//pkg:BUCK"),
+                BUILD,
+                LoadedModules {
+                    map: OrderedMap::from_iter([(
+                        OwnedStarlarkModulePath::LoadFile(bzlfile.clone()),
+                        module.dupe(),
+                    )]),
+                },
+                PackageListing::testing_new(&[], "BUCK"),
+            )?;
+
+            let fs = ProjectRootTemp::new()?;
+            let live_file = AsRef::<Path>::as_ref(fs.path().root()).join(LIVE_FILE);
+            std::fs::create_dir_all(live_file.parent().unwrap())?;
+            std::fs::write(&live_file, "case_a\n")?;
+
+            let executions = Arc::new(Mutex::new(Vec::new()));
+            let admissions = Arc::new(Mutex::new(Vec::new()));
+            let mut dice = DiceBuilder::new()
+                .mock_and_return(
+                    EvalImportKey(OwnedStarlarkModulePath::LoadFile(bzlfile.clone())),
+                    Ok(module),
+                )
+                .mock_and_return(
+                    InterpreterResultsKey(PackageLabel::testing_parse("cell//pkg")),
+                    Ok(Arc::new(eval_res)),
+                )
+                .mock_and_return(ExecutionPlatformsKey, Ok(None))
+                .set_data(|data| {
+                    data.set_testing_io_provider(&fs);
+                    data.set_digest_config(DigestConfig::testing_default());
+                    data.set_detailed_aggregated_metrics_handle(
+                        DetailedAggregatedMetricsHandle::new(),
+                    );
+                })
+                .build({
+                    let mut data = UserComputationData::new();
+                    data.set_keep_going(true);
+                    data.set_starlark_debugger_handle(None);
+                    set_fallback_executor_config(
+                        &mut data.data,
+                        CommandExecutorConfig::testing_local(),
+                    );
+                    data.set_command_executor(Box::new(Executors {
+                        live_file: live_file.clone(),
+                        executions: executions.dupe(),
+                        admissions: admissions.dupe(),
+                    }));
+                    data.set_blocking_executor(Arc::new(DummyBlockingExecutor {
+                        fs: fs.path().dupe(),
+                    }));
+                    data.set_materializer(Arc::new(
+                        NoDiskDeferredMaterializer::testing_new_no_disk(fs.path().dupe())?,
+                    ));
+                    data.set_re_client(UnconfiguredRemoteExecutionClient::testing_new_dummy());
+                    data.data.set(EventDispatcher::null());
+                    data.data.set(RunActionKnobs::default());
+                    data.data.set(HasResourceControl(false));
+                    data.spawner = Arc::new(BuckSpawner::current_runtime().unwrap());
+                    data
+                })
+                .unwrap();
+            setup_interpreter_basic(
+                &mut dice,
+                resolver,
+                BuildInterpreterConfiguror::new(
+                    None,
+                    InterpreterHostPlatform::Linux,
+                    InterpreterHostArchitecture::X86_64,
+                    None,
+                    false,
+                    false,
+                    InferTargetNames::No,
+                    None,
+                )?,
+            )?;
+            // The root cell's real `.buckconfig`, read through the project's file operations.
+            let root = AsRef::<Path>::as_ref(fs.path().root());
+            std::fs::write(
+                root.join(".buckconfig"),
+                if local_workspace_tests {
+                    "[test]\nlocal_workspace_tests = true\n"
+                } else {
+                    ""
+                },
+            )?;
+            std::fs::write(root.join("cell/.buckconfig"), "")?;
+            dice.set_buck_out_path(Some(ProjectRelativePathBuf::unchecked_new(
+                "buck-out/v2".to_owned(),
+            )))?;
+            let dice = dice.commit().await;
+
+            let key = TestExecutionKey {
+                test_target: ConfiguredProvidersLabel::new(
+                    ConfiguredTargetLabel::testing_parse(
+                        &format!("cell//pkg:{mode}"),
+                        ConfigurationData::testing_new(),
+                    ),
+                    Default::default(),
+                ),
+                cmd: Arc::new(vec![ArgValue {
+                    content: ArgValueContent::ExternalRunnerSpecValue(
+                        ExternalRunnerSpecValue::Verbatim("discover".to_owned()),
+                    ),
+                    format: None,
+                }]),
+                env: Arc::new(SortedVectorMap::new()),
+                executor_override: executor_override.map(|name| {
+                    Arc::new(ExecutorConfigOverride {
+                        name: name.to_owned(),
+                    })
+                }),
+                required_local_resources: Arc::new(RequiredLocalResources {
+                    resources: Vec::new(),
+                }),
+                pre_create_dirs: Arc::new(Vec::new()),
+                stage: Arc::new(TestStage::Listing {
+                    suite: mode.to_owned(),
+                    cacheable: true,
+                }),
+                options: TestSessionOptions::default(),
+                timeout: Duration::from_secs(60),
+                host_sharing_requirements: Arc::new(HostSharingRequirements::default()),
+                disable_test_execution_caching,
+            };
+            let mut returned = Vec::new();
+            for live in ["case_a\n", "case_a\ncase_b\n"] {
+                // The file changes only between completed requests; the request, its key and the
+                // DICE version stay identical.
+                std::fs::write(&live_file, live)?;
+                let data = match prepare_and_execute(
+                    &mut dice.dupe().ctx(),
+                    CancellationContext::testing(),
+                    key.dupe(),
+                    NoopLivelinessObserver::create(),
+                    &InternalRunnerConfig::parse(None),
+                    None,
+                )
+                .await
+                {
+                    Ok(data) => data,
+                    Err(ExecuteError::Error(e)) => return Err(e),
+                    Err(ExecuteError::Cancelled(_)) => panic!("listing was cancelled"),
+                };
+                assert_eq!(data.status, ExecutionStatus::Finished { exitcode: 0 });
+                let ExecutionStream::Inline(stdout) = data.stdout;
+                returned.push(stdout);
+            }
+            let returned: [Vec<u8>; 2] = returned.try_into().unwrap();
+            let executions = executions.lock().unwrap().clone();
+            let admissions = admissions.lock().unwrap().clone();
+            Ok(Observed {
+                returned,
+                executions,
+                admissions,
+            })
+        }
+
+        /// Both requests execute and the second returns the changed file.
+        fn fresh(admission: LocalExecution) -> Observed {
+            Observed {
+                returned: [b"case_a\n".to_vec(), b"case_a\ncase_b\n".to_vec()],
+                executions: vec![b"case_a\n".to_vec(), b"case_a\ncase_b\n".to_vec()],
+                admissions: vec![admission, admission],
+            }
+        }
+
+        /// The first request executes and the second reuses its DICE result.
+        fn reused() -> Observed {
+            Observed {
+                returned: [b"case_a\n".to_vec(), b"case_a\n".to_vec()],
+                executions: vec![b"case_a\n".to_vec()],
+                admissions: vec![LocalExecution::ByStrategy],
+            }
+        }
+
+        #[tokio::test]
+        async fn admitted_local_workspace_listing_runs_for_every_request() -> buck2_error::Result<()>
+        {
+            assert_eq!(
+                list_twice("default_local", true, None, false).await?,
+                fresh(LocalExecution::AdmittedLocalWorkspaceTest)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn admitted_listing_override_and_named_override_run_for_every_request()
+        -> buck2_error::Result<()> {
+            assert_eq!(
+                list_twice("listing_override", true, None, false).await?,
+                fresh(LocalExecution::AdmittedLocalWorkspaceTest)
+            );
+            assert_eq!(
+                list_twice("named_override", true, Some("named"), false).await?,
+                fresh(LocalExecution::AdmittedLocalWorkspaceTest)
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn ordinary_cacheable_listing_reuses_its_dice_result() -> buck2_error::Result<()> {
+            // Without the root opt-in, the same explicitly local uncached provider is no
+            // local-workspace test, and its successful cacheable listing is reused.
+            assert_eq!(
+                list_twice("default_local", false, None, false).await?,
+                reused()
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn unadmitted_listings_reuse_their_dice_result_under_the_opt_in()
+        -> buck2_error::Result<()> {
+            // A cache-capable provider is refused even when the request disables caching.
+            assert_eq!(
+                list_twice("cache_capable", true, None, true).await?,
+                reused()
+            );
+            // A platform-derived fallback executor is never admitted.
+            assert_eq!(
+                list_twice("platform_fallback", true, None, false).await?,
+                reused()
+            );
+            // With executor overrides but no `listing` override or default, a listing has no
+            // provider-selected executor either.
+            assert_eq!(
+                list_twice("named_override", true, None, false).await?,
+                reused()
+            );
+            Ok(())
         }
     }
 }
