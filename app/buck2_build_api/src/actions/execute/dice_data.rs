@@ -46,13 +46,21 @@ pub trait SetCommandExecutor {
 #[derive(Clone, Copy, Debug, Dupe, PartialEq, Eq)]
 pub enum LocalExecution {
     /// The invocation's execution strategy alone decides. Builds, runs, every other action and
-    /// every `ExternalRunnerTestInfo` test use this.
+    /// every test command the test orchestrator does not admit use this.
     ByStrategy,
     /// The listing or case command of an `InternalRunnerTestInfo` test whose resolved executor
     /// is `Executor::Local`, selected under `[test] local_internal_cases = true`. Only the test
     /// orchestrator grants it. It admits that local executor under `--remote-only` and nothing
     /// else: no other executor kind, and nothing under a strategy that bans all execution.
     AdmittedInternalTest,
+    /// The listing or test command of an `ExternalRunnerTestInfo` test whose provider explicitly
+    /// selected `Executor::Local` (its `default_executor` or the named override, never the
+    /// execution platform's fallback) and which does not support test execution caching,
+    /// selected under `[test] local_workspace_tests = true`. Such a test may read its live
+    /// workspace, so it runs locally and uncached. Only the test orchestrator grants it, and the
+    /// orchestrator keeps its cache checker and uploader no-ops. It admits that local executor
+    /// under `--remote-only` and nothing else, exactly like `AdmittedInternalTest`.
+    AdmittedLocalWorkspaceTest,
 }
 
 pub trait HasCommandExecutor {

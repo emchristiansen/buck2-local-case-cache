@@ -494,33 +494,35 @@ impl HasCommandExecutor for CommandExecutorFactory {
     }
 }
 
-/// Whether the local executor is banned for one command. Only an admitted Internal test command
-/// that selected `Executor::Local` may run locally under `--remote-only`; `NoExecution` (dry runs)
-/// still runs nothing, and every other strategy already permits local execution.
+/// Whether the local executor is banned for one command. Only an admitted Internal or
+/// local-workspace test command that selected `Executor::Local` may run locally under
+/// `--remote-only`; `NoExecution` (dry runs) still runs nothing, and every other strategy already
+/// permits local execution.
 fn local_execution_banned(
     strategy: ExecutionStrategy,
     local_execution: LocalExecution,
     executor: &Executor,
 ) -> buck2_error::Result<bool> {
-    match local_execution {
-        LocalExecution::ByStrategy => Ok(strategy.ban_local()),
-        LocalExecution::AdmittedInternalTest => {
-            if !matches!(executor, Executor::Local(_)) {
-                return Err(buck2_error::internal_error!(
-                    "an admitted Internal test command must select the local executor, not {:?}",
-                    executor
-                ));
-            }
-            Ok(match strategy {
-                ExecutionStrategy::RemoteOnly => false,
-                ExecutionStrategy::NoExecution => true,
-                ExecutionStrategy::Default
-                | ExecutionStrategy::LocalOnly
-                | ExecutionStrategy::HybridPreferLocal
-                | ExecutionStrategy::HybridPreferRemote => false,
-            })
-        }
+    let admitted = match local_execution {
+        LocalExecution::ByStrategy => return Ok(strategy.ban_local()),
+        LocalExecution::AdmittedInternalTest => "Internal",
+        LocalExecution::AdmittedLocalWorkspaceTest => "local-workspace",
+    };
+    if !matches!(executor, Executor::Local(_)) {
+        return Err(buck2_error::internal_error!(
+            "an admitted {} test command must select the local executor, not {:?}",
+            admitted,
+            executor
+        ));
     }
+    Ok(match strategy {
+        ExecutionStrategy::RemoteOnly => false,
+        ExecutionStrategy::NoExecution => true,
+        ExecutionStrategy::Default
+        | ExecutionStrategy::LocalOnly
+        | ExecutionStrategy::HybridPreferLocal
+        | ExecutionStrategy::HybridPreferRemote => false,
+    })
 }
 
 trait ExecutionStrategyExt {
@@ -694,6 +696,42 @@ mod tests {
             assert!(
                 format!("{err:?}").contains("must select the local executor"),
                 "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_admitted_local_workspace_test_overrides_remote_only_and_nothing_else() {
+        for strategy in STRATEGIES {
+            let banned = local_execution_banned(
+                strategy,
+                LocalExecution::AdmittedLocalWorkspaceTest,
+                &local(),
+            )
+            .unwrap();
+            assert_eq!(
+                banned,
+                strategy == ExecutionStrategy::NoExecution,
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_workspace_admission_for_another_executor_kind_is_refused() {
+        for strategy in STRATEGIES {
+            let err = local_execution_banned(
+                strategy,
+                LocalExecution::AdmittedLocalWorkspaceTest,
+                &Executor::None,
+            )
+            .unwrap_err();
+            let err = format!("{err:?}");
+            assert!(
+                err.contains(
+                    "an admitted local-workspace test command must select the local executor"
+                ),
+                "{err}"
             );
         }
     }

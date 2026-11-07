@@ -1164,6 +1164,23 @@ impl Display for TestExecutionKey {
     }
 }
 
+/// The root cell's two closed `[test]` local admissions. Each admits only its own provider kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LocalTestAdmissions {
+    /// `[test] local_internal_cases`.
+    internal_cases: bool,
+    /// `[test] local_workspace_tests`.
+    workspace_tests: bool,
+}
+
+/// Whether a test command keeps the cache checker or uploader the executor factory provided, or
+/// replaces it with a no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestCachePath {
+    Provided,
+    NoOp,
+}
+
 /// The outcome of checking a constrained case's launch before its action is prepared.
 enum LaunchCheck {
     Eligible(ConstrainedCase),
@@ -2196,6 +2213,37 @@ impl BuckTestOrchestrator<'_> {
         }
     }
 
+    /// Which of the executor factory's action cache checker and cache uploader one test command
+    /// keeps, in that order. A listing keeps both. A test command never uploads, and checks the
+    /// action cache only when it supports test execution caching. An admitted local-workspace
+    /// test reads its live workspace, so neither its listing nor its test command ever checks or
+    /// uploads a cache.
+    fn test_command_cache_paths(
+        stage: &TestStage,
+        supports_test_execution_caching: bool,
+        local_execution: LocalExecution,
+    ) -> (TestCachePath, TestCachePath) {
+        match (local_execution, stage) {
+            (LocalExecution::AdmittedLocalWorkspaceTest, _) => {
+                (TestCachePath::NoOp, TestCachePath::NoOp)
+            }
+            (LocalExecution::ByStrategy | LocalExecution::AdmittedInternalTest, stage) => {
+                match stage {
+                    TestStage::Listing { .. } => (TestCachePath::Provided, TestCachePath::Provided),
+                    TestStage::Testing { .. } => (
+                        if supports_test_execution_caching {
+                            TestCachePath::Provided
+                        } else {
+                            TestCachePath::NoOp
+                        },
+                        // We never upload local test executions
+                        TestCachePath::NoOp,
+                    ),
+                }
+            }
+        }
+    }
+
     fn get_command_executor(
         dice: &mut DiceComputations<'_>,
         fs: &ArtifactFs,
@@ -2213,19 +2261,15 @@ impl BuckTestOrchestrator<'_> {
             output_trees_download_config: _,
         } = dice.get_command_executor_from_dice(fs, executor_config, local_execution)?;
 
-        let (cache_uploader, action_cache_checker) = match stage {
-            TestStage::Listing { .. } => (cache_uploader, action_cache_checker),
-            TestStage::Testing { .. } => {
-                (
-                    // We never upload local test executions
-                    Arc::new(NoOpCacheUploader {}) as _,
-                    if supports_test_execution_caching {
-                        action_cache_checker
-                    } else {
-                        Arc::new(NoOpCommandOptionalExecutor {}) as _
-                    },
-                )
-            }
+        let (checker_path, uploader_path) =
+            Self::test_command_cache_paths(stage, supports_test_execution_caching, local_execution);
+        let action_cache_checker = match checker_path {
+            TestCachePath::Provided => action_cache_checker,
+            TestCachePath::NoOp => Arc::new(NoOpCommandOptionalExecutor {}) as _,
+        };
+        let cache_uploader = match uploader_path {
+            TestCachePath::Provided => cache_uploader,
+            TestCachePath::NoOp => Arc::new(NoOpCacheUploader {}) as _,
         };
 
         let executor = CommandExecutor::new(
@@ -2289,50 +2333,88 @@ impl BuckTestOrchestrator<'_> {
         })
     }
 
-    /// `[test] local_internal_cases`: whether an `InternalRunnerTestInfo` test whose provider
-    /// explicitly selects the local executor may use it under `--remote-only`. Absent means
-    /// `false`; any value other than `true` or `false` is refused.
-    async fn local_internal_cases(dice: &mut DiceComputations<'_>) -> buck2_error::Result<bool> {
+    /// One closed `[test]` local-admission boolean of the root cell. Absent means `false`; any
+    /// value other than `true` or `false` is refused.
+    fn parse_local_admission(property: &str, value: Option<&str>) -> buck2_error::Result<bool> {
+        match value {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(other) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "[test] {} must be `true` or `false`, not `{}`",
+                property,
+                other
+            )),
+        }
+    }
+
+    async fn local_admission(
+        dice: &mut DiceComputations<'_>,
+        property: &'static str,
+    ) -> buck2_error::Result<bool> {
         let cell_resolver = dice.get_cell_resolver().await?;
         let value = dice
             .get_legacy_config_property(
                 cell_resolver.root_cell(),
                 BuckconfigKeyRef {
                     section: "test",
-                    property: "local_internal_cases",
+                    property,
                 },
             )
             .await?;
-        match value.as_ref().map(|v| v.to_string()).as_deref() {
-            None | Some("false") => Ok(false),
-            Some("true") => Ok(true),
-            Some(other) => Err(buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Input,
-                "[test] local_internal_cases must be `true` or `false`, not `{}`",
-                other
-            )),
-        }
+        Self::parse_local_admission(property, value.as_ref().map(|v| v.to_string()).as_deref())
     }
 
-    /// The local-execution admission for one test command. Only the listing or case command of
-    /// an `InternalRunnerTestInfo` test whose provider explicitly selected the local executor
-    /// (its `default_executor` or the named override), under `[test] local_internal_cases`,
-    /// is admitted. A platform-derived fallback executor, an External test and the option alone
-    /// never are.
+    /// The two independent `[test]` local admissions:
+    /// - `local_internal_cases`: an `InternalRunnerTestInfo` test whose provider explicitly
+    ///   selects the local executor may use it under `--remote-only`;
+    /// - `local_workspace_tests`: an `ExternalRunnerTestInfo` test whose provider explicitly
+    ///   selects the local executor and that does not support test execution caching may use it,
+    ///   uncached, under `--remote-only`.
+    async fn local_test_admissions(
+        dice: &mut DiceComputations<'_>,
+    ) -> buck2_error::Result<LocalTestAdmissions> {
+        Ok(LocalTestAdmissions {
+            internal_cases: Self::local_admission(dice, "local_internal_cases").await?,
+            workspace_tests: Self::local_admission(dice, "local_workspace_tests").await?,
+        })
+    }
+
+    /// The local-execution admission for one listing or test command. The provider must have
+    /// explicitly selected the local executor (its `default_executor` or the named override); a
+    /// platform-derived fallback executor never is admitted. Then:
+    /// - an `InternalRunnerTestInfo` test is admitted under `[test] local_internal_cases`;
+    /// - an `ExternalRunnerTestInfo` test that does not support test execution caching is
+    ///   admitted under `[test] local_workspace_tests`, as a local-workspace test, never as an
+    ///   Internal one.
+    ///
+    /// Neither option admits the other's provider kind, and an option alone admits nothing.
+    /// `supports_test_execution_caching` is true when the provider declares test execution
+    /// caching or this command would use it; such an External test is refused, whatever the
+    /// invocation's own caching flags.
     fn local_execution_for_test(
-        test_info: &OwnedTestInfo,
+        kind: TestProviderKind,
         provider_executor: Option<&CommandExecutorConfig>,
-        local_internal_cases: bool,
+        supports_test_execution_caching: bool,
+        admissions: LocalTestAdmissions,
     ) -> LocalExecution {
-        match (test_info, provider_executor) {
-            (
-                OwnedTestInfo::Internal(_),
-                Some(CommandExecutorConfig {
-                    executor: Executor::Local(_),
-                    ..
-                }),
-            ) if local_internal_cases => LocalExecution::AdmittedInternalTest,
-            _ => LocalExecution::ByStrategy,
+        let Some(CommandExecutorConfig {
+            executor: Executor::Local(_),
+            ..
+        }) = provider_executor
+        else {
+            return LocalExecution::ByStrategy;
+        };
+        match kind {
+            TestProviderKind::Internal if admissions.internal_cases => {
+                LocalExecution::AdmittedInternalTest
+            }
+            TestProviderKind::External
+                if admissions.workspace_tests && !supports_test_execution_caching =>
+            {
+                LocalExecution::AdmittedLocalWorkspaceTest
+            }
+            TestProviderKind::Internal | TestProviderKind::External => LocalExecution::ByStrategy,
         }
     }
 
@@ -2378,9 +2460,10 @@ impl BuckTestOrchestrator<'_> {
 
         let provider_executor = resolved_executor_override.as_ref().map(|a| &***a);
         let local_execution = Self::local_execution_for_test(
-            test_info,
+            test_info.kind(),
             provider_executor,
-            Self::local_internal_cases(dice).await?,
+            test_info.supports_test_execution_caching() || supports_test_execution_caching,
+            Self::local_test_admissions(dice).await?,
         );
         let executor_config = Self::executor_config_with_remote_cache_override(
             node,
@@ -3543,5 +3626,294 @@ mod tests {
         let result = create_action_key_suffix(&stage);
         assert!(result.len() <= MAX_SUFFIX_LEN);
         assert!(result.ends_with("(truncated)"));
+    }
+
+    mod local_admission {
+        use buck2_core::execution_types::executor_config::CacheUploadBehavior;
+        use buck2_core::execution_types::executor_config::HybridExecutionLevel;
+        use buck2_core::execution_types::executor_config::RePlatformFields;
+        use buck2_core::execution_types::executor_config::RemoteEnabledExecutor;
+        use buck2_core::execution_types::executor_config::RemoteEnabledExecutorOptions;
+        use buck2_core::execution_types::executor_config::RemoteExecutorOptions;
+        use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+
+        use super::*;
+
+        type Orchestrator = BuckTestOrchestrator<'static>;
+
+        const OFF: LocalTestAdmissions = LocalTestAdmissions {
+            internal_cases: false,
+            workspace_tests: false,
+        };
+        const INTERNAL_CASES: LocalTestAdmissions = LocalTestAdmissions {
+            internal_cases: true,
+            workspace_tests: false,
+        };
+        const WORKSPACE_TESTS: LocalTestAdmissions = LocalTestAdmissions {
+            internal_cases: false,
+            workspace_tests: true,
+        };
+        const BOTH: LocalTestAdmissions = LocalTestAdmissions {
+            internal_cases: true,
+            workspace_tests: true,
+        };
+
+        fn options() -> CommandGenerationOptions {
+            CommandGenerationOptions {
+                path_separator: PathSeparatorKind::Unix,
+                output_paths_behavior: Default::default(),
+                use_bazel_protocol_remote_persistent_workers: false,
+                network_access: None,
+            }
+        }
+
+        fn local() -> CommandExecutorConfig {
+            CommandExecutorConfig {
+                executor: Executor::Local(LocalExecutorOptions::default()),
+                options: options(),
+            }
+        }
+
+        fn none() -> CommandExecutorConfig {
+            CommandExecutorConfig {
+                executor: Executor::None,
+                options: options(),
+            }
+        }
+
+        fn hybrid() -> CommandExecutorConfig {
+            CommandExecutorConfig {
+                executor: Executor::RemoteEnabled(RemoteEnabledExecutorOptions {
+                    executor: RemoteEnabledExecutor::Hybrid {
+                        local: LocalExecutorOptions::default(),
+                        remote: RemoteExecutorOptions::default(),
+                        level: HybridExecutionLevel::Limited,
+                    },
+                    re_properties: RePlatformFields {
+                        properties: Arc::new(Default::default()),
+                    },
+                    re_use_case: RemoteExecutorUseCase::buck2_default(),
+                    re_action_key: None,
+                    cache_upload_behavior: CacheUploadBehavior::Disabled,
+                    remote_cache_enabled: false,
+                    remote_dep_file_cache_enabled: false,
+                    dependencies: vec![],
+                    gang_workers: vec![],
+                    custom_image: None,
+                    meta_internal_extra_params: MetaInternalExtraParams::default_arc(),
+                    priority: None,
+                }),
+                options: options(),
+            }
+        }
+
+        fn listing() -> TestStage {
+            TestStage::Listing {
+                suite: "suite".to_owned(),
+                cacheable: true,
+            }
+        }
+
+        fn testing() -> TestStage {
+            TestStage::Testing {
+                suite: "suite".to_owned(),
+                testcases: vec!["case".to_owned()],
+                variant: None,
+                repeat_count: None,
+            }
+        }
+
+        fn admission(
+            kind: TestProviderKind,
+            provider_executor: Option<&CommandExecutorConfig>,
+            caching: bool,
+            admissions: LocalTestAdmissions,
+        ) -> LocalExecution {
+            Orchestrator::local_execution_for_test(kind, provider_executor, caching, admissions)
+        }
+
+        #[test]
+        fn an_external_test_with_an_explicit_uncached_local_executor_is_a_local_workspace_test() {
+            // The resolved provider executor is the same whether it came from the provider's
+            // `default_executor` or a named override; both reach here as `Some`.
+            for admissions in [WORKSPACE_TESTS, BOTH] {
+                assert_eq!(
+                    admission(
+                        TestProviderKind::External,
+                        Some(&local()),
+                        false,
+                        admissions
+                    ),
+                    LocalExecution::AdmittedLocalWorkspaceTest,
+                    "{admissions:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_platform_fallback_executor_is_never_admitted() {
+            // `None` is the execution platform's fallback executor: the provider selected none.
+            for kind in [TestProviderKind::External, TestProviderKind::Internal] {
+                for admissions in [OFF, INTERNAL_CASES, WORKSPACE_TESTS, BOTH] {
+                    for caching in [false, true] {
+                        assert_eq!(
+                            admission(kind, None, caching, admissions),
+                            LocalExecution::ByStrategy,
+                            "{kind:?} {admissions:?} {caching}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_explicit_non_local_executor_is_never_admitted() {
+            for executor in [hybrid(), none()] {
+                for kind in [TestProviderKind::External, TestProviderKind::Internal] {
+                    for admissions in [OFF, INTERNAL_CASES, WORKSPACE_TESTS, BOTH] {
+                        assert_eq!(
+                            admission(kind, Some(&executor), false, admissions),
+                            LocalExecution::ByStrategy,
+                            "{kind:?} {admissions:?} {executor:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_caching_external_test_is_refused_and_an_uncached_one_admitted() {
+            assert_eq!(
+                admission(
+                    TestProviderKind::External,
+                    Some(&local()),
+                    true,
+                    WORKSPACE_TESTS
+                ),
+                LocalExecution::ByStrategy
+            );
+            assert_eq!(
+                admission(TestProviderKind::External, Some(&local()), true, BOTH),
+                LocalExecution::ByStrategy
+            );
+            assert_eq!(
+                admission(
+                    TestProviderKind::External,
+                    Some(&local()),
+                    false,
+                    WORKSPACE_TESTS
+                ),
+                LocalExecution::AdmittedLocalWorkspaceTest
+            );
+        }
+
+        #[test]
+        fn neither_option_admits_the_other_provider_kind() {
+            // `local_internal_cases` never admits an External test.
+            assert_eq!(
+                admission(
+                    TestProviderKind::External,
+                    Some(&local()),
+                    false,
+                    INTERNAL_CASES
+                ),
+                LocalExecution::ByStrategy
+            );
+            // `local_workspace_tests` never admits an Internal test, cached or not.
+            for caching in [false, true] {
+                assert_eq!(
+                    admission(
+                        TestProviderKind::Internal,
+                        Some(&local()),
+                        caching,
+                        WORKSPACE_TESTS
+                    ),
+                    LocalExecution::ByStrategy
+                );
+            }
+            // Without either option nothing is admitted.
+            for kind in [TestProviderKind::External, TestProviderKind::Internal] {
+                assert_eq!(
+                    admission(kind, Some(&local()), false, OFF),
+                    LocalExecution::ByStrategy
+                );
+            }
+        }
+
+        #[test]
+        fn internal_admission_is_unaffected() {
+            for admissions in [INTERNAL_CASES, BOTH] {
+                for caching in [false, true] {
+                    assert_eq!(
+                        admission(
+                            TestProviderKind::Internal,
+                            Some(&local()),
+                            caching,
+                            admissions
+                        ),
+                        LocalExecution::AdmittedInternalTest,
+                        "{admissions:?} {caching}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_local_workspace_test_never_checks_or_uploads_a_cache() {
+            for stage in [listing(), testing()] {
+                for caching in [false, true] {
+                    assert_eq!(
+                        Orchestrator::test_command_cache_paths(
+                            &stage,
+                            caching,
+                            LocalExecution::AdmittedLocalWorkspaceTest,
+                        ),
+                        (TestCachePath::NoOp, TestCachePath::NoOp),
+                        "{stage:?} {caching}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn other_test_commands_keep_their_cache_paths() {
+            for local_execution in [
+                LocalExecution::ByStrategy,
+                LocalExecution::AdmittedInternalTest,
+            ] {
+                assert_eq!(
+                    Orchestrator::test_command_cache_paths(&listing(), false, local_execution),
+                    (TestCachePath::Provided, TestCachePath::Provided)
+                );
+                assert_eq!(
+                    Orchestrator::test_command_cache_paths(&testing(), true, local_execution),
+                    (TestCachePath::Provided, TestCachePath::NoOp)
+                );
+                assert_eq!(
+                    Orchestrator::test_command_cache_paths(&testing(), false, local_execution),
+                    (TestCachePath::NoOp, TestCachePath::NoOp)
+                );
+            }
+        }
+
+        #[test]
+        fn a_local_admission_key_is_a_closed_boolean() {
+            for property in ["local_internal_cases", "local_workspace_tests"] {
+                assert!(!Orchestrator::parse_local_admission(property, None).unwrap());
+                assert!(!Orchestrator::parse_local_admission(property, Some("false")).unwrap());
+                assert!(Orchestrator::parse_local_admission(property, Some("true")).unwrap());
+                for invalid in ["", "True", "FALSE", "1", "0", "yes", "on", " true", "true "] {
+                    let err =
+                        Orchestrator::parse_local_admission(property, Some(invalid)).unwrap_err();
+                    let message = format!("{err:?}");
+                    assert!(
+                        message.contains(&format!(
+                            "[test] {property} must be `true` or `false`, not `{invalid}`"
+                        )),
+                        "{message}"
+                    );
+                }
+            }
+        }
     }
 }
