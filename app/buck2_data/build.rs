@@ -37,39 +37,39 @@ fn main() -> io::Result<()> {
         )
         .type_attribute(
             "buck.data.BuckEvent.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.SpanStartEvent.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.SpanEndEvent.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CommandStart.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CommandEnd.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CommandCriticalStart.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CommandCriticalEnd.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.InstantEvent.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.RecordEvent.data",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.LocalStage.stage",
@@ -82,15 +82,15 @@ fn main() -> io::Result<()> {
         )
         .type_attribute(
             "buck.data.CommandExecution.status",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.ActionExecutionEnd.error",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.ActionError.error",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .field_attribute(
             "buck.data.CommandExecutionDetails.cmd_stderr",
@@ -102,42 +102,55 @@ fn main() -> io::Result<()> {
         )
         .type_attribute(
             "buck.data.CommandExecutionDetails.command",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.DynamicLambdaStart.owner",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.DeferredPreparationStageStart.stage",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.AnalysisStart.target",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.AnalysisEnd.target",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.ActionKind",
-            "#[derive(::gazebo::variants::VariantName, ::pagable::Pagable)]",
+            "#[derive(::variant_name::VariantName, ::pagable::Pagable)]",
         )
         .type_attribute(
             "buck.data.MaterializationMethod",
-            "#[derive(::gazebo::variants::VariantName)]",
+            "#[derive(::variant_name::VariantName)]",
         )
         .type_attribute("buck.data.CpuCounter", "#[derive(dupe::Dupe)]")
         .type_attribute("buck.data.CommandExecutionStats", "#[derive(dupe::Dupe)]")
         .type_attribute(".", "#[derive(::serde::Serialize, ::serde::Deserialize)]")
         .type_attribute(".", "#[derive(::allocative::Allocative)]")
+        // Keep the JSON event log for ordinary failures as `{"Failure": {}}`.
+        .field_attribute(
+            "buck.data.CommandExecution.Failure.missing_materialized_inputs",
+            "#[serde(default, skip_serializing_if = \"std::ops::Not::not\")]",
+        )
         .field_attribute(
             "timestamp",
             "#[serde(with = \"::buck2_proto_serde::serialize_timestamp\")]",
         )
         .field_attribute(
             "start_time",
+            "#[serde(default, with = \"::buck2_proto_serde::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "buck.data.BuildPhaseEnd.end_time",
+            "#[serde(default, with = \"::buck2_proto_serde::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "client_start_time",
             "#[serde(default, with = \"::buck2_proto_serde::serialize_timestamp\")]",
         )
         .field_attribute(
@@ -232,19 +245,19 @@ fn main() -> io::Result<()> {
         )
         .type_attribute(
             "buck.data.CriticalPathEntry2.entry",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CriticalPathEntry2.Analysis.target",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CriticalPathEntry2.ActionExecution.owner",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.CriticalPathEntry2.Materialization.owner",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .type_attribute(
             "buck.data.StarlarkUserMetadataDictValue",
@@ -264,7 +277,7 @@ fn main() -> io::Result<()> {
         )
         .type_attribute(
             "buck.data.CommandExecutionKind.command",
-            "#[derive(::derive_more::From, ::gazebo::variants::VariantName)]",
+            "#[derive(::derive_more::From, ::variant_name::VariantName)]",
         )
         .field_attribute(
             "buck.data.Invocation.expanded_command_line_args",
@@ -302,10 +315,23 @@ fn main() -> io::Result<()> {
             "#[serde(rename = \"queue_duration_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",
         )
         .boxed("RecordEvent.data.invocation_record")
+        // Putting some of the larger, rarer payloads into a Box reduce the size of every event in the event queue
         .boxed("SpanEndEvent.data.action_execution")
+        .boxed("RemoteCommand.re_worker")
         .boxed("SpanEndEvent.data.cache_upload")
+        .boxed("SpanEndEvent.data.dep_file_upload")
+        .boxed("SpanEndEvent.data.test_discovery")
+        .boxed("SpanEndEvent.data.test_run")
         .boxed("CommandEnd.data.clean")
+        .boxed("InstantEvent.data.action_error")
+        .boxed("InstantEvent.data.clean_stale_result")
+        .boxed("InstantEvent.data.page_out_summary")
+        .boxed("InstantEvent.data.paging_summary")
+        .boxed("InstantEvent.data.rage_result")
+        .boxed("InstantEvent.data.resource_control_event")
         .boxed("InstantEvent.data.snapshot")
+        // Fork-local: the rare reuse provenance stays off the inline size of every event.
+        .boxed("TestResult.reuse")
         .extern_path(".buck.host_sharing", "::buck2_host_sharing_proto")
         .compile(proto_files, &includes)
 }

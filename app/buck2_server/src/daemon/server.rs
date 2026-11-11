@@ -11,6 +11,7 @@
 use std::future;
 use std::io;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,12 +29,15 @@ use async_trait::async_trait;
 use buck2_build_api::configure_dice::configure_dice_for_buck;
 use buck2_build_api::spawner::BuckSpawner;
 use buck2_certs::validate::CertState;
-use buck2_certs::validate::check_cert_state;
+use buck2_certs::validate::CertStateReport;
+use buck2_certs::validate::INVALID_CERTS_TAG;
+use buck2_certs::validate::check_cert_state_for;
 use buck2_certs::validate::validate_certs;
 use buck2_cli_proto::daemon_api_server::*;
 use buck2_cli_proto::*;
 use buck2_common::buckd_connection::BUCK_AUTH_TOKEN_HEADER;
 use buck2_common::events::HasEvents;
+use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::io::IoProvider;
@@ -70,6 +74,7 @@ use buck2_resource_control::buck_cgroup_tree::PreppedBuckCgroups;
 use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::late_bindings::AUDIT_SERVER_COMMAND;
+use buck2_server_ctx::late_bindings::LSP_SERVER_COMMAND;
 use buck2_server_ctx::late_bindings::OTHER_SERVER_COMMANDS;
 use buck2_server_ctx::late_bindings::QUERY_SERVER_COMMANDS;
 use buck2_server_ctx::late_bindings::STARLARK_SERVER_COMMAND;
@@ -83,7 +88,7 @@ use buck2_test::executor_launcher::get_all_test_executors;
 use buck2_util::system_stats::num_cores;
 use buck2_util::system_stats::system_memory_stats;
 use buck2_util::threads::thread_spawn;
-use dice::DetectCycles;
+use dice::BranchId;
 use dice::Dice;
 use dice_futures::cancellation::CancellationContext;
 use dice_futures::drop::DropTogether;
@@ -99,6 +104,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::BoxFuture;
 use futures::stream;
+use pagable::DeferredReadFailures;
 use rand::Rng as _;
 use rand::SeedableRng;
 use tokio::runtime::Handle;
@@ -122,7 +128,6 @@ use crate::daemon::server_allocative::spawn_allocative;
 use crate::daemon::state::DaemonState;
 use crate::file_status::file_status_command;
 use crate::hydration::hydration_command;
-use crate::lsp::run_lsp_server_command;
 use crate::new_generic::new_generic_command;
 use crate::paging::cancel_active_page_out;
 use crate::profile::profile_command;
@@ -219,9 +224,10 @@ impl DaemonShutdown {
     /// As we might be processing a `kill()` (or other) request, we cannot wait for the server to actually
     /// shutdown (as it will wait for current requests to finish), so this returns immediately.
     fn start_shutdown(&self, reason: buck2_data::DaemonShutdown, timeout: Option<Duration>) {
-        // It would be better to pass reason to be logged later in a more structured way, but this can't be done via
-        // the existing graceful (not forced) shutdown mechanism (serve_with_incoming_shutdown), so logging here instead.
-        tracing::warn!("triggered shutdown: {}", reason.reason);
+        // The daemon's stderr is `buckd.stderr`, which the client tails into the console and the
+        // invocation record and `rage` collects: it is where a daemon's last words are looked
+        // for, so the reason goes there directly.
+        eprintln!("triggered shutdown: {}", reason.reason);
         crate::active_commands::broadcast_shutdown(&reason);
 
         let timeout = timeout.unwrap_or(DEFAULT_KILL_TIMEOUT);
@@ -234,7 +240,6 @@ impl DaemonShutdown {
 
 #[derive(Allocative)]
 pub struct BuckdServerInitPreferences {
-    pub detect_cycles: Option<DetectCycles>,
     pub enable_trace_io: bool,
     pub reject_materializer_state: Option<SqliteIdentity>,
     pub daemon_startup_config: DaemonStartupConfig,
@@ -244,7 +249,6 @@ pub struct BuckdServerInitPreferences {
 
 #[derive(Allocative)]
 pub(crate) struct TenantStateInitPreferences {
-    pub(crate) detect_cycles: Option<DetectCycles>,
     pub(crate) enable_trace_io: bool,
     pub(crate) reject_materializer_state: Option<SqliteIdentity>,
     pub(crate) daemon_startup_config: DaemonStartupConfig,
@@ -253,7 +257,6 @@ pub(crate) struct TenantStateInitPreferences {
 impl BuckdServerInitPreferences {
     pub(crate) fn split(self) -> (TenantStateInitPreferences, Option<String>) {
         let Self {
-            detect_cycles,
             enable_trace_io,
             reject_materializer_state,
             daemon_startup_config,
@@ -262,7 +265,6 @@ impl BuckdServerInitPreferences {
         } = self;
         (
             TenantStateInitPreferences {
-                detect_cycles,
                 enable_trace_io,
                 reject_materializer_state,
                 daemon_startup_config,
@@ -277,22 +279,33 @@ impl TenantStateInitPreferences {
         &self,
         io: Arc<dyn IoProvider>,
         digest_config: DigestConfig,
+        ignore_set: Arc<IgnoreSet>,
         root_config: &LegacyBuckConfig,
         tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
         dice_state_path: &Path,
-    ) -> buck2_error::Result<Arc<Dice>> {
+    ) -> buck2_error::Result<(Arc<Dice>, BranchId)> {
         // `hydration` is `Some` when paging is enabled (via `enable_paging` or
         // `page_out_on_idle`), which is what gates setting up on-disk storage.
-        let hydration = self.daemon_startup_config.hydration.as_ref();
+        let hydration = self
+            .daemon_startup_config
+            .startup_options
+            .hydration
+            .as_ref();
         configure_dice_for_buck(
             io,
             digest_config,
+            ignore_set,
             Some(root_config),
-            self.detect_cycles,
             tenting_acl_provider,
-            self.daemon_startup_config.buck_settings.dupe(),
+            self.daemon_startup_config.daemon_buck_settings().dupe(),
             hydration.map(|_| dice_state_path),
             hydration.map_or_else(Default::default, |h| h.pagable_storage_backend),
+            hydration.map_or_else(Default::default, |h| h.page_out_policy),
+            hydration.map_or_else(Default::default, |h| h.eviction_policy),
+            self.daemon_startup_config
+                .daemon_buck_settings()
+                .hydration
+                .defer_field_reads(),
         )
         .await
     }
@@ -365,6 +378,7 @@ impl BuckdServer {
         listener: Pin<Box<dyn Stream<Item = Result<tokio::net::TcpStream, io::Error>> + Send>>,
         rt: Handle,
         daemon_id: DaemonId,
+        ready: Box<dyn FnOnce() + Send>,
     ) -> buck2_error::Result<()> {
         let now = SystemTime::now();
         let now = now.duration_since(SystemTime::UNIX_EPOCH)?;
@@ -375,7 +389,11 @@ impl BuckdServer {
 
         let final_artifact_materialization =
             FinalArtifactMaterialization::try_new_from_config_value(
-                init_ctx.daemon_startup_config.materializations.as_deref(),
+                init_ctx
+                    .daemon_startup_config
+                    .startup_options
+                    .materializations
+                    .as_deref(),
             )?;
 
         let tenant_paths = paths.tenant_paths();
@@ -395,7 +413,10 @@ impl BuckdServer {
             Some(
                 BuckCgroupTree::set_up(
                     prepped_cgroups,
-                    &init_ctx.daemon_startup_config.resource_control,
+                    &init_ctx
+                        .daemon_startup_config
+                        .startup_options
+                        .resource_control,
                 )
                 .await?,
             )
@@ -407,7 +428,10 @@ impl BuckdServer {
         certs_validation_background_job(cert_state.dupe()).await;
 
         let inactivity_config = DaemonInactivityConfig::try_new(
-            init_ctx.daemon_startup_config.daemon_idle_timeout_s,
+            init_ctx
+                .daemon_startup_config
+                .startup_options
+                .daemon_idle_timeout_s,
             init_ctx.started_for_clean_stale,
         )?;
 
@@ -476,6 +500,9 @@ impl BuckdServer {
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
 
+        // The listener accepted connections since before the daemon state existed, but answers
+        // them only from here on.
+        ready();
         let server_result = server.await;
 
         let shutdown_deadline = shutdown_deadline
@@ -485,7 +512,7 @@ impl BuckdServer {
             .await
             .is_err()
         {
-            tracing::warn!("timed out waiting for DICE tasks to finish during shutdown");
+            eprintln!("timed out waiting for DICE tasks to finish during shutdown");
         }
 
         server_result?;
@@ -549,227 +576,262 @@ impl BuckdServer {
         .await
     }
 
-    async fn run_streaming_fallible<Req, Res, PartialRes, F>(
+    /// The body of `run_streaming`, compiled once for all commands. `#[inline(never)]` keeps
+    /// it from being inlined back into each command's `run_streaming` instantiation.
+    #[inline(never)]
+    fn run_streaming_erased(
         &self,
-        req: Request<Req>,
-        opts: impl StreamingCommandOptions<Req>,
-        func: F,
-    ) -> buck2_error::Result<Response<ResponseStream>>
-    where
-        F: for<'a> FnOnce(
-                &'a ServerCommandContext,
-                PartialResultDispatcher<PartialRes>,
-                Req,
-            ) -> BoxFuture<'a, buck2_error::Result<Res>>
-            + Send
-            + 'static,
-        Req: HasClientContext + HasBuildOptions + Send + Sync + 'static,
-        Res: Into<command_result::Result> + Send + 'static,
-        PartialRes: Into<partial_result::PartialResult> + Send + 'static,
-    {
-        let command_start = Instant::now();
+        command: Box<dyn ErasedStreamingCommand>,
+    ) -> BoxFuture<'_, buck2_error::Result<Response<ResponseStream>>> {
+        Box::pin(async move {
+            let command_start = Instant::now();
 
-        if buck2_env!("BUCK2_TEST_FAIL_STREAMING", bool, applicability = testing).unwrap() {
-            Err(buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Input,
-                "Injected client streaming error"
-            ))?;
-        }
+            if buck2_env!("BUCK2_TEST_FAIL_STREAMING", bool, applicability = testing).unwrap() {
+                Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Injected client streaming error"
+                ))?;
+            }
 
-        let client_ctx = req.get_ref().client_context()?;
-        let soft_error_context = Arc::new(SoftErrorContext::new(
-            &client_ctx.buck2_hard_error,
-            &client_ctx.buck2_show_soft_errors,
-        )?);
+            let client_ctx = command.client_context()?;
+            let soft_error_context = Arc::new(SoftErrorContext::new(
+                &client_ctx.buck2_hard_error,
+                &client_ctx.buck2_show_soft_errors,
+            )?);
 
-        OneshotCommandOptions::pre_run(&opts, self)?;
+            command.pre_run(self)?;
 
-        let daemon_state = self.0.daemon_state.dupe();
-        let trace_id = client_ctx.trace_id.parse()?;
-        let (events, dispatch) = daemon_state.prepare_events(trace_id).await?;
-        let dispatch = dispatch.with_soft_error_context(soft_error_context);
-        let ActiveCommand {
-            guard,
-            daemon_shutdown_channel,
-            state,
-        } = ActiveCommand::new(&dispatch, client_ctx.sanitized_argv.clone());
+            let daemon_state = self.0.daemon_state.dupe();
+            let trace_id = client_ctx.trace_id.parse()?;
+            let (events, dispatch) = daemon_state.prepare_events(trace_id).await?;
+            let dispatch = dispatch.with_soft_error_context(soft_error_context);
+            let ActiveCommand {
+                guard,
+                daemon_shutdown_channel,
+                state,
+            } = ActiveCommand::new(&dispatch, client_ctx.sanitized_argv.clone());
 
-        // A command that contends for the DICE graph is starting; cancel any
-        // in-progress idle page-out so it yields resources back. Read-only /
-        // debug commands opt out (see `triggers_idle_page_out`).
-        if opts.triggers_idle_page_out() {
-            cancel_active_page_out();
-        }
+            // A command that contends for the DICE graph is starting; cancel any
+            // in-progress idle page-out so it yields resources back. Read-only /
+            // debug commands opt out (see `triggers_idle_page_out`).
+            let triggers_idle_page_out = command.triggers_idle_page_out();
+            let prevents_background_cleanup = command.prevents_background_cleanup();
+            if triggers_idle_page_out {
+                cancel_active_page_out();
+            }
 
-        let data = daemon_state.data();
-        let tenant = data.tenant_for_client_context(client_ctx).await?;
-        let repo = tenant.repo.dupe();
+            let data = daemon_state.data();
+            let tenant = data.tenant_for_client_context(client_ctx).await?;
+            let repo = tenant.repo.dupe();
 
-        // The total disk space on `buck-out`, effectively fixed for the daemon's life.
-        // Captured here alongside `SystemInfo` and handed to this command's
-        // `PagingManager`, which pairs it with the command-end snapshot's used-disk
-        // reading to gate idle page-out without a second disk stat.
-        let total_disk_space_bytes = disk_space_stats(repo.paths.buck_out_path())
-            .ok()
-            .map(|DiskSpaceStats { total_space, .. }| total_space);
+            // The total disk space on `buck-out`, effectively fixed for the daemon's life.
+            // Captured here alongside `SystemInfo` and handed to this command's
+            // `PagingManager`, which pairs it with the command-end snapshot's used-disk
+            // reading to gate idle page-out without a second disk stat.
+            let total_disk_space_bytes = disk_space_stats(repo.paths.buck_out_path())
+                .ok()
+                .map(|DiskSpaceStats { total_space, .. }| total_space);
 
-        // Fire off a system-wide event to record the memory usage of this process.
-        // TODO(ezgi): add it to oneshot command too
-        let system_warning_config = &repo.system_warning_config;
-        dispatch.instant_event(buck2_data::SystemInfo {
-            system_total_memory_bytes: Some(system_memory_stats()),
-            memory_pressure_threshold_percent: system_warning_config
-                .memory_pressure_threshold_percent,
-            total_disk_space_bytes,
-            remaining_disk_space_threshold_gb: system_warning_config
-                .remaining_disk_space_threshold_gb,
-            min_re_download_bytes_threshold: system_warning_config.min_re_download_bytes_threshold,
-            avg_re_download_bytes_per_sec_threshold: system_warning_config
-                .avg_re_download_bytes_per_sec_threshold,
-            optin_vpn_check_targets_regex: system_warning_config
-                .optin_vpn_check_targets_regex
-                .clone(),
-            enable_stable_revision_check: system_warning_config.enable_stable_revision_check,
-            enable_health_check_process_isolation: system_warning_config
-                .enable_health_check_process_isolation,
-            daemon_cgroup_path: {
-                #[cfg(unix)]
-                {
-                    data.memory_tracker
-                        .as_ref()
-                        .map(|mt| mt.cgroup_tree.daemon().path().to_string())
-                }
-                #[cfg(not(unix))]
-                {
-                    None
-                }
-            },
-            allprocs_cgroup_path: {
-                #[cfg(unix)]
-                {
-                    data.memory_tracker
-                        .as_ref()
-                        .map(|mt| mt.cgroup_tree.allprocs().path().to_string())
-                }
-                #[cfg(not(unix))]
-                {
-                    None
-                }
-            },
-            daemon_cgroup_slice_path: {
-                #[cfg(unix)]
-                {
-                    std::fs::read_to_string("/proc/self/cgroup")
-                        .ok()
-                        .and_then(|s| {
-                            s.lines()
-                                .find_map(|l| l.strip_prefix("0::"))
-                                .map(|p| format!("/sys/fs/cgroup{}", p))
-                        })
-                }
-                #[cfg(not(unix))]
-                {
-                    None
-                }
-            },
-            num_cores: Some(num_cores() as u64),
-        });
-
-        // Fire off a snapshot before we start doing anything else. We use the metrics emitted here
-        // as a baseline.
-        let snapshot_collector =
-            SnapshotCollector::new(data.dupe(), tenant.dupe(), self.0.rt.clone());
-        dispatch.instant_event(Box::new(snapshot_collector.create_snapshot().await));
-        let cert_state = self.0.cert_state.dupe();
-
-        let repo_root = repo.paths.project_root().root().to_buf();
-        // Spawn an async task to collect expensive info
-        // We start collecting immediately, and emit the event as soon as it is ready
-        let version_control_revision_collector =
-            version_control_revision::spawn_version_control_collector(dispatch.dupe(), repo_root);
-
-        #[cfg(unix)]
-        let memory_reporter = daemon_state.data.memory_tracker.as_ref().map(|t| {
-            buck2_resource_control::memory_tracker::spawn_memory_reporter(dispatch.dupe(), t.dupe())
-        });
-
-        let resp = streaming(
-            req,
-            events,
-            state,
-            dispatch.dupe(),
-            daemon_shutdown_channel,
-            move |req, cancellations| {
-                async move {
-                    let _background_cleanup_guard = if opts.prevents_background_cleanup() {
-                        Some(repo.materializer.prevent_background_cleanup().await)
-                    } else {
-                        None
-                    };
-                    let result: buck2_error::Result<Res> = try {
-                        let base_context = daemon_state
-                            .prepare_command(tenant, dispatch.dupe(), guard)
-                            .await?;
-
-                        let client_ctx = req.client_context()?;
-
-                        let instrumentation = opts.starlark_profiler_instrumentation_override(
-                            &req,
-                            base_context.repo().paths.project_root(),
-                        )?;
-                        let profiling_manager = StarlarkProfilingManager::new(
-                            client_ctx.profile_pattern_opts.as_ref(),
-                            instrumentation,
-                            &base_context.events,
-                        )?;
-
-                        let context = ServerCommandContext::new(
-                            base_context,
-                            client_ctx,
-                            profiling_manager,
-                            req.build_options(),
-                            cert_state.dupe(),
-                            snapshot_collector,
-                            cancellations,
-                            command_start,
-                            total_disk_space_bytes,
-                        )?;
-
-                        let res = func(
-                            &context,
-                            PartialResultDispatcher::new(
-                                dispatch.dupe(),
-                                context.cancellation_context().into(),
-                            ),
-                            req,
-                        )
-                        .await;
-
-                        // Finalize the command, emitting its paging telemetry and (if
-                        // eligible) scheduling an idle page-out.
-                        context.finalize(opts.triggers_idle_page_out()).await?;
-                        res?
-                    };
-
-                    // Do not kill the process prematurely.
-                    drop(version_control_revision_collector);
+            // Fire off a system-wide event to record the memory usage of this process.
+            // TODO(ezgi): add it to oneshot command too
+            let system_warning_config = &repo.system_warning_config;
+            dispatch.instant_event(buck2_data::SystemInfo {
+                system_total_memory_bytes: Some(system_memory_stats()),
+                memory_pressure_threshold_percent: system_warning_config
+                    .memory_pressure_threshold_percent,
+                total_disk_space_bytes,
+                remaining_disk_space_threshold_gb: system_warning_config
+                    .remaining_disk_space_threshold_gb,
+                min_re_download_bytes_threshold: system_warning_config
+                    .min_re_download_bytes_threshold,
+                avg_re_download_bytes_per_sec_threshold: system_warning_config
+                    .avg_re_download_bytes_per_sec_threshold,
+                optin_vpn_check_targets_regex: system_warning_config
+                    .optin_vpn_check_targets_regex
+                    .clone(),
+                enable_stable_revision_check: system_warning_config.enable_stable_revision_check,
+                enable_health_check_process_isolation: system_warning_config
+                    .enable_health_check_process_isolation,
+                daemon_cgroup_path: {
                     #[cfg(unix)]
-                    drop(memory_reporter);
-                    match result {
-                        Ok(_) => dispatch.command_result(result_to_command_result(result)),
-                        Err(e) => match check_cert_state(cert_state).await {
-                            Some(err) => dispatch.command_result(error_to_command_result(
-                                err.context(format!("{e:?}")),
-                            )),
-                            _ => dispatch.command_result(error_to_command_result(e)),
-                        },
+                    {
+                        data.memory_tracker
+                            .as_ref()
+                            .map(|mt| mt.cgroup_tree.daemon().path().to_string())
                     }
-                }
-                .boxed()
-            },
-            &self.0.rt,
-        );
-        Ok(resp)
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
+                allprocs_cgroup_path: {
+                    #[cfg(unix)]
+                    {
+                        data.memory_tracker
+                            .as_ref()
+                            .map(|mt| mt.cgroup_tree.allprocs().path().to_string())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
+                daemon_cgroup_slice_path: {
+                    #[cfg(unix)]
+                    {
+                        std::fs::read_to_string("/proc/self/cgroup")
+                            .ok()
+                            .and_then(|s| {
+                                s.lines()
+                                    .find_map(|l| l.strip_prefix("0::"))
+                                    .map(|p| format!("/sys/fs/cgroup{}", p))
+                            })
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
+                num_cores: Some(num_cores() as u64),
+            });
+
+            // Fire off a snapshot before we start doing anything else. We use the metrics emitted here
+            // as a baseline.
+            let snapshot_collector =
+                SnapshotCollector::new(data.dupe(), tenant.dupe(), self.0.rt.clone());
+            dispatch.instant_event(Box::new(snapshot_collector.create_snapshot().await));
+            let cert_state = self.0.cert_state.dupe();
+
+            let repo_root = repo.paths.project_root().root().to_buf();
+            // Spawn an async task to collect expensive info
+            // We start collecting immediately, and emit the event as soon as it is ready
+            let version_control_revision_collector =
+                version_control_revision::spawn_version_control_collector(
+                    dispatch.dupe(),
+                    repo_root,
+                );
+
+            #[cfg(unix)]
+            let memory_reporter = daemon_state.data.memory_tracker.as_ref().map(|t| {
+                buck2_resource_control::memory_tracker::spawn_memory_reporter(
+                    dispatch.dupe(),
+                    t.dupe(),
+                )
+            });
+
+            let resp = streaming(
+                events,
+                state,
+                dispatch.dupe(),
+                daemon_shutdown_channel,
+                move |cancellations| {
+                    async move {
+                        let _background_cleanup_guard = if prevents_background_cleanup {
+                            Some(repo.materializer.prevent_background_cleanup().await)
+                        } else {
+                            None
+                        };
+                        let result: buck2_error::Result<command_result::Result> = try {
+                            let base_context = daemon_state
+                                .prepare_command(tenant, dispatch.dupe(), guard)
+                                .await?;
+
+                            let client_ctx = command.client_context()?;
+
+                            let instrumentation = command.starlark_profiler_configuration(
+                                base_context.repo().paths.project_root(),
+                            )?;
+                            let profiling_manager = StarlarkProfilingManager::new(
+                                client_ctx.profile_pattern_opts.as_ref(),
+                                instrumentation,
+                                &base_context.events,
+                            )?;
+
+                            let context = ServerCommandContext::new(
+                                base_context,
+                                client_ctx,
+                                profiling_manager,
+                                command.build_options(),
+                                cert_state.dupe(),
+                                snapshot_collector,
+                                cancellations,
+                                command_start,
+                                total_disk_space_bytes,
+                            )?;
+
+                            let res = command.run(&context, dispatch.dupe()).await;
+
+                            // Build failures are reported inside a successful response, so the
+                            // command's own result does not say whether a deferred read failed.
+                            if let Some(payload) = deferred_read_failures(
+                                context.base_context.tenant.dice_manager.unsafe_dice(),
+                            ) {
+                                dispatch.instant_event(buck2_data::StructuredError {
+                                    payload,
+                                    quiet: false,
+                                    task: Some(false),
+                                    soft_error_category: Some(buck2_data::SoftError {
+                                        category: "paging_deferred_read_failed".to_owned(),
+                                        is_quiet: false,
+                                        is_deprecation: false,
+                                    }),
+                                    daemon_in_memory_state_is_corrupted: true,
+                                    ..Default::default()
+                                });
+                            }
+                            if let Some(payload) =
+                                heap_rekeys(context.base_context.tenant.dice_manager.unsafe_dice())
+                            {
+                                dispatch.instant_event(buck2_data::StructuredError {
+                                    payload,
+                                    quiet: false,
+                                    task: Some(false),
+                                    soft_error_category: Some(buck2_data::SoftError {
+                                        category: "paging_heap_indexed_under_two_keys".to_owned(),
+                                        is_quiet: false,
+                                        is_deprecation: false,
+                                    }),
+                                    ..Default::default()
+                                });
+                            }
+
+                            // Finalize the command, emitting its paging telemetry and (if
+                            // eligible) scheduling an idle page-out.
+                            context.finalize(triggers_idle_page_out).await?;
+                            res?
+                        };
+
+                        // Do not kill the process prematurely.
+                        drop(version_control_revision_collector);
+                        #[cfg(unix)]
+                        drop(memory_reporter);
+                        match result {
+                            Ok(_) => dispatch.command_result(result_to_command_result(result)),
+                            Err(e) => {
+                                let report = check_cert_state_for(cert_state, [&e]).await;
+                                if report.cert_error().is_some() {
+                                    dispatch.instant_event(buck2_data::TagEvent {
+                                        tags: vec![INVALID_CERTS_TAG.to_owned()],
+                                    });
+                                }
+                                let e = match report {
+                                    CertStateReport::Valid => e,
+                                    CertStateReport::Explains(err) => err.context(format!("{e:?}")),
+                                    CertStateReport::Hint(err) => {
+                                        dispatch.console_warning(err.to_string());
+                                        e
+                                    }
+                                };
+                                dispatch.command_result(error_to_command_result(e))
+                            }
+                        }
+                    }
+                    .boxed()
+                },
+                &self.0.rt,
+            );
+            Ok(resp)
+        })
     }
 
     /// Runs a single command (given by the func F). Prior to running the command, calls the
@@ -795,12 +857,25 @@ impl BuckdServer {
     {
         self.note_command_activity(opts.daemon_activity());
 
-        match self.run_streaming_fallible(req, opts, func).await {
+        let command = Box::new(StreamingCommand {
+            req: req.into_inner(),
+            opts,
+            func,
+            _types: PhantomData,
+        });
+
+        match self.run_streaming_erased(command).await {
             Ok(resp) => Ok(resp),
-            Err(e) => match check_cert_state(self.0.cert_state.dupe()).await {
-                Some(err) => Ok(error_to_response_stream(err.context(format!("{e:?}")))),
-                _ => Ok(error_to_response_stream(e)),
-            },
+            Err(e) => {
+                // There is no event stream to send a hint on yet, so a user error gets the cert
+                // error as context, which does not change its classification.
+                let e = match check_cert_state_for(self.0.cert_state.dupe(), [&e]).await {
+                    CertStateReport::Valid => e,
+                    CertStateReport::Explains(err) => err.context(format!("{e:?}")),
+                    CertStateReport::Hint(err) => e.context(err.to_string()),
+                };
+                Ok(error_to_response_stream(e))
+            }
         }
     }
 
@@ -841,6 +916,39 @@ impl BuckdServer {
 }
 
 #[allow(clippy::result_large_err)]
+/// The message for the finishing command's corrupted-state report when a
+/// deferred read has failed on paged-out data. A value paged back in cannot be
+/// repaired once a field it kept in storage fails to read, so the daemon has to
+/// be replaced, and every command that finishes before that happens says so:
+/// the client only restarts a command that failed, so a report consumed by an
+/// unrelated command that succeeded would be lost.
+fn deferred_read_failures(dice: &Dice) -> Option<String> {
+    let failures = dice
+        .pagable_storage_context()?
+        .get::<DeferredReadFailures>()?
+        .snapshot();
+    if failures.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Deferred reads of paged-out data failed: [{}]. The daemon's in-memory state cannot be repaired; restarting the daemon",
+        failures.join("; ")
+    ))
+}
+
+/// The report for Starlark heaps the storage indexed under a second data key
+/// during this command, which should not occur and leaves page-in able to
+/// deserialize a copy of a resident heap.
+fn heap_rekeys(dice: &Dice) -> Option<String> {
+    let rekeyed = starlark::pagable::take_heap_rekeys(dice.pagable_storage_context()?);
+    (rekeyed > 0).then(|| {
+        format!(
+            "{rekeyed} Starlark heap(s) were indexed under a second data key, so a page-in \
+             through that key deserializes a copy of a heap that is still resident"
+        )
+    })
+}
+
 fn convert_positive_duration(proto_duration: &prost_types::Duration) -> Result<Duration, Status> {
     if proto_duration.seconds < 0 || proto_duration.nanos < 0 {
         return Err(Status::new(
@@ -949,8 +1057,7 @@ fn pump_events(
 
 /// Dispatches a request to the given function and returns a stream of responses, suitable for streaming to a client.
 #[allow(clippy::mut_mut)] // select! does this internally
-fn streaming<Req, F>(
-    req: Request<Req>,
+fn streaming<F>(
     events: ChannelEventSource,
     state: ActiveCommandStateWriter,
     dispatcher: EventDispatcher,
@@ -959,8 +1066,7 @@ fn streaming<Req, F>(
     rt: &Handle,
 ) -> Response<ResponseStream>
 where
-    Req: Send + Sync + 'static,
-    F: for<'a> FnOnce(Req, &'a CancellationContext) -> BoxFuture<'a, ()> + Send + 'static,
+    F: for<'a> FnOnce(&'a CancellationContext) -> BoxFuture<'a, ()> + Send + 'static,
 {
     // This function is responsible for receiving all events coming into an ChannelEventSource and reacting accordingly.
     // The function `func` is the computation that we are going to run. It communicates its success or failure using
@@ -977,14 +1083,9 @@ where
 
     let trace_id = dispatcher.trace_id().dupe();
 
-    let req = req.into_inner();
     let events_ctx = EventsCtx { dispatcher };
 
-    let spawned = spawn_dropcancel(
-        |cancellations| func(req, cancellations),
-        &BuckSpawner::new(rt.clone()),
-        &events_ctx,
-    );
+    let spawned = spawn_dropcancel(func, &BuckSpawner::new(rt.clone()), &events_ctx);
     let (output_send, output_recv) = tokio::sync::mpsc::unbounded_channel();
 
     // We run the event consumer on new non-tokio thread to avoid the consumer task from getting stuck behind
@@ -1548,6 +1649,34 @@ impl DaemonApi for BuckdServer {
         Ok(Response::new(UnstableHeapDumpResponse {}))
     }
 
+    async fn unstable_recent_alloc_dump(
+        &self,
+        req: Request<UnstableRecentAllocDumpRequest>,
+    ) -> Result<Response<UnstableRecentAllocDumpResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let req = req.into_inner();
+
+        // Producing the dump and streaming it to disk are blocking; run them off
+        // the async runtime so a large dump can't stall the daemon.
+        tokio::task::spawn_blocking(move || {
+            memory::write_recent_alloc_to_file(&req.destination_path)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("recent alloc dump task failed: {e}")))?
+        .map_err(|e| {
+            // `Input`-tagged errors are unmet preconditions (jemalloc isn't the
+            // allocator, or profiling / the recent-alloc ring isn't enabled);
+            // anything else (mallctl or file-IO failure) is an internal error.
+            let msg = format!("failed to dump recent allocations: {e:#}");
+            if e.has_tag(buck2_error::ErrorTag::Input) {
+                Status::failed_precondition(msg)
+            } else {
+                Status::internal(msg)
+            }
+        })?;
+        Ok(Response::new(UnstableRecentAllocDumpResponse {}))
+    }
+
     async fn unstable_flush_pgo_profile(
         &self,
         _req: Request<UnstableFlushPgoProfileRequest>,
@@ -1579,6 +1708,27 @@ impl DaemonApi for BuckdServer {
             Ok(response) => Ok(Response::new(UnstableAllocatorStatsResponse { response })),
             Err(e) => Err(Status::invalid_argument(format!("{e:#}"))),
         }
+    }
+
+    async fn unstable_list_tenants(
+        &self,
+        _req: Request<UnstableListTenantsRequest>,
+    ) -> Result<Response<UnstableListTenantsResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let tenants = self
+            .0
+            .daemon_state
+            .data()
+            .tenants()
+            .into_iter()
+            .map(|tenant| UnstableTenantInfo {
+                project_root: tenant.key.project_root().display().to_string(),
+                isolation: tenant.key.isolation().as_str().to_owned(),
+                generation: tenant.generation,
+                initialized: tenant.initialized,
+            })
+            .collect();
+        Ok(Response::new(UnstableListTenantsResponse { tenants }))
     }
 
     async fn unstable_dice_dump(
@@ -1657,13 +1807,13 @@ impl DaemonApi for BuckdServer {
         } = active_command;
 
         let this = self.0.dupe();
+        let req = req.into_inner();
         Ok(streaming(
-            req,
             event_source,
             state,
             dispatcher.dupe(),
             daemon_shutdown_channel,
-            move |req, _| {
+            move |_| {
                 async move {
                     let result = try {
                         spawn_allocative(
@@ -1768,7 +1918,11 @@ impl DaemonApi for BuckdServer {
              partial_result_dispatcher,
              _client_ctx,
              req: StreamingRequestHandler<LspRequest>| {
-                run_lsp_server_command(ctx, partial_result_dispatcher, req).boxed()
+                Box::pin(async move {
+                    (LSP_SERVER_COMMAND.get()?)
+                        .lsp(ctx, partial_result_dispatcher, req)
+                        .await
+                })
             },
         )
         .await
@@ -1893,6 +2047,101 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     }
 }
 
+/// A streaming command with its request, result and partial result types erased.
+///
+/// `run_streaming` is instantiated once per command, so anything it does directly is compiled
+/// once per command. Everything that does not need the concrete types lives behind this trait
+/// in `run_streaming_erased`; the per-command half should stay small.
+trait ErasedStreamingCommand: Send + 'static {
+    fn client_context(&self) -> buck2_error::Result<&ClientContext>;
+
+    fn build_options(&self) -> Option<&CommonBuildOptions>;
+
+    #[allow(clippy::result_large_err)]
+    fn pre_run(&self, server: &BuckdServer) -> Result<(), Status>;
+
+    fn triggers_idle_page_out(&self) -> bool;
+
+    fn prevents_background_cleanup(&self) -> bool;
+
+    fn starlark_profiler_configuration(
+        &self,
+        project_root: &ProjectRoot,
+    ) -> buck2_error::Result<StarlarkProfilerConfiguration>;
+
+    /// Runs the command. The partial result dispatcher is created here because its type is one
+    /// of the erased ones.
+    fn run<'b>(
+        self: Box<Self>,
+        context: &'b ServerCommandContext<'_>,
+        dispatch: EventDispatcher,
+    ) -> BoxFuture<'b, buck2_error::Result<command_result::Result>>;
+}
+
+struct StreamingCommand<Req, Res, PartialRes, Opts, F> {
+    req: Req,
+    opts: Opts,
+    func: F,
+    _types: PhantomData<fn() -> (Res, PartialRes)>,
+}
+
+impl<Req, Res, PartialRes, Opts, F> ErasedStreamingCommand
+    for StreamingCommand<Req, Res, PartialRes, Opts, F>
+where
+    F: for<'a> FnOnce(
+            &'a ServerCommandContext,
+            PartialResultDispatcher<PartialRes>,
+            Req,
+        ) -> BoxFuture<'a, buck2_error::Result<Res>>
+        + Send
+        + 'static,
+    Req: HasClientContext + HasBuildOptions + Send + Sync + 'static,
+    Res: Into<command_result::Result> + Send + 'static,
+    PartialRes: Into<partial_result::PartialResult> + Send + 'static,
+    Opts: StreamingCommandOptions<Req>,
+{
+    fn client_context(&self) -> buck2_error::Result<&ClientContext> {
+        self.req.client_context()
+    }
+
+    fn build_options(&self) -> Option<&CommonBuildOptions> {
+        self.req.build_options()
+    }
+
+    fn pre_run(&self, server: &BuckdServer) -> Result<(), Status> {
+        self.opts.pre_run(server)
+    }
+
+    fn triggers_idle_page_out(&self) -> bool {
+        self.opts.triggers_idle_page_out()
+    }
+
+    fn prevents_background_cleanup(&self) -> bool {
+        self.opts.prevents_background_cleanup()
+    }
+
+    fn starlark_profiler_configuration(
+        &self,
+        project_root: &ProjectRoot,
+    ) -> buck2_error::Result<StarlarkProfilerConfiguration> {
+        self.opts
+            .starlark_profiler_instrumentation_override(&self.req, project_root)
+    }
+
+    fn run<'b>(
+        self: Box<Self>,
+        context: &'b ServerCommandContext<'_>,
+        dispatch: EventDispatcher,
+    ) -> BoxFuture<'b, buck2_error::Result<command_result::Result>> {
+        let StreamingCommand { req, func, .. } = *self;
+        let partial_result_dispatcher =
+            PartialResultDispatcher::new(dispatch, context.cancellation_context().into());
+        func(context, partial_result_dispatcher, req)
+            .map_ok(Into::into)
+            .boxed()
+    }
+}
+
 fn server_shutdown_signal(
     command_receiver: UnboundedReceiver<()>,
     mut shutdown_receiver: UnboundedReceiver<tokio::time::Instant>,
@@ -1955,7 +2204,7 @@ fn spawn_shutdown_watchdog(in_process: bool, deadline: tokio::time::Instant) {
 
         // Clients read `buckd.stderr` to explain why the daemon went away, so make sure the
         // reason is on disk before we go.
-        tracing::warn!("Shutdown deadline exceeded, exiting");
+        eprintln!("Shutdown deadline exceeded, exiting");
         let _ignored = io::stderr().flush();
         buck2_util::pgo::flush_pgo_profile();
 
@@ -1982,7 +2231,7 @@ async fn inactivity_timeout(
         }
     };
 
-    tracing::warn!(
+    eprintln!(
         "inactivity timeout elapsed ({:?}), shutting down server",
         duration
     );
@@ -2006,7 +2255,7 @@ pub(crate) mod eden_health {
     use std::time::Duration;
 
     use buck2_core::fs::project::ProjectRoot;
-    use buck2_core::soft_error;
+    use buck2_core::soft_error_or_panic;
     use buck2_eden::connection::EdenConnectionManager;
     use buck2_eden::connection::EdenDaemonIdentity;
     use buck2_eden::error::EdenDaemonRestarted;
@@ -2028,7 +2277,17 @@ pub(crate) mod eden_health {
             let mut last_identity: Option<EdenDaemonIdentity> = None;
             loop {
                 tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL)).await;
-                match EdenConnectionManager::new(fb, &root, Some(semaphore::buck2_default())) {
+                let semaphore = match semaphore::buck2_default() {
+                    Ok(semaphore) => semaphore,
+                    Err(e) => {
+                        soft_error_or_panic!(
+                            "eden_health_check_setup_failed",
+                            e.context("EdenFS health check cannot be set up")
+                        );
+                        return;
+                    }
+                };
+                match EdenConnectionManager::new(fb, &root, Some(semaphore)) {
                     Ok(Some(conn)) => {
                         let info = conn
                             .with_eden(|eden| {
@@ -2042,7 +2301,7 @@ pub(crate) mod eden_health {
                                 let identity = EdenDaemonIdentity::from_daemon_info(&info);
                                 if let Some(last) = &last_identity {
                                     if !last.is_same_daemon(&identity) {
-                                        soft_error!(
+                                        soft_error_or_panic!(
                                             "eden_restart_detected",
                                             EdenDaemonRestarted {
                                                 old_pid: last.pid(),
@@ -2051,23 +2310,20 @@ pub(crate) mod eden_health {
                                                 new_start_time: identity.start_time(),
                                             }
                                             .into()
-                                        )
-                                        .ok();
+                                        );
                                     }
                                 }
                                 last_identity = Some(identity);
                             }
                             Err(e) if e.is_caused_by_hanging_mount() => {
-                                tracing::error!(
-                                    "check hit an EdenFS error caused by a hanging mount: {:#}",
-                                    e
-                                );
-                                soft_error!(
+                                soft_error_or_panic!(
                                     "eden_thrift_health_check_failed",
-                                    buck2_error!(buck2_error::ErrorTag::Input, "check failed with: {:#}", e),
-                                    quiet: true
-                                )
-                                .ok();
+                                    buck2_error!(
+                                        buck2_error::ErrorTag::Input,
+                                        "check failed with: {:#}",
+                                        e
+                                    )
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!("check failed with a non-hanging error: {:#}", e);
@@ -2082,13 +2338,14 @@ pub(crate) mod eden_health {
                     // Can occur for a number of reasons, including IO into the Eden mount failing.
                     // This _could_ signal a hanging mount, so we'll report a possible hang.
                     Err(e) => {
-                        tracing::error!("check failed to create an EdenFS client: {:#}", e);
-                        soft_error!(
+                        soft_error_or_panic!(
                             "eden_thrift_client_creation_failed",
-                            buck2_error!(buck2_error::ErrorTag::Input, "client creation failed with: {:#}", e),
-                            quiet: true
-                        )
-                        .ok();
+                            buck2_error!(
+                                buck2_error::ErrorTag::Input,
+                                "client creation failed with: {:#}",
+                                e
+                            )
+                        );
                     }
                 }
             }

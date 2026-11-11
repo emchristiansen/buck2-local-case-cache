@@ -31,10 +31,11 @@ use crate::heap_dump::HeapDumpCommand;
 use crate::hydration::HydrationCommand;
 use crate::internal_version::InternalVersionCommand;
 use crate::log_perf::LogPerfCommand;
-use crate::materialize::MaterializeCommand;
 use crate::paranoid::ParanoidCommand;
 use crate::persist_event_logs::PersistEventLogsCommand;
+use crate::recent_alloc_dump::RecentAllocDumpCommand;
 use crate::set_log_filter::SetLogFilterCommand;
+use crate::tenants::TenantsCommand;
 use crate::thread_dump::ThreadDumpCommand;
 use crate::trace_io::TraceIoCommand;
 use crate::upload_re_logs::UploadReLogsCommand;
@@ -54,10 +55,11 @@ mod heap_dump;
 mod hydration;
 mod internal_version;
 mod log_perf;
-mod materialize;
 mod paranoid;
 mod persist_event_logs;
+mod recent_alloc_dump;
 mod set_log_filter;
+mod tenants;
 mod thread_dump;
 mod trace_io;
 mod upload_re_logs;
@@ -68,6 +70,9 @@ pub enum DebugCommand {
     /// Deliberately crashes the Buck daemon, for testing purposes.
     Crash(CrashCommand),
     HeapDump(HeapDumpCommand),
+    /// Dumps jemalloc's recent-allocations ring (individual allocations with
+    /// sizes, alloc/free stacks, and lifetimes) to a JSON file.
+    RecentAllocDump(RecentAllocDumpCommand),
     /// Dumps allocator stat
     AllocatorStats(AllocatorStatsCommand),
     /// Dump the DICE graph to a file and saves it to disk.
@@ -80,8 +85,6 @@ pub enum DebugCommand {
     FlushDepFiles(FlushDepFilesCommand),
     /// Flush PGO profile data from the daemon to disk.
     FlushPgoProfile(FlushPgoProfileCommand),
-    /// Forces materialization of a path, even on the deferred materializer
-    Materialize(MaterializeCommand),
     // Upload RE logs given an RE session ID
     UploadReLogs(UploadReLogsCommand),
     /// Validates that Buck2 and disk agree on the state of files.
@@ -105,6 +108,8 @@ pub enum DebugCommand {
     /// targets.
     AnonTargets(AnonTargetsCommand),
     ThreadDump(ThreadDumpCommand),
+    /// List tenants currently registered in the daemon.
+    Tenants(TenantsCommand),
     /// Control DICE node value page-out / page-in.
     #[clap(subcommand)]
     Hydration(HydrationCommand),
@@ -122,12 +127,12 @@ impl DebugCommand {
             DebugCommand::DiceDump(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::Crash(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::HeapDump(cmd) => ctx.exec(cmd, matches, events_ctx),
+            DebugCommand::RecentAllocDump(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::AllocatorStats(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::InternalVersion(cmd) => cmd.exec(matches, ctx),
             DebugCommand::ChromeTrace(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::FlushDepFiles(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::FlushPgoProfile(cmd) => ctx.exec(cmd, matches, events_ctx),
-            DebugCommand::Materialize(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::UploadReLogs(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::DaemonDir(cmd) => cmd.exec(matches, ctx),
             DebugCommand::Exe(cmd) => cmd.exec(matches, ctx),
@@ -141,6 +146,7 @@ impl DebugCommand {
             DebugCommand::Eval(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::AnonTargets(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::ThreadDump(cmd) => cmd.exec(matches, ctx),
+            DebugCommand::Tenants(cmd) => ctx.exec(cmd, matches, events_ctx),
             DebugCommand::Hydration(cmd) => ctx.exec(cmd, matches, events_ctx),
         }
     }

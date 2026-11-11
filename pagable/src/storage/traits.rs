@@ -16,9 +16,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use dupe::Dupe;
 use either::Either;
 use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 
 use crate::arc_erase::ArcErase;
 use crate::arc_erase::ArcEraseDyn;
@@ -31,13 +33,44 @@ use crate::storage::data::PagableData;
 use crate::storage::support::SerializerForPaging;
 use crate::traits::StorageContext;
 
+/// Shards for the binding map. It changes mostly in bulk, at page-out and at
+/// the sweep after it, and page-ins of one key are already serialized by
+/// [`DeserializedArcCache::get_or_page_in`], so a few shards are enough and
+/// the rounding waste of many power-of-two tables is not paid.
+const SHARDS: usize = 64;
+
 /// Thread-safe cache of arcs keyed by `(TypeId, DataKey)`.
-/// `OnceCell` per deserialized entry ensures each arc is deserialized at most once.
-// TODO: Merge `map` and `resident`, and add eviction for resident values when
-// paged-in values can be paged out again.
+///
+/// Each key is bound to at most one allocation, held weakly: the cache hands
+/// out the identity every live referrer shares without keeping it resident.
+/// Once the allocation is dropped, the next page-in binds a fresh one and
+/// [`evict_expired`](Self::evict_expired) discards the stale entry.
+///
+/// A bound key costs its map bucket and the boxed weak, with no allocation of
+/// its own: a page-out of a large graph leaves millions of bindings behind.
 pub struct DeserializedArcCache {
-    map: DashMap<(TypeId, DataKey), Arc<OnceCell<Box<dyn ArcEraseDyn>>>>,
-    resident: DashMap<(TypeId, DataKey), Box<dyn WeakEraseDyn>>,
+    map: DashMap<(TypeId, DataKey), Slot>,
+}
+
+/// What a `(TypeId, DataKey)` holds: its binding, or the gate of the page-in
+/// about to bind it. Concurrent page-ins of one key wait on the gate, so the
+/// key deserializes at most once between them.
+enum Slot {
+    Bound(Box<dyn WeakEraseDyn>),
+    PagingIn(Arc<Mutex<()>>),
+}
+
+impl Slot {
+    fn live(&self) -> Option<Box<dyn ArcEraseDyn>> {
+        match self {
+            Slot::Bound(weak) => weak.upgrade(),
+            Slot::PagingIn(_) => None,
+        }
+    }
+
+    fn expired(&self) -> bool {
+        matches!(self, Slot::Bound(weak) if weak.is_expired())
+    }
 }
 
 /// Per-allocation serialization slots for one type view.
@@ -50,13 +83,49 @@ pub struct ArcSerCache {
     /// different wire formats, so each view needs a distinct slot. Partitioning
     /// by type also avoids storing a `TypeId` in every per-allocation key.
     by_type: TypeIdDashMap<Arc<IdentityDashMap>>,
+    /// Arcs written during this page-out, waiting to be bound to their key
+    /// until the rows the key depends on have committed. Bound earlier, a later
+    /// page-out would reference a row that a discarded queue never wrote.
+    /// Workers push here; `bind_covered` moves entries to `waiting` before it
+    /// scans them, so a scan of everything waiting never holds up a worker.
+    unbound: Mutex<Vec<UnboundArc>>,
+    waiting: Mutex<Vec<UnboundArc>>,
 }
+
+type UnboundArc = (Box<dyn ArcEraseDyn>, DataKey, WriteTicket);
 
 impl ArcSerCache {
     pub fn new() -> Self {
         Self {
             by_type: TypeIdDashMap::default(),
+            unbound: Mutex::new(Vec::new()),
+            waiting: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Removes and returns the written arcs whose rows `frontier` covers, for
+    /// the caller to bind with [`PagableStorage::associate_arc_with_data_key`].
+    pub fn take_covered(&self, frontier: &CommitFrontier) -> Vec<(Box<dyn ArcEraseDyn>, DataKey)> {
+        let mut waiting = self.waiting.lock();
+        waiting.append(&mut self.unbound.lock());
+        waiting
+            .extract_if(.., |(_, _, ticket)| frontier.covers(ticket))
+            .map(|(arc, key, _)| (arc, key))
+            .collect()
+    }
+
+    /// Binds every written arc whose rows `frontier` covers to its key.
+    pub fn bind_covered<S: PagableStorage + ?Sized>(&self, storage: &S, frontier: &CommitFrontier) {
+        for (arc, key) in self.take_covered(frontier) {
+            storage.associate_arc_with_data_key(&*arc, key);
+        }
+    }
+
+    /// Forgets the arcs still waiting to be bound, for a page-out whose queued
+    /// rows are being discarded.
+    pub fn discard_unbound(&self) {
+        self.unbound.lock().clear();
+        self.waiting.lock().clear();
     }
 
     fn by_identity(&self, type_id: TypeId) -> Arc<IdentityDashMap> {
@@ -109,31 +178,108 @@ impl<'a> ArcSerCacheLocal<'a> {
 impl DeserializedArcCache {
     pub fn new() -> Self {
         Self {
-            map: DashMap::new(),
-            resident: DashMap::new(),
+            map: DashMap::with_shard_amount(SHARDS),
         }
     }
 
+    /// The live allocation bound to `(type_id, key)`, if any.
     pub fn get(&self, type_id: &TypeId, key: &DataKey) -> Option<Box<dyn ArcEraseDyn>> {
-        // A live allocation may be retained by another resident object graph. Reusing an
-        // older deserialized allocation would mix pointer identities during one page-in.
-        if let Some(arc) = self
-            .resident
-            .get(&(*type_id, *key))
-            .and_then(|weak| weak.upgrade())
-        {
-            return Some(arc);
-        }
-        if let Some(arc) = self
-            .map
-            .get(&(*type_id, *key))
-            .and_then(|cell| cell.get().map(|v| v.clone_dyn()))
-        {
-            return Some(arc);
-        }
-        None
+        self.map.get(&(*type_id, *key))?.live()
     }
 
+    /// Returns the allocation bound to `(type_id, key)`, or binds the one
+    /// `page_in` produces. Concurrent callers for one key run `page_in` at most
+    /// once between them; the rest block and share its result.
+    pub fn get_or_page_in<E>(
+        &self,
+        type_id: TypeId,
+        key: DataKey,
+        page_in: impl FnOnce() -> Result<Box<dyn ArcEraseDyn>, E>,
+    ) -> Result<Box<dyn ArcEraseDyn>, E> {
+        let gate = Arc::new(Mutex::new(()));
+        // Locked before it is published and until the binding is, so waiters
+        // block on it and find the binding when they retry.
+        let held = gate.lock();
+        loop {
+            let replaced = match self.map.entry((type_id, key)) {
+                Entry::Occupied(mut occupied) => {
+                    if let Some(live) = occupied.get().live() {
+                        return Ok(live);
+                    }
+                    if let Slot::PagingIn(other) = occupied.get() {
+                        let other = other.dupe();
+                        drop(occupied);
+                        // Wait for the holder, then look again. Never this
+                        // thread's own gate: a key is the hash of its row,
+                        // nested keys included, so no value can reference
+                        // itself and `page_in` cannot reach the same key.
+                        drop(other.lock());
+                        continue;
+                    }
+                    Some(occupied.insert(Slot::PagingIn(gate.dupe())))
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(Slot::PagingIn(gate.dupe()));
+                    None
+                }
+            };
+            // Dropped outside the shard lock: a strong-as-weak binding frees its value.
+            drop(replaced);
+            break;
+        }
+        let result = page_in().map(|arc| self.bind_unless_live(type_id, key, arc));
+        if result.is_err() {
+            // Unless a page-out bound the key meanwhile, leave it to the next caller.
+            self.map.remove_if(
+                &(type_id, key),
+                |_, slot| matches!(slot, Slot::PagingIn(own) if Arc::ptr_eq(own, &gate)),
+            );
+        }
+        drop(held);
+        result
+    }
+
+    /// Binds `arc` to `(type_id, key)` and returns it, unless a live allocation
+    /// was bound meanwhile, in which case that one is returned instead: a
+    /// page-out registered it from a resident object graph, while nothing but
+    /// the caller holds `arc` yet. Keys are content hashes, so two allocations
+    /// of one key are not a fault, but handing out both would split identity.
+    fn bind_unless_live(
+        &self,
+        type_id: TypeId,
+        key: DataKey,
+        arc: Box<dyn ArcEraseDyn>,
+    ) -> Box<dyn ArcEraseDyn> {
+        let previous = match self.map.entry((type_id, key)) {
+            Entry::Occupied(mut occupied) => {
+                if let Some(live) = occupied.get().live() {
+                    drop(occupied);
+                    return live;
+                }
+                Some(occupied.insert(Slot::Bound(arc.downgrade())))
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Slot::Bound(arc.downgrade()));
+                None
+            }
+        };
+        // Dropped outside the shard lock: a strong-as-weak binding frees its value.
+        drop(previous);
+        arc
+    }
+
+    /// Replaces any earlier binding of `(type_id, key)`: the newest resident
+    /// allocation is the one live object graphs hold, so page-in must hand out
+    /// that identity rather than an older allocation that happens to survive.
+    fn bind(&self, type_id: TypeId, key: DataKey, arc: &dyn ArcEraseDyn) {
+        // Dropped outside the shard lock: a strong-as-weak binding frees its value.
+        let previous = self
+            .map
+            .insert((type_id, key), Slot::Bound(arc.downgrade()));
+        drop(previous);
+    }
+
+    /// Strong references to every live allocation of type `T` bound to a key.
     pub(crate) fn snapshot<T: ArcErase>(&self) -> Vec<T> {
         let type_id = TypeId::of::<T>();
         self.map
@@ -142,7 +288,7 @@ impl DeserializedArcCache {
                 if entry.key().0 != type_id {
                     return None;
                 }
-                let arc = entry.value().get()?;
+                let arc = entry.value().live()?;
                 Some(
                     arc.as_arc_any()
                         .downcast_ref::<T>()
@@ -153,45 +299,126 @@ impl DeserializedArcCache {
             .collect()
     }
 
+    /// Binds `arc` to `key` when `arc` records `key` as its stored
+    /// representation, so a later page-in of `key` reuses this allocation.
     pub fn register_resident(&self, key: DataKey, arc: &dyn ArcEraseDyn) {
         if arc.data_key() != Some(key) {
             return;
         }
-        if let Some(weak) = arc.downgrade() {
-            self.resident
-                .insert((arc.as_arc_any().type_id(), key), weak);
-        }
+        self.bind(arc.as_arc_any().type_id(), key, arc);
     }
 
-    /// Returns the `OnceCell` for this key, creating it if needed.
-    /// Use `cell.get_or_try_init(|| ...)` to deserialize at most once.
-    pub fn get_or_create_cell(
-        &self,
-        type_id: TypeId,
-        key: DataKey,
-    ) -> Arc<OnceCell<Box<dyn ArcEraseDyn>>> {
-        self.map
-            .entry((type_id, key))
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
+    /// Drops entries whose allocation is gone, or that the cache alone keeps
+    /// alive. A pass visits every entry, so this runs after a page-out or an
+    /// eviction, where values drop in bulk, not per command.
+    pub fn evict_expired(&self) {
+        // Dropping a strong-as-weak binding frees its value, which may leave
+        // the arcs inside it held by the cache alone, so passes repeat until
+        // one frees nothing.
+        while self.evict_expired_once() > 0 {}
+    }
+
+    /// One pass of [`Self::evict_expired`]; returns how many entries it dropped.
+    fn evict_expired_once(&self) -> usize {
+        // Removed in two steps: a page-in may rebind a key between them, and
+        // the bindings are dropped outside the shard locks, since dropping a
+        // strong-as-weak binding frees its value.
+        let expired: Vec<(TypeId, DataKey)> = self
+            .map
+            .iter()
+            .filter(|entry| entry.value().expired())
+            .map(|entry| *entry.key())
+            .collect();
+        let unbound: Vec<Slot> = expired
+            .into_iter()
+            .filter_map(|key| self.map.remove_if(&key, |_, slot| slot.expired()))
+            .map(|(_, slot)| slot)
+            .collect();
+        let dropped = unbound.len();
+        drop(unbound);
+        dropped
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
     }
 
     pub fn clear(&self) {
         self.map.clear();
-        self.resident.clear();
+    }
+}
+
+/// Where a stored row sits in its backend's commit order: a sequence number
+/// and the shards that must have committed past it. A row's ticket covers the
+/// rows it references too, so a value is durable once [`CommitFrontier::covers`]
+/// its ticket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteTicket {
+    shards: u64,
+    seq: u64,
+}
+
+impl WriteTicket {
+    /// A row the backend wrote through before returning, or one that already existed.
+    pub const DURABLE: WriteTicket = WriteTicket { shards: 0, seq: 0 };
+
+    /// Shards are a bit each; a backend with more must check this where it
+    /// chooses its shard count.
+    pub const MAX_SHARDS: usize = u64::BITS as usize;
+
+    /// The `seq`th row enqueued across the backend, landing in `shard`.
+    pub fn new(shard: usize, seq: u64) -> Self {
+        assert!(
+            shard < Self::MAX_SHARDS,
+            "write tickets track at most {} shards",
+            Self::MAX_SHARDS
+        );
+        WriteTicket {
+            shards: 1 << shard,
+            seq,
+        }
     }
 
-    pub fn on_arc_deserialized(
-        &self,
-        typeid: TypeId,
-        key: DataKey,
-        arc: Box<dyn ArcEraseDyn>,
-    ) -> Option<Box<dyn ArcEraseDyn>> {
-        let cell = self.get_or_create_cell(typeid, key);
-        match cell.set(arc) {
-            Ok(()) => None,
-            Err(_already_set) => cell.get().map(|v| v.clone_dyn()),
+    /// A ticket covered only when both are.
+    pub fn join(self, other: WriteTicket) -> WriteTicket {
+        WriteTicket {
+            shards: self.shards | other.shards,
+            seq: self.seq.max(other.seq),
         }
+    }
+}
+
+/// The backend's commit progress as of when it was taken: per shard, the
+/// sequence number below which every row has committed. Rows enqueued after
+/// the frontier was taken have larger sequence numbers and are never covered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFrontier {
+    committed_before: Vec<u64>,
+}
+
+impl CommitFrontier {
+    /// Everything ever enqueued has been committed, and always will have been.
+    pub fn everything() -> Self {
+        Self::new(Vec::new())
+    }
+
+    pub fn new(committed_before: Vec<u64>) -> Self {
+        CommitFrontier { committed_before }
+    }
+
+    /// Whether every row `ticket` depends on had committed when the frontier
+    /// was taken.
+    pub fn covers(&self, ticket: &WriteTicket) -> bool {
+        let mut shards = ticket.shards;
+        while shards != 0 {
+            let shard = shards.trailing_zeros() as usize;
+            shards &= shards - 1;
+            let committed_before = self.committed_before.get(shard).copied();
+            if committed_before.unwrap_or(u64::MAX) <= ticket.seq {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -208,8 +435,6 @@ impl DeserializedArcCache {
 /// - [`fetch_arc_or_data_blocking`](Self::fetch_arc_or_data_blocking): Try to fetch either
 ///   a cached deserialized arc or raw data synchronously
 /// - [`fetch_data`](Self::fetch_data): Fetch raw serialized data asynchronously
-/// - [`on_arc_deserialized`](Self::on_arc_deserialized): Hook called when an arc is deserialized,
-///   allowing storage to cache it
 /// - [`schedule_for_paging`](Self::schedule_for_paging): Schedule an arc for eviction to storage
 #[async_trait::async_trait]
 pub trait PagableStorage: Send + Sync + 'static {
@@ -244,19 +469,6 @@ pub trait PagableStorage: Send + Sync + 'static {
     /// Fetches raw serialized data asynchronously.
     async fn fetch_data(&self, key: &DataKey) -> anyhow::Result<Arc<PagableData>>;
 
-    /// Hook called when an arc is deserialized from data.
-    ///
-    /// Returns a cached arc if one already exists for this `(typeid, key)`,
-    /// otherwise caches the provided arc and returns `None`.
-    fn on_arc_deserialized(
-        &self,
-        typeid: TypeId,
-        key: DataKey,
-        arc: Box<dyn ArcEraseDyn>,
-    ) -> Option<Box<dyn ArcEraseDyn>> {
-        self.arc_cache().on_arc_deserialized(typeid, key, arc)
-    }
-
     /// Schedules a type-erased arc for background paging to storage.
     ///
     /// Called when a pagable arc becomes fully unpinned and eligible for eviction.
@@ -272,7 +484,24 @@ pub trait PagableStorage: Send + Sync + 'static {
     ///
     /// Implementations may buffer writes internally and defer the actual I/O
     /// until [`flush`](Self::flush) is called.
-    fn store_data(&self, data: PagableData) -> anyhow::Result<DataKey>;
+    fn store_data(&self, data: PagableData) -> anyhow::Result<DataKey> {
+        self.store_data_ticketed(data).map(|(key, _ticket)| key)
+    }
+
+    /// [`store_data`](Self::store_data), also returning where the row sits in
+    /// the backend's commit order. Backends that write through return
+    /// [`WriteTicket::DURABLE`].
+    fn store_data_ticketed(&self, data: PagableData) -> anyhow::Result<(DataKey, WriteTicket)>;
+
+    /// How far each shard's commits have progressed; see [`CommitFrontier`].
+    /// Backends that write through return [`CommitFrontier::everything`].
+    fn commit_frontier(&self) -> CommitFrontier;
+
+    /// Drops every row stored but not yet committed, cutting a write in
+    /// progress short at its next statement. Only sound while nothing refers
+    /// to those rows: no value evicted against them and no arc bound to them.
+    /// Backends that write through have nothing to drop.
+    fn discard_unwritten(&self);
 
     /// Commit any buffered writes to persistent storage.
     ///
@@ -308,6 +537,24 @@ pub trait PagableStorage: Send + Sync + 'static {
         finished: &ArcSerCache,
         storage_context: &StorageContext,
     ) -> Result<DataKey, PageOutError> {
+        let (key, _ticket) =
+            self.page_out_item_ticketed(item_data, item_arcs, finished, storage_context)?;
+        finished.bind_covered(self, &self.commit_frontier());
+        Ok(key)
+    }
+
+    /// [`page_out_item`](Self::page_out_item), also returning a ticket that
+    /// covers the item's row and every arc row it references, including those
+    /// another worker wrote during this page-out. The arcs it writes are left
+    /// in `finished` until the caller binds them with
+    /// [`ArcSerCache::bind_covered`] once their rows have committed.
+    fn page_out_item_ticketed(
+        &self,
+        item_data: Vec<u8>,
+        item_arcs: Vec<Box<dyn ArcEraseDyn>>,
+        finished: &ArcSerCache,
+        storage_context: &StorageContext,
+    ) -> Result<(DataKey, WriteTicket), PageOutError> {
         enum Task {
             Start {
                 arc: Box<dyn ArcEraseDyn>,
@@ -330,6 +577,12 @@ pub trait PagableStorage: Send + Sync + 'static {
             .map(|arc| cache.get_or_insert(&**arc))
             .collect();
 
+        // Pushed once per item: a page-out writes about twenty arc rows per
+        // value, and a push per arc from every worker contends on one lock.
+        // Holds every arc this item's row references, written here or by
+        // another item still in progress, so that once this item is handed
+        // back and its value evicted, nothing its row references is unbound.
+        let mut written = Vec::new();
         let mut tasks: Vec<Task> = item_arcs
             .iter()
             .zip(&item_slots)
@@ -343,15 +596,16 @@ pub trait PagableStorage: Send + Sync + 'static {
             match task {
                 Task::Start { arc, slot } => {
                     if !slot.try_claim() {
-                        if slot.wait().is_none() {
+                        let Some((key, ticket)) = slot.wait() else {
                             return Err(PageOutError::AlreadyFailed);
-                        }
+                        };
+                        written.push((arc, key, ticket));
                         continue;
                     }
 
                     if let Some(key) = arc.data_key() {
                         self.associate_arc_with_data_key(&*arc, key);
-                        slot.set_success(key);
+                        slot.set_success(key, WriteTicket::DURABLE);
                         continue;
                     }
 
@@ -360,7 +614,7 @@ pub trait PagableStorage: Send + Sync + 'static {
                         Ok(ArcSerializeOutcome::Serialized) => serializer.finish(),
                         Ok(ArcSerializeOutcome::ReuseDataKey(key)) => {
                             self.associate_arc_with_data_key(&*arc, key);
-                            slot.set_success(key);
+                            slot.set_success(key, WriteTicket::DURABLE);
                             continue;
                         }
                         Err(e) => {
@@ -395,9 +649,9 @@ pub trait PagableStorage: Send + Sync + 'static {
                     data,
                     child_slots,
                 } => match resolve_and_store(self, data, &child_slots) {
-                    Ok(key) => {
-                        self.associate_arc_with_data_key(&*arc, key);
-                        slot.set_success(key);
+                    Ok((key, ticket)) => {
+                        slot.set_success(key, ticket);
+                        written.push((arc, key, ticket));
                     }
                     Err(e) => {
                         slot.set_failed();
@@ -407,6 +661,9 @@ pub trait PagableStorage: Send + Sync + 'static {
             }
         }
 
+        if !written.is_empty() {
+            finished.unbound.lock().append(&mut written);
+        }
         resolve_and_store(self, item_data, &item_slots)
     }
 }
@@ -415,14 +672,20 @@ fn resolve_and_store(
     storage: &(impl PagableStorage + ?Sized),
     data: Vec<u8>,
     child_slots: &[Arc<ArcSerSlot>],
-) -> Result<DataKey, PageOutError> {
-    let keys: Option<Vec<DataKey>> = child_slots.iter().map(|slot| slot.wait()).collect();
-    let Some(keys) = keys else {
-        return Err(PageOutError::AlreadyFailed);
-    };
-    storage
-        .store_data(PagableData { data, arcs: keys })
-        .map_err(PageOutError::Failed)
+) -> Result<(DataKey, WriteTicket), PageOutError> {
+    let mut keys = Vec::with_capacity(child_slots.len());
+    let mut ticket = WriteTicket::DURABLE;
+    for slot in child_slots {
+        let Some((key, child_ticket)) = slot.wait() else {
+            return Err(PageOutError::AlreadyFailed);
+        };
+        keys.push(key);
+        ticket = ticket.join(child_ticket);
+    }
+    let (key, own) = storage
+        .store_data_ticketed(PagableData { data, arcs: keys })
+        .map_err(PageOutError::Failed)?;
+    Ok((key, ticket.join(own)))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -439,8 +702,9 @@ pub enum PageOutError {
 pub struct ArcSerSlot {
     /// Set to `true` by the first thread to claim this arc.
     claimed: AtomicBool,
-    /// `Some(key)` on success, `None` on failure.
-    result: OnceCell<Option<DataKey>>,
+    /// The key and the ticket covering the arc's row and its children on
+    /// success, `None` on failure.
+    result: OnceCell<Option<(DataKey, WriteTicket)>>,
 }
 
 impl ArcSerSlot {
@@ -457,13 +721,13 @@ impl ArcSerSlot {
     }
 
     /// Block until the result is available.
-    /// Returns `Some(key)` on success, `None` if serialization failed.
-    fn wait(&self) -> Option<DataKey> {
+    /// Returns the key and ticket on success, `None` if serialization failed.
+    fn wait(&self) -> Option<(DataKey, WriteTicket)> {
         *self.result.wait()
     }
 
-    fn set_success(&self, key: DataKey) {
-        let _ = self.result.set(Some(key));
+    fn set_success(&self, key: DataKey, ticket: WriteTicket) {
+        let _ = self.result.set(Some((key, ticket)));
     }
 
     fn set_failed(&self) {

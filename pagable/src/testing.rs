@@ -45,18 +45,18 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::PagableDeserializerRecipe;
-use crate::PageInScope;
 use crate::arc_erase::ArcEraseDyn;
 use crate::arc_erase::ArcSerializeOutcome;
 use crate::flavors::PagableSlice;
 use crate::flavors::PagableVecFlavor;
 use crate::flavors::SharedPosition;
-use crate::page_in_scope::ArcKey;
 use crate::storage::data::DataKey;
 use crate::storage::data::PagableData;
 use crate::storage::handle::PagableStorageHandle;
+use crate::storage::traits::CommitFrontier;
 use crate::storage::traits::DeserializedArcCache;
 use crate::storage::traits::PagableStorage;
+use crate::storage::traits::WriteTicket;
 use crate::traits::PagableCursor;
 use crate::traits::PagableDeserializer;
 use crate::traits::PagableSerializer;
@@ -162,7 +162,6 @@ pub struct TestingDeserializer<'de> {
     /// testing because arcs are deserialized inline from the byte stream.
     arc_index: usize,
     storage: PagableStorageHandle,
-    page_in_scope: PageInScope,
 }
 
 impl<'de> TestingDeserializer<'de> {
@@ -180,16 +179,11 @@ impl<'de> TestingDeserializer<'de> {
             seen_arcs: HashMap::new(),
             arc_index: 0,
             storage,
-            page_in_scope: PageInScope::new(DataKey::compute(0, bytes, &[])),
         }
     }
 
-    /// Construct a deserializer sharing an existing `Arc<[u8]>` and page-in scope.
-    pub(crate) fn from_bytes_arc(
-        bytes: &'de Arc<[u8]>,
-        storage: PagableStorageHandle,
-        page_in_scope: PageInScope,
-    ) -> Self {
+    /// Construct a deserializer sharing an existing `Arc<[u8]>`.
+    pub(crate) fn from_bytes_arc(bytes: &'de Arc<[u8]>, storage: PagableStorageHandle) -> Self {
         let pos = SharedPosition::new();
         Self {
             bytes_arc: bytes.dupe(),
@@ -198,7 +192,6 @@ impl<'de> TestingDeserializer<'de> {
             seen_arcs: HashMap::new(),
             arc_index: 0,
             storage,
-            page_in_scope,
         }
     }
 }
@@ -239,7 +232,6 @@ impl<'de> PagableDeserializer<'de> for TestingDeserializer<'de> {
             // First time - deserialize, store in map, return
             let recipe: Arc<dyn PagableDeserializerRecipe> = Arc::new(TestingRecipe {
                 bytes: self.bytes_arc.dupe(),
-                page_in_scope: self.page_in_scope.dupe(),
             });
             let arc = deserialize_fn(self, recipe)?;
             self.seen_arcs.insert((type_id, identity), arc.clone_dyn());
@@ -249,16 +241,12 @@ impl<'de> PagableDeserializer<'de> for TestingDeserializer<'de> {
 
     /// Arcs are identified inline in the byte stream here rather than by
     /// `DataKey`, so there is no key to hand out.
-    fn take_arc_key(&mut self) -> crate::Result<Option<ArcKey>> {
+    fn take_arc_key(&mut self) -> crate::Result<Option<DataKey>> {
         Ok(None)
     }
 
     fn storage(&self) -> PagableStorageHandle {
         self.storage.dupe()
-    }
-
-    fn page_in_scope(&self) -> &PageInScope {
-        &self.page_in_scope
     }
 
     fn as_dyn(&mut self) -> &mut dyn crate::traits::PagableDeserializer<'de> {
@@ -287,8 +275,6 @@ impl EmptyPagableStorage {
 #[derive(Allocative)]
 pub(crate) struct TestingRecipe {
     bytes: Arc<[u8]>,
-    #[allocative(skip)]
-    page_in_scope: PageInScope,
 }
 
 impl PagableDeserializerRecipe for TestingRecipe {
@@ -299,7 +285,6 @@ impl PagableDeserializerRecipe for TestingRecipe {
         Box::new(TestingDeserializer::from_bytes_arc(
             &self.bytes,
             storage.dupe(),
-            self.page_in_scope.dupe(),
         ))
     }
 
@@ -310,6 +295,12 @@ impl PagableDeserializerRecipe for TestingRecipe {
 
 #[async_trait::async_trait]
 impl PagableStorage for EmptyPagableStorage {
+    fn commit_frontier(&self) -> CommitFrontier {
+        CommitFrontier::everything()
+    }
+
+    fn discard_unwritten(&self) {}
+
     fn arc_cache(&self) -> &DeserializedArcCache {
         &self.arc_cache
     }
@@ -334,7 +325,7 @@ impl PagableStorage for EmptyPagableStorage {
         &self.storage_context
     }
 
-    fn store_data(&self, data: PagableData) -> anyhow::Result<DataKey> {
-        Ok(data.compute_key())
+    fn store_data_ticketed(&self, data: PagableData) -> anyhow::Result<(DataKey, WriteTicket)> {
+        Ok((data.compute_key(), WriteTicket::DURABLE))
     }
 }

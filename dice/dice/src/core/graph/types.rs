@@ -11,16 +11,15 @@
 //! Type definitions for objects relating to the Versioned Graph
 
 use dupe::Dupe;
-use gazebo::variants::UnpackVariants;
-use gazebo::variants::VariantName;
+use variant_name::VariantName;
 
 use crate::arc::Arc;
 use crate::core::graph::DiceCert;
 use crate::core::graph::revision::EpsilonToken;
 use crate::key::DiceKey;
-use crate::value::DiceComputedValue;
 use crate::value::DiceValidValue;
 use crate::value::MaybeResident;
+use crate::value::MaybeResidentComputedValue;
 use crate::versions::VersionNumber;
 
 /// The Key for a Versioned, incremental computation
@@ -50,21 +49,25 @@ pub(crate) struct Candidate {
 }
 
 /// The core state's answer to a lookup of a key at a version.
-///
-/// Both variants carry the revision of the key's untracked input at that version. An
-/// `Unknown` caller stamps it on the certificate it is about to write; a `Match` caller
-/// needs it only if the value turns out to be unreadable and it recomputes after all.
-#[derive(Debug, VariantName, UnpackVariants)]
+#[derive(Debug, VariantName)]
 pub(crate) enum VersionedGraphResult {
     /// The key resolves to `value` at the version.
-    Match {
-        value: DiceComputedValue,
-        epsilon: EpsilonToken,
-    },
+    Match { value: MaybeResidentComputedValue },
     /// The key does not resolve at the version. `candidate` is the nearest certificate the
     /// state retains for the key, if any.
     Unknown {
         candidate: Option<Candidate>,
+        /// The key's untracked-input revision, stamped on a newly computed certificate.
         epsilon: EpsilonToken,
     },
+}
+
+#[cfg(test)]
+impl VersionedGraphResult {
+    pub(crate) fn unpack_match(&self) -> Option<&MaybeResidentComputedValue> {
+        match self {
+            Self::Match { value } => Some(value),
+            Self::Unknown { .. } => None,
+        }
+    }
 }

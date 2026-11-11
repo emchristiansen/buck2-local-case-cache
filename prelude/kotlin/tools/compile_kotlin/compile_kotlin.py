@@ -7,6 +7,8 @@
 # above-listed licenses.
 
 
+from __future__ import annotations
+
 import argparse
 import os
 import pathlib
@@ -541,7 +543,8 @@ def _zip_recursive(archive_path: pathlib.Path, source_path: pathlib.Path):
         archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
     ) as z:
         z.write(source_path)
-        for f in source_path.glob("**/*"):
+        # Listing order differs between file systems, and the archive is content hashed.
+        for f in sorted(source_path.glob("**/*")):
             z.write(f)
 
 

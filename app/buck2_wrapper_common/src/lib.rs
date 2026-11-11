@@ -46,6 +46,8 @@ pub use process::async_background_command;
 pub use process::background_command;
 
 pub const BUCK2_WRAPPER_ENV_VAR: &str = "BUCK2_WRAPPER";
+/// Identifies the launching wrapper only when it matches the client's direct parent.
+pub const BUCK_WRAPPER_PID_ENV_VAR: &str = "BUCK_WRAPPER_PID";
 pub const BUCK_WRAPPER_UUID_ENV_VAR: &str = "BUCK_WRAPPER_UUID";
 pub const BUCK_WRAPPER_START_TIME_ENV_VAR: &str = "BUCK_WRAPPER_START_TIME";
 pub const BUCKD_LIFECYCLE: &str = "buckd.lifecycle";
@@ -130,17 +132,23 @@ impl KillallFilter {
 /// Returns `None` when the flag is absent (e.g. the isolation dir was supplied via
 /// the `BUCK_ISOLATION_DIR` env var, which does not appear in argv, or the process
 /// predates the flag being added to forkserver spawns).
+///
+/// Like clap, the last occurrence wins when the flag is given both before and after the
+/// subcommand, and arguments after `--` belong to the program being run, not to buck2.
 fn parse_isolation_dir(cmd: &[String]) -> Option<String> {
+    let mut isolation_dir = None;
     let mut args = cmd.iter();
     while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--isolation-dir=") {
-            return Some(value.to_owned());
+        if arg == "--" {
+            break;
         }
-        if arg == "--isolation-dir" {
-            return args.next().cloned();
+        if let Some(value) = arg.strip_prefix("--isolation-dir=") {
+            isolation_dir = Some(value.to_owned());
+        } else if arg == "--isolation-dir" {
+            isolation_dir = args.next().cloned();
         }
     }
-    None
+    isolation_dir
 }
 
 /// Get the list of all PIDs on Linux
@@ -512,9 +520,10 @@ mod tests {
         // Under OSS `cargo test` (all tests share one process, unlike buck's
         // per-test process isolation) a sibling test's `fork` can inherit the
         // write fd `fs::copy` briefly holds on `fake_buck2`, making `exec` fail
-        // with ETXTBSY until that fd clears. Retry past the window.
+        // with ETXTBSY until that fd clears, which is when the sibling's child
+        // execs. On a loaded runner that can take a while. Retry past the window.
         let mut child = None;
-        for _ in 0..100 {
+        for _ in 0..1000 {
             match background_command(&fake_buck2)
                 .args(["-c", "read _", "--isolation-dir=process-scan-test"])
                 .stdin(Stdio::piped())
@@ -554,6 +563,25 @@ mod tests {
                 .iter()
                 .all(|process| process.pid.to_u32() != current_pid),
             "scan should exclude the invoking process",
+        );
+    }
+
+    fn parse(cmd: &str) -> Option<String> {
+        parse_isolation_dir(&cmd.split(' ').map(str::to_owned).collect::<Vec<_>>())
+    }
+
+    /// The scan agrees with clap: the last `--isolation-dir` wins, and flags after `--` belong
+    /// to the program being run.
+    #[test]
+    fn test_parse_isolation_dir_takes_the_last_flag_before_double_dash() {
+        assert_eq!(
+            Some("b".to_owned()),
+            parse("buck2 --isolation-dir a build --isolation-dir b")
+        );
+        assert_eq!(None, parse("buck2 run //t -- --isolation-dir x"));
+        assert_eq!(
+            Some("a".to_owned()),
+            parse("buck2 --isolation-dir a run //t -- --isolation-dir x")
         );
     }
 }

@@ -152,8 +152,10 @@ impl<'v> StarlarkValue<'v> for Range {
 
     fn at(&self, index: Value, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let index = convert_index(index, self.length()?)?;
-        // Must not overflow if `length` is computed correctly
-        Ok(heap.alloc(self.start + self.step.get() * index))
+        // The element itself fits in `i32`, but `step * index` can leave the range
+        // on the way there, so compute in `i64` like `slice` and the iterator do.
+        let element = self.start as i64 + self.step.get() as i64 * index as i64;
+        Ok(heap.alloc(i32::try_from(element).map_err(|_| ValueError::IntegerOverflow)?))
     }
 
     fn equals(&self, other: Value) -> crate::Result<bool> {
@@ -172,28 +174,46 @@ impl<'v> StarlarkValue<'v> for Range {
         heap: Heap<'v>,
     ) -> crate::Result<Value<'v>> {
         let (start, stop, step) = convert_slice_indices(self.length()?, start, stop, stride)?;
-        return Ok(heap.alloc(Range {
-            start: self
-                .start
-                .checked_add(
-                    start
-                        .checked_mul(self.step.get())
-                        .ok_or(ValueError::IntegerOverflow)?,
-                )
-                .ok_or(ValueError::IntegerOverflow)?,
-            stop: self
-                .start
-                .checked_add(
-                    stop.checked_mul(self.step.get())
-                        .ok_or(ValueError::IntegerOverflow)?,
-                )
-                .ok_or(ValueError::IntegerOverflow)?,
-            step: NonZeroI32::new(
-                step.checked_mul(self.step.get())
-                    .ok_or(ValueError::IntegerOverflow)?,
-            )
-            .unwrap(),
-        }));
+        // The stop index is one past the last element, so the raw endpoint can leave `i32`
+        // although every element of the result is an element of `self`: compute in `i64` and
+        // build an equal range that fits.
+        let self_step = i64::from(self.step.get());
+        let first = i64::from(self.start) + i64::from(start) * self_step;
+        let end = i64::from(self.start) + i64::from(stop) * self_step;
+        let step = i64::from(step) * self_step;
+        let len = if step > 0 {
+            if end > first {
+                (end - first - 1) / step + 1
+            } else {
+                0
+            }
+        } else if first > end {
+            (first - end - 1) / (-step) + 1
+        } else {
+            0
+        };
+        let range = if len == 0 {
+            Range::new(0, 0, NonZeroI32::new(1).unwrap())
+        } else {
+            let last = first + (len - 1) * step;
+            let first = i32::try_from(first).map_err(|_| ValueError::IntegerOverflow)?;
+            let last = i32::try_from(last).map_err(|_| ValueError::IntegerOverflow)?;
+            if len == 1 {
+                if last < i32::MAX {
+                    Range::new(last, last + 1, NonZeroI32::new(1).unwrap())
+                } else {
+                    Range::new(last, last - 1, NonZeroI32::new(-1).unwrap())
+                }
+            } else {
+                let step = i32::try_from(step).map_err(|_| ValueError::IntegerOverflow)?;
+                // `last` is an element of `self` and `self.stop` lies beyond it, so this fits.
+                let stop = last
+                    .checked_add(step.signum())
+                    .ok_or(ValueError::IntegerOverflow)?;
+                Range::new(first, stop, NonZeroI32::new(step).unwrap())
+            }
+        };
+        Ok(heap.alloc(range))
     }
 
     unsafe fn iterate(&self, me: Value<'v>, _heap: Heap<'v>) -> crate::Result<Value<'v>> {
@@ -315,6 +335,34 @@ mod tests {
         assert_eq!(Some(5), range(10, 0, -2).length().ok());
         assert_eq!(Some(5), range(9, 0, -2).length().ok());
         assert_eq!(Some(1), range(4, 14, 10).length().ok());
+    }
+
+    /// A slice of a range near the `i32` limits is an equal range that fits.
+    #[test]
+    fn test_slice_near_i32_limits() {
+        assert::is_true("range(0, 2147483647, 2)[:] == range(0, 2147483647, 2)");
+        assert::eq("len(range(0, 2147483647, 2)[1:])", "1073741823");
+        assert::is_true("range(-2147483648, -2147483647)[::-1] == range(-2147483648, -2147483647)");
+        assert::eq("len(range(5, 5, 2)[::2147483647])", "0");
+        assert::eq("list(range(10)[2:8:3])", "[2, 5]");
+        assert::eq("list(range(10)[::-3])", "[9, 6, 3, 0]");
+        assert::eq("list(range(2147483646, 2147483647)[:])", "[2147483646]");
+        assert::eq("list(range(3, 10, 3)[1:2])", "[6]");
+    }
+
+    /// Indexing an element whose `step * index` product leaves `i32`, even though the
+    /// element itself is in range.
+    #[test]
+    fn test_at_near_i32_limits() {
+        assert::eq(
+            "range(-2000000000, 2000000000, 1000000)[3999]",
+            "1999000000",
+        );
+        assert::eq("range(-2147483648, 2147483647, 3)[1000000000]", "852516352");
+        assert::eq(
+            "range(2000000000, -2000000000, -1000000)[3999]",
+            "-1999000000",
+        );
     }
 
     #[test]

@@ -311,7 +311,7 @@ mod tests {
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
     use buck2_execute::digest_config::DigestConfig;
     use buck2_execute::execute::request::CommandExecutionPaths;
-    use sorted_vector_map::SortedVectorMap;
+    use buck2_hash::BuckFixedSortedMap;
 
     use super::*;
 
@@ -420,8 +420,8 @@ mod tests {
         fresh: &FreshDirs,
         extra_inputs: Vec<CommandExecutionInput>,
     ) -> CommandExecutionRequest {
-        let mut env: SortedVectorMap<String, String> = SortedVectorMap::new();
-        env.insert("OTHER".to_owned(), "1".to_owned());
+        let env: BuckFixedSortedMap<String, String> =
+            [("OTHER".to_owned(), "1".to_owned())].into_iter().collect();
         let inputs = fresh.input().into_iter().chain(extra_inputs).collect();
         let paths = CommandExecutionPaths::new(
             inputs,
@@ -559,8 +559,10 @@ mod tests {
                 None,
             )
             .unwrap();
-            let mut env: SortedVectorMap<String, String> = SortedVectorMap::new();
-            env.insert(name.to_owned(), "/elsewhere".to_owned());
+            let env: BuckFixedSortedMap<String, String> =
+                [(name.to_owned(), "/elsewhere".to_owned())]
+                    .into_iter()
+                    .collect();
             let request = CommandExecutionRequest::new(vec![], vec!["test".to_owned()], paths, env)
                 .with_scratch_dir_variables(a.variables());
             assert!(!a.admits(&request), "{name}");

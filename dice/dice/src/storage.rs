@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use allocative::Allocative;
@@ -39,9 +40,11 @@ use pagable::storage::handle::PagableStorageHandle;
 use pagable::storage::noop::NoopPagableStorage;
 use pagable::storage::support::SerializerForPaging;
 use pagable::storage::traits::ArcSerCache;
+use pagable::storage::traits::CommitFrontier;
 use pagable::storage::traits::DeserializedArcCache;
 use pagable::storage::traits::PagableStorage;
 use pagable::storage::traits::PageOutError;
+use pagable::storage::traits::WriteTicket;
 use pagable_storage::storage::sled::SledBackedPagableStorage;
 use pagable_storage::storage::sqlite::SqliteBackedPagableStorage;
 use serde::Deserialize;
@@ -55,13 +58,15 @@ use crate::key::DiceKey;
 use crate::key::DiceKeyErased;
 use crate::key_index::DiceKeyIndex;
 use crate::metrics::AllocWindow;
+use crate::metrics::EvictionSnapshot;
 use crate::metrics::PageInKeyTypeMetrics;
 use crate::metrics::PagingMemoryMetrics;
 use crate::metrics::PagingMemorySnapshot;
 use crate::value::DiceValidValue;
+use crate::value::HydratedValue;
 use crate::value::PageOutResult;
 
-/// On-disk backend for pagable DICE storage, from `buck2_hydration.pagable_storage_backend`.
+/// On-disk backend for pagable DICE storage, from `hydration.pagable_storage_backend`.
 #[derive(
     Allocative,
     Clone,
@@ -73,6 +78,7 @@ use crate::value::PageOutResult;
     PartialEq,
     Eq
 )]
+#[serde(rename_all = "snake_case")]
 pub enum PagableStorageBackend {
     /// SQLite database files.
     #[default]
@@ -81,6 +87,56 @@ pub enum PagableStorageBackend {
     Sled,
     /// Serializes but discards data (no I/O).
     Noop,
+}
+
+/// Which values a page-out writes, from `hydration.page_out_policy`.
+#[derive(
+    Allocative,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Dupe,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PageOutPolicy {
+    /// A key's value is paged out at most once: a value recomputed or read back
+    /// after a page-out stays resident, with no row to fall back on.
+    OncePerKey,
+    /// Each value is written at most once: a recomputed value is written by the
+    /// next page-out and stays resident, backed by its row, as does a value read
+    /// back from its row. A backed value can be evicted again without a write.
+    #[default]
+    OncePerValue,
+}
+
+/// When the values a page-out writes leave memory, from `hydration.eviction_policy`.
+#[derive(
+    Allocative,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Dupe,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionPolicy {
+    /// A page-out evicts the values it writes that were never paged out before;
+    /// the idle page-out after a command is where memory is given back.
+    OnIdle,
+    /// A page-out evicts nothing: what it writes stays resident, backed by its
+    /// row, until resource control sees memory pressure, which evicts every
+    /// backed value.
+    #[default]
+    OnMemoryPressure,
 }
 
 impl PagableStorageBackend {
@@ -155,6 +211,18 @@ pub struct DiceStorage {
     /// `soft_error`) instead of reporting 0. `Arc` so `dupe`d handles share one cache.
     #[allocative(skip)]
     cached_db_size_bytes: Arc<ArcSwap<Result<u64, Arc<std::io::Error>>>>,
+    /// Which values a page-out writes; see [`PageOutPolicy`].
+    page_out_policy: PageOutPolicy,
+    /// When the values a page-out writes leave memory; see [`EvictionPolicy`].
+    eviction_policy: EvictionPolicy,
+}
+
+/// What the core state is given about paging: where to record what paging moves, and which
+/// values a page-out writes. A `Dice` without storage never pages and has none.
+#[derive(Clone, Dupe)]
+pub(crate) struct PagingSetup {
+    pub(crate) memory: Arc<PagingMemoryMetrics>,
+    pub(crate) page_out_policy: PageOutPolicy,
 }
 
 impl DiceStorage {
@@ -168,6 +236,26 @@ impl DiceStorage {
             paging_memory: Arc::new(PagingMemoryMetrics::default()),
             path: None,
             cached_db_size_bytes: Arc::new(ArcSwap::new(Arc::new(Ok(0)))),
+            page_out_policy: PageOutPolicy::default(),
+            eviction_policy: EvictionPolicy::default(),
+        }
+    }
+
+    /// Sets which values a page-out writes; see [`PageOutPolicy`]. Only before the storage is
+    /// given to a `Dice`, whose core state reads the policy once.
+    pub fn set_page_out_policy(&mut self, policy: PageOutPolicy) {
+        self.page_out_policy = policy;
+    }
+
+    /// Sets when the values a page-out writes leave memory; see [`EvictionPolicy`].
+    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
+        self.eviction_policy = policy;
+    }
+
+    pub(crate) fn paging_setup(&self) -> PagingSetup {
+        PagingSetup {
+            memory: self.paging_memory.dupe(),
+            page_out_policy: self.page_out_policy,
         }
     }
 
@@ -177,7 +265,8 @@ impl DiceStorage {
         self.page_in_metrics.snapshot()
     }
 
-    pub(crate) fn storage_context(&self) -> &StorageContext {
+    /// Storage-scoped configuration and state for pagable value implementations.
+    pub fn storage_context(&self) -> &StorageContext {
         self.storage.storage_context()
     }
 
@@ -189,12 +278,6 @@ impl DiceStorage {
     /// was created.
     pub(crate) fn storage_io_snapshot(&self) -> StorageIoSnapshot {
         self.io_metrics.snapshot()
-    }
-
-    /// Shared with the core state thread so it can charge the memory that
-    /// evicting values actually releases.
-    pub(crate) fn paging_memory_metrics(&self) -> Arc<PagingMemoryMetrics> {
-        self.paging_memory.dupe()
     }
 
     /// Cumulative memory paging has moved, measured from the allocator.
@@ -265,6 +348,13 @@ impl DiceStorage {
         const CHUNK_SIZE: usize = 32768;
         let finished = Arc::new(ArcSerCache::new());
         let num_workers = env_concurrency("BUCK2_DICE_PAGE_OUT_WORKERS");
+        let pending = Arc::new(PendingEvictions::default());
+        let mut evictor = AbortOnDrop(tokio::spawn(evict_as_rows_commit(
+            self.dupe(),
+            finished.dupe(),
+            pending.dupe(),
+            state_handle.dupe(),
+        )));
 
         let mut remaining = keys;
         let mut worker_error = None;
@@ -296,55 +386,124 @@ impl DiceStorage {
                 let storage = self.dupe();
                 let finished = finished.clone();
                 let state_handle = state_handle.dupe();
+                let pending = pending.dupe();
                 handles.push(tokio::spawn(async move {
-                    storage.page_out_chunk(items, &finished, &state_handle, cancelled)
+                    storage.page_out_chunk(items, &finished, &state_handle, &pending, cancelled)
                 }));
             }
 
             // Join every worker even after a failure - abandoning one mid-chunk
             // would leave it writing and evicting concurrently with the flush
-            // below - and keep only the first error.
-            let mut chunk_error: Option<anyhow::Error> = None;
+            // below - and keep every error: they may have different root causes.
+            let mut chunk_errors: Vec<anyhow::Error> = Vec::new();
             for handle in handles {
                 let result = match handle.await {
                     Ok(result) => result,
                     Err(join_error) => Err(join_error.into()),
                 };
                 if let Err(e) = result {
-                    // The first failure is the one returned; the rest may have
-                    // different root causes, so they are logged, not dropped.
-                    if chunk_error.is_none() {
-                        chunk_error = Some(e);
-                    } else {
-                        tracing::warn!("additional page-out worker failure: {e:#}");
-                    }
+                    chunk_errors.push(e);
                 }
             }
-            if let Some(e) = chunk_error {
-                worker_error = Some(e);
+            if !chunk_errors.is_empty() {
+                worker_error = Some(if chunk_errors.len() == 1 {
+                    chunk_errors.pop().unwrap()
+                } else {
+                    anyhow::anyhow!(
+                        "{} page-out workers failed: {}",
+                        chunk_errors.len(),
+                        chunk_errors
+                            .iter()
+                            .map(|e| format!("{e:#}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )
+                });
                 break;
             }
         }
 
-        // Flushed on the error path too: workers evict keys as their writes
-        // land in the buffers, so returning without committing would leave
-        // keys marked paged out whose data the read path cannot see.
+        evictor.0.abort();
+        // Aborted, so the join reports cancellation; there is nothing to act on.
+        drop((&mut evictor.0).await);
+        if cancelled() {
+            // Rows committed by now may already back evicted values, so the
+            // arcs those rows hold are bound before anything is dropped; an
+            // arc can reach the unbound list after the tick that evicted a
+            // value referencing it. Nothing refers to the rows still queued,
+            // so dropping them hands the shards back to the command that
+            // cancelled us, instead of draining a queue it would have to
+            // read past. The frontier is taken before the discard, which
+            // makes the dropped rows look committed.
+            let committed = self.storage.commit_frontier();
+            self.storage.discard_unwritten();
+            bind_in_parallel(&self.storage, finished.take_covered(&committed)).await;
+            pending.clear();
+            finished.discard_unbound();
+        }
         let flushed = self.storage.flush();
-        self.storage.release_memory();
+        // Only rows the flush committed may be bound or evicted: after a failed
+        // flush the frontier still names the rows that never landed, and their
+        // values stay resident.
+        let frontier = self.storage.commit_frontier();
+        bind_in_parallel(&self.storage, finished.take_covered(&frontier)).await;
+        commit_in_batches(
+            state_handle,
+            pending.take_covered(&frontier),
+            self.eviction_policy,
+        );
+        // Evictions are fire-and-forget. The sweep must run after the core has
+        // processed every one, or the arcs of late evictions stay pinned until
+        // the next sweep. State requests are FIFO, so any round trip is the barrier.
+        let _ = state_handle.pagable_node_counts().await;
+        self.release_after_evictions();
         // The append-only store only changes here; refresh the cached size so the
         // command-end path reports it without a filesystem walk.
         self.refresh_db_size_bytes().await;
         if let Some(e) = worker_error {
-            // The worker error is the root cause and gets returned; the flush
-            // failure still decides whether the evicted keys' data committed,
-            // so it is logged, not dropped.
-            if let Err(flush_error) = flushed {
-                tracing::error!("flush after page-out worker failure also failed: {flush_error:#}");
-            }
-            return Err(e);
+            // The worker error is the root cause; the flush failure still decides
+            // whether the evicted keys' data committed, so it rides along.
+            return Err(match flushed {
+                Ok(()) => e,
+                Err(flush_error) => e.context(format!(
+                    "flush after page-out worker failure also failed: {flush_error:#}"
+                )),
+            });
         }
         flushed?;
         Ok(())
+    }
+
+    /// Drops the resident values a row already backs, one read back or written by an earlier
+    /// page-out, without writing anything: those backed when the call starts, not ones that
+    /// become backed while it runs. Returns how many values were evicted. Runs alongside
+    /// computations: a lookup of an evicted value reads it back.
+    pub(crate) async fn evict_backed(&self, state_handle: &CoreStateHandle) -> u64 {
+        // In batches of keys, so the core thread stays responsive between them.
+        const EVICT_BATCH_KEYS: usize = 1000;
+        // Bounded by what was backed at the start. Computations run meanwhile, and under
+        // `OncePerValue` each value one reads back is backed again by the next batch; evicting
+        // those would be evicting what is in use, and would never end while anything runs. They
+        // are left for the next eviction.
+        self.paging_memory.record_eviction();
+        let target = state_handle.pagable_node_counts().await.backed as u64;
+        let mut evicted = 0;
+        while evicted < target {
+            let batch = state_handle.evict_backed(EVICT_BATCH_KEYS).await;
+            if batch == 0 {
+                break;
+            }
+            evicted += batch;
+        }
+        self.release_after_evictions();
+        evicted
+    }
+
+    /// Frees what evictions the core has applied left behind: the backend's caches and the
+    /// arc-cache bindings whose values the evictions dropped.
+    fn release_after_evictions(&self) {
+        self.storage.release_memory();
+        self.storage.arc_cache().evict_expired();
     }
 
     fn page_out_chunk(
@@ -352,10 +511,9 @@ impl DiceStorage {
         items: Vec<(DiceKey, DiceKeyErased, DiceValidValue)>,
         finished: &ArcSerCache,
         state_handle: &CoreStateHandle,
+        pending: &PendingEvictions,
         cancelled: PageOutCancel,
     ) -> anyhow::Result<()> {
-        const EVICT_BATCH_SIZE: usize = 1000;
-        let mut pending_evictions = Vec::with_capacity(EVICT_BATCH_SIZE);
         // Candidates whose value could not be serialized; marked so they aren't
         // offered as page-out candidates again (until recomputed).
         let mut non_pageable = Vec::new();
@@ -365,20 +523,18 @@ impl DiceStorage {
             if cancelled() {
                 break;
             }
-            if let Some(data_key) = self.page_out_value(&key_dyn, &value, finished)? {
-                pending_evictions.push((
+            if let Some((data_key, serialized_bytes, ticket)) =
+                self.page_out_value(&key_dyn, &value, finished)?
+            {
+                pending.push(
                     dice_key,
                     PageOutResult {
                         serialized_value: value,
                         data_key,
+                        serialized_bytes,
                     },
-                ));
-                if pending_evictions.len() >= EVICT_BATCH_SIZE {
-                    state_handle.evict_keys(std::mem::replace(
-                        &mut pending_evictions,
-                        Vec::with_capacity(EVICT_BATCH_SIZE),
-                    ));
-                }
+                    ticket,
+                );
             } else {
                 non_pageable.push((dice_key, value));
             }
@@ -387,13 +543,7 @@ impl DiceStorage {
         // transaction a few thousand rows, and each commit rewrites every
         // index page it touched - the dominant page-out cost at scale
         // (measurements in the diff summary). Buffers rotate and commit at
-        // their byte bound, so transient memory stays bounded, and `page_out`
-        // flushes once at the end. Eviction never waited for durability, and
-        // the store is a content-addressed cache nothing references after a
-        // crash, so no ordering invariant is lost.
-        if !pending_evictions.is_empty() {
-            state_handle.evict_keys(pending_evictions);
-        }
+        // their byte bound, and `page_out` flushes once at the end.
         if !non_pageable.is_empty() {
             state_handle.mark_non_pageable(non_pageable);
         }
@@ -405,7 +555,7 @@ impl DiceStorage {
         key_dyn: &DiceKeyErased,
         value: &DiceValidValue,
         finished: &ArcSerCache,
-    ) -> anyhow::Result<Option<DataKey>> {
+    ) -> anyhow::Result<Option<(DataKey, u64, WriteTicket)>> {
         let storage_context = self.storage.storage_context();
         let mut serializer = SerializerForPaging::new(storage_context);
         let serialize_result = match key_dyn {
@@ -425,11 +575,12 @@ impl DiceStorage {
             Some(Err(e)) => Err(e),
             Some(Ok(())) => {
                 let (data, arcs) = serializer.finish();
+                let serialized_bytes = data.len() as u64;
                 match self
                     .storage
-                    .page_out_item(data, arcs, finished, storage_context)
+                    .page_out_item_ticketed(data, arcs, finished, storage_context)
                 {
-                    Ok(key) => Ok(Some(key)),
+                    Ok((data_key, ticket)) => Ok(Some((data_key, serialized_bytes, ticket))),
                     Err(PageOutError::Failed(e)) => Err(e),
                     Err(PageOutError::AlreadyFailed) => Ok(None),
                 }
@@ -462,8 +613,8 @@ impl DiceStorage {
                     .collect();
                 tokio::spawn(async move {
                     for (dice_key, key_dyn, data_key) in &items {
-                        let value = storage.hydrate(key_dyn, *data_key).await?;
-                        state_handle.rehydrate(*dice_key, *data_key, value);
+                        let hydrated = storage.hydrate(key_dyn, *data_key).await?;
+                        state_handle.rehydrate(*dice_key, *data_key, hydrated);
                     }
                     Ok::<_, anyhow::Error>(())
                 })
@@ -481,13 +632,17 @@ impl DiceStorage {
         self.paging_memory.nodes_paged_out()
     }
 
+    pub(crate) fn eviction_snapshot(&self) -> EvictionSnapshot {
+        self.paging_memory.eviction_snapshot()
+    }
+
     /// Deserialize the value at `data_key` back into a `DiceValidValue` via `key_dyn`'s
     /// `ValueSerialize`.
     pub(crate) async fn hydrate(
         &self,
         key_dyn: &DiceKeyErased,
         data_key: DataKey,
-    ) -> anyhow::Result<DiceValidValue> {
+    ) -> anyhow::Result<HydratedValue> {
         let fetch_start = Instant::now();
         let data = self.storage.fetch_data(&data_key).await?;
         let fetch_us = fetch_start.elapsed().as_micros() as u64;
@@ -534,7 +689,120 @@ impl DiceStorage {
             },
         );
 
-        Ok(DiceValidValue::from_arc(arc))
+        Ok(HydratedValue {
+            value: DiceValidValue::from_arc(arc),
+            serialized_bytes: bytes,
+        })
+    }
+}
+
+/// Values page-out workers have serialized, held until every row each one
+/// references has committed. Only then is the value evicted, so a row the
+/// storage never writes, after a failure, leaves its value resident rather
+/// than unreadable.
+#[derive(Default)]
+struct PendingEvictions {
+    /// Where workers push. The evictor moves entries to `waiting` before it
+    /// scans them, so a scan of everything waiting never holds up a worker.
+    incoming: parking_lot::Mutex<Vec<PendingEviction>>,
+    waiting: parking_lot::Mutex<Vec<PendingEviction>>,
+}
+
+type PendingEviction = (DiceKey, PageOutResult, WriteTicket);
+
+impl PendingEvictions {
+    fn push(&self, key: DiceKey, result: PageOutResult, ticket: WriteTicket) {
+        self.incoming.lock().push((key, result, ticket));
+    }
+
+    /// Drops every pending value, leaving them resident.
+    fn clear(&self) {
+        self.incoming.lock().clear();
+        self.waiting.lock().clear();
+    }
+
+    /// Removes and returns the values whose rows `frontier` says have committed.
+    fn take_covered(&self, frontier: &CommitFrontier) -> Vec<(DiceKey, PageOutResult)> {
+        let mut waiting = self.waiting.lock();
+        waiting.append(&mut self.incoming.lock());
+        waiting
+            .extract_if(.., |(_, _, ticket)| frontier.covers(ticket))
+            .map(|(key, result, _)| (key, result))
+            .collect()
+    }
+}
+
+/// Aborts the task it holds when dropped, so the evictor does not outlive a
+/// `page_out` that unwinds before stopping it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Binds written arcs and evicts pending values as their rows commit, so
+/// memory is released during the page-out rather than at its end. Runs until
+/// aborted; the sleep is the
+/// only await, so an abort never lands inside a tick.
+async fn evict_as_rows_commit(
+    storage: DiceStorage,
+    finished: Arc<ArcSerCache>,
+    pending: Arc<PendingEvictions>,
+    state_handle: CoreStateHandle,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let frontier = storage.storage.commit_frontier();
+        bind_in_parallel(&storage.storage, finished.take_covered(&frontier)).await;
+        commit_in_batches(
+            &state_handle,
+            pending.take_covered(&frontier),
+            storage.eviction_policy,
+        );
+    }
+}
+
+/// Binds arcs on the blocking pool, many at a time. A page-out writes tens of
+/// millions of arc rows; bound one task at a time they took longer to bind
+/// than to write.
+async fn bind_in_parallel(
+    storage: &Arc<dyn PagableStorage>,
+    mut covered: Vec<(Box<dyn ArcEraseDyn>, DataKey)>,
+) {
+    const BIND_CHUNK: usize = 1 << 16;
+    let mut tasks = Vec::with_capacity(covered.len().div_ceil(BIND_CHUNK));
+    while !covered.is_empty() {
+        let chunk = covered.split_off(covered.len().saturating_sub(BIND_CHUNK));
+        let storage = storage.dupe();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            for (arc, key) in chunk {
+                storage.associate_arc_with_data_key(&*arc, key);
+            }
+        }));
+    }
+    for task in tasks {
+        // A chunk only fails by panicking, and a panic in the binding of
+        // paged-out arcs is a bug in the page-out, not something to continue from.
+        if let Err(e) = task.await
+            && e.is_panic()
+        {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+}
+
+/// Sends committed rows in batches small enough to keep the core thread responsive.
+fn commit_in_batches(
+    state_handle: &CoreStateHandle,
+    mut keys: Vec<(DiceKey, PageOutResult)>,
+    eviction_policy: EvictionPolicy,
+) {
+    const COMMIT_BATCH_SIZE: usize = 1000;
+    while !keys.is_empty() {
+        let rest = keys.split_off(keys.len().min(COMMIT_BATCH_SIZE));
+        state_handle.commit_page_out(std::mem::replace(&mut keys, rest), eviction_policy);
     }
 }
 
@@ -646,11 +914,19 @@ impl PagableStorage for MeteredPagableStorage {
         self.inner.storage_context()
     }
 
-    fn store_data(&self, data: PagableData) -> anyhow::Result<DataKey> {
+    fn store_data_ticketed(&self, data: PagableData) -> anyhow::Result<(DataKey, WriteTicket)> {
         let bytes = data.data.len() as u64;
-        let key = self.inner.store_data(data)?;
+        let stored = self.inner.store_data_ticketed(data)?;
         self.metrics.record_out(bytes);
-        Ok(key)
+        Ok(stored)
+    }
+
+    fn commit_frontier(&self) -> CommitFrontier {
+        self.inner.commit_frontier()
+    }
+
+    fn discard_unwritten(&self) {
+        self.inner.discard_unwritten()
     }
 
     fn flush(&self) -> anyhow::Result<()> {
@@ -703,8 +979,11 @@ mod tests {
     use pagable::storage::support::SerializerForPaging;
     use pagable::storage::traits::ArcSerCache;
     use pagable::storage::traits::PagableStorage;
+    use pagable::storage::traits::WriteTicket;
 
+    use crate::storage::DiceStorage;
     use crate::storage::MeteredPagableStorage;
+    use crate::storage::PagableStorageBackend;
     use crate::storage::PageInMetrics;
     use crate::storage::PageInSample;
     use crate::storage::StorageIoMetrics;
@@ -785,6 +1064,34 @@ mod tests {
             a.restored_bytes, -500,
             "a negative record must cancel against a positive one"
         );
+    }
+
+    /// `DiceStorage` sees its backend only through the metering wrapper, so the
+    /// wrapper must pass commit tracking through or every row looks durable at once.
+    #[test]
+    fn metered_storage_forwards_commit_tracking() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = DiceStorage::open(dir.path(), PagableStorageBackend::Sqlite)?.storage;
+        let (_key, ticket) = storage.store_data_ticketed(PagableData {
+            data: vec![0u8; 10],
+            arcs: vec![],
+        })?;
+        assert_ne!(ticket, WriteTicket::DURABLE);
+        assert!(!storage.commit_frontier().covers(&ticket));
+        storage.flush()?;
+        assert!(storage.commit_frontier().covers(&ticket));
+
+        let (key, _ticket) = storage.store_data_ticketed(PagableData {
+            data: vec![1u8; 10],
+            arcs: vec![],
+        })?;
+        storage.discard_unwritten();
+        storage.flush()?;
+        assert!(
+            storage.fetch_data_blocking(&key).is_err(),
+            "the discard must reach the backend"
+        );
+        Ok(())
     }
 
     #[test]

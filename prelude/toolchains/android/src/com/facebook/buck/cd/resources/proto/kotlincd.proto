@@ -56,7 +56,9 @@ message KotlinExtraParams {
   string incrementalStateDir = 22;
   string languageVersion = 23;
   repeated string extraClassPathSnapshots = 24;
-  bool shouldKsp2RunIncrementally = 26;
+  reserved 26; // was shouldKsp2RunIncrementally, KSP2 always runs
+               // non-incrementally
+  reserved "shouldKsp2RunIncrementally";
   reserved 27; // was shouldKosabiJvmAbiGenUseK2, unused (kotlincd derives K2
                // from LanguageVersion.getSupportsK2())
   reserved 28;
@@ -68,6 +70,13 @@ message KotlinExtraParams {
   // from compileTimeClasspathPaths which contains the full dep set during
   // library builds.
   repeated string applicabilityClasspath = 31;
+  // Records only directly-referenced classes in Kosabi source-only ABI dep
+  // files, recursing into supertypes for the target's own supertype chain.
+  bool shouldKosabiUseShallowClassUsage = 32;
+  // How the K2 JVM ABI gen plugin reports ABI content repaired because a
+  // dependency was missing from the source-only ABI classpath: off, warn,
+  // or error (fails the compilation instead of emitting a knowingly-wrong ABI).
+  string kosabiAbiValidationMode = 33;
 }
 
 message PluginParams {

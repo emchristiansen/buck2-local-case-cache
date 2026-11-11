@@ -18,12 +18,13 @@ use buck2_build_api::interpreter::rule_defs::artifact::starlark_promise_artifact
 use buck2_build_api::interpreter::rule_defs::context::ANALYSIS_ACTIONS_METHODS_ANON_TARGET;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisActions;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::downstream_crate_starlark_defs::REGISTER_BUCK2_ANON_TARGETS_GLOBALS;
+use buck2_interpreter::execution_group::ExecutionGroupArg;
 use buck2_interpreter::starlark_promise::StarlarkPromise;
 use buck2_interpreter_for_build::rule::FrozenArtifactPromiseMappings;
-use buck2_interpreter_for_build::rule::FrozenStarlarkRuleCallable;
+use buck2_interpreter_for_build::rule::StarlarkRuleCallableUnpack;
 use dupe::Dupe;
-use gazebo::prelude::VecExt;
 use starlark::any::ProvidesStaticType;
 use starlark::codemap::FileSpan;
 use starlark::environment::GlobalsBuilder;
@@ -42,8 +43,8 @@ use starlark::values::ValueTyped;
 use starlark::values::dict::UnpackDictEntries;
 use starlark::values::list::AllocList;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
+use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
-use starlark_map::small_map::SmallMap;
 
 use crate::anon_targets::AnonTargetKey;
 use crate::anon_targets::AnonTargetsRegistry;
@@ -60,7 +61,7 @@ struct StarlarkAnonTarget<'v> {
     // Promise created by the anon rule
     promise: ValueTyped<'v, StarlarkPromise<'v>>,
     // Promised artifacts of the anon rule
-    artifacts: SmallMap<StringValue<'v>, PromiseArtifact>,
+    artifacts: BuckMutInsertionMap<StringValue<'v>, PromiseArtifact>,
     // Where the anon target was declared
     declaration_location: Option<FileSpan>,
 }
@@ -73,7 +74,7 @@ impl<'v> StarlarkAnonTarget<'v> {
         key: AnonTargetKey,
         registry: &mut AnonTargetsRegistry<'v>,
     ) -> buck2_error::Result<StarlarkAnonTarget<'v>> {
-        let mut artifacts_map = SmallMap::new();
+        let mut artifacts_map = BuckMutInsertionMap::new();
         if let Some(artifacts) = frozen_artifact_mappings {
             for (id, name) in artifacts.mappings.keys().enumerate() {
                 let artifact =
@@ -254,16 +255,21 @@ fn analysis_actions_methods_anon_target(builder: &mut MethodsBuilder) {
     fn anon_target<'v>(
         this: &AnalysisActions<'v>,
         // TODO(nga): this should be either positional or named, not both.
-        rule: ValueTyped<'v, FrozenStarlarkRuleCallable<'v>>,
+        rule: StarlarkRuleCallableUnpack<'v>,
         attrs: UnpackDictEntries<&'v str, Value<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAnonTarget<'v>> {
+        let exec_group = exec_group
+            .into_option()
+            .map(|ExecutionGroupArg { group }| group);
+        let rule = rule.frozen()?;
         let anon_target_promise = eval.heap().alloc_typed(StarlarkPromise::new_unresolved());
         let mut this = this.state()?;
         let this = &mut *this;
         let registry = AnonTargetsRegistry::downcast_mut(&mut **this.anon_targets)?;
         let owner_key = this.analysis_value_storage.self_key.owner();
-        let key = registry.anon_target_key(rule, attrs, owner_key)?;
+        let key = registry.anon_target_key(rule, attrs, owner_key, exec_group.as_ref())?;
         registry.register_one(anon_target_promise, key.dupe())?;
 
         Ok(StarlarkAnonTarget::new(
@@ -280,11 +286,15 @@ fn analysis_actions_methods_anon_target(builder: &mut MethodsBuilder) {
         this: &AnalysisActions<'v>,
         // TODO(nga): this should be either positional or named, not both.
         rules: UnpackListOrTuple<(
-            ValueTyped<'v, FrozenStarlarkRuleCallable<'v>>,
+            StarlarkRuleCallableUnpack<'v>,
             UnpackDictEntries<&'v str, Value<'v>>,
         )>,
+        #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<ExecutionGroupArg>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<StarlarkAnonTargets<'v>> {
+        let exec_group = exec_group
+            .into_option()
+            .map(|ExecutionGroupArg { group }| group);
         let mut this = this.state()?;
         let this = &mut *this;
         let registry = AnonTargetsRegistry::downcast_mut(&mut **this.anon_targets)?;
@@ -293,25 +303,32 @@ fn analysis_actions_methods_anon_target(builder: &mut MethodsBuilder) {
         let mut anon_targets = Vec::new();
         let mut promises_to_join = Vec::new();
         let owner_key = this.analysis_value_storage.self_key.owner();
-        rules.items.into_try_map(|(rule, attributes)| {
-            let key = registry.anon_target_key(rule, attributes, owner_key)?;
-            let anon_target_promise = eval.heap().alloc_typed(StarlarkPromise::new_unresolved());
+        rules
+            .items
+            .into_iter()
+            .map(|(rule, attributes)| {
+                let rule = rule.frozen()?;
+                let key =
+                    registry.anon_target_key(rule, attributes, owner_key, exec_group.as_ref())?;
+                let anon_target_promise =
+                    eval.heap().alloc_typed(StarlarkPromise::new_unresolved());
 
-            promises_to_join.push(anon_target_promise);
+                promises_to_join.push(anon_target_promise);
 
-            registry.register_one(anon_target_promise, key.dupe())?;
-            let anon_target = StarlarkAnonTarget::new(
-                declaration_location.dupe(),
-                anon_target_promise,
-                rule.artifact_promise_mappings(),
-                key.dupe(),
-                registry,
-            )?;
+                registry.register_one(anon_target_promise, key.dupe())?;
+                let anon_target = StarlarkAnonTarget::new(
+                    declaration_location.dupe(),
+                    anon_target_promise,
+                    rule.artifact_promise_mappings(),
+                    key.dupe(),
+                    registry,
+                )?;
 
-            anon_targets.push(anon_target);
+                anon_targets.push(anon_target);
 
-            buck2_error::Ok(key)
-        })?;
+                buck2_error::Ok(key)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(StarlarkAnonTargets {
             promise: StarlarkPromise::join(promises_to_join, eval.heap()),

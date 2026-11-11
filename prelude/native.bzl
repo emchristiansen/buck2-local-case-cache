@@ -11,6 +11,7 @@
 # This is buck2's shim import. Any public symbols here will be available within
 # **all** interpreted files.
 
+load("@prelude//:build_variants.bzl", "build_variants_macro")
 load("@prelude//:is_full_meta_repo.bzl", "is_full_meta_repo")
 load("@prelude//:paths.bzl", "paths")
 load("@prelude//:rules.bzl", __rules__ = "rules")
@@ -35,10 +36,8 @@ load("@prelude//cxx:cxx_toolchain_macro_layer.bzl", "cxx_toolchain_macro_impl")
 load("@prelude//cxx:cxx_toolchain_types.bzl", _cxx = "cxx")
 load("@prelude//erlang:erlang.bzl", _erlang_application = "erlang_application", _erlang_tests = "erlang_tests")
 load("@prelude//python:toolchain.bzl", _python = "python")
-load("@prelude//rust:link_info.bzl", "RustLinkInfo")
 load("@prelude//rust:rust_common.bzl", "rust_common_macro_wrapper")
 load("@prelude//rust:rust_library.bzl", "rust_library_macro_wrapper")
-load("@prelude//rust:sources.bzl", "RustSources")
 load("@prelude//rust:with_workspace.bzl", "with_rust_workspace")
 load("@prelude//user:all.bzl", _user_rules = "rules")
 load(
@@ -256,6 +255,9 @@ def _android_instrumentation_apk_macro_stub(cpu_filters = None, primary_dex_patt
     __rules__["android_instrumentation_apk"](cpu_filters = _get_valid_cpu_filters(cpu_filters), primary_dex_patterns = primary_dex_patterns, **kwargs)
 
 # export_file src defaults to name, despite being string vs source, so adjust it in the macros
+def _build_variants_macro_stub(**kwargs):
+    build_variants_macro(build_variants_rule = __rules__["build_variants"], **kwargs)
+
 def _export_file_macro_stub(name, src = None, **kwargs):
     __rules__["export_file"](name = name, src = name if src == None else src, **kwargs)
 
@@ -419,7 +421,7 @@ def _prebuilt_apple_xcframework_macro_stub(**kwargs):
         filegroup_rule = __rules__["filegroup"], genrule = __rules__["genrule"], prebuilt_apple_framework_rule = __rules__["prebuilt_apple_framework"], **kwargs
     )
 
-# TODO(cjhopman): These macro wrappers should be handled in prelude/rules.bzl+rule_impl.bzl.
+# TODO(cjhopman): These macro wrappers should be handled in prelude/rules.bzl.
 # Probably good if they were defined to take in the base rule that
 # they are wrapping and return the wrapped one.
 __extra_rules__ = {
@@ -439,6 +441,7 @@ __extra_rules__ = {
     "apple_universal_executable": _apple_universal_executable_macro_stub,
     "apple_watchos_bundle": _apple_watchos_bundle_macro_stub,
     "apple_xcuitest": _apple_xcuitest_macro_stub,
+    "build_variants": _build_variants_macro_stub,
     "configured_alias": _configured_alias_macro_stub,
     "cxx_toolchain": _cxx_toolchain_macro_stub,
     "cxx_toolchain_override": _cxx_toolchain_override_macro_stub,
@@ -477,11 +480,5 @@ __shimmed_native__.update(_user_rules)
 # Should come after the rules which are macro overridden
 __shimmed_native__.update(__extra_rules__)
 __shimmed_native__.update({"cxx": _cxx, "python": _python})
-__shimmed_native__.update({
-    "__internal_autodeps_hacks__": struct(
-        rust_link_info = RustLinkInfo,
-        rust_sources = RustSources,
-    ),
-})
 
 native = struct(**__shimmed_native__)

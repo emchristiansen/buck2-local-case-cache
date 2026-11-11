@@ -29,21 +29,32 @@ use serde::Serialize;
 
 /// Type which enfoces that its elements are sorted. That's it.
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Allocative,
-    Default,
-    Serialize,
-    Deserialize
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Allocative, Default, Serialize
 )]
 #[cfg_attr(feature = "pagable_dep", derive(Pagable))]
 pub struct SortedVec<T> {
     vec: Vec<T>,
+}
+
+impl<'de, T> Deserialize<'de> for SortedVec<T>
+where
+    T: Deserialize<'de> + Ord,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The wire shape of the derived `Serialize`; the input need not be sorted. Only serde
+        /// input is sorted here; the derived `Pagable` impl reads `vec` directly and never
+        /// goes through this impl.
+        #[derive(Deserialize)]
+        #[serde(rename = "SortedVec")]
+        struct Repr<T> {
+            vec: Vec<T>,
+        }
+        let Repr { vec } = Repr::<T>::deserialize(deserializer)?;
+        Ok(SortedVec::from(vec))
+    }
 }
 
 impl<T> SortedVec<T> {
@@ -98,12 +109,23 @@ impl<T> IntoIterator for SortedVec<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sorted_vec::SortedVec;
+
     /// Test `new_unchecked` panics in debug mode when the elements are not sorted.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic]
     fn test_new_unchecked() {
-        use crate::sorted_vec::SortedVec;
         SortedVec::new_unchecked(vec![1, 3, 2]);
+    }
+
+    #[test]
+    fn test_deserialize_sorts() {
+        assert_eq!(
+            serde_json::json!({"vec": [1, 2, 3]}),
+            serde_json::to_value(SortedVec::from(vec![3u32, 1, 2])).unwrap()
+        );
+        let v: SortedVec<u32> = serde_json::from_str(r#"{"vec": [3, 1, 2]}"#).unwrap();
+        assert_eq!(vec![1, 2, 3], v.iter().copied().collect::<Vec<_>>());
     }
 }

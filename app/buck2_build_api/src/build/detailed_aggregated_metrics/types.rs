@@ -46,7 +46,6 @@ pub struct AnalysisMetrics {
 #[derive(Clone)]
 pub struct TopLevelTargetSpec {
     pub label: ConfiguredProvidersLabel,
-    pub target: ConfiguredTargetNode,
     pub outputs: Arc<Vec<(ArtifactGroup, BuildProviderType)>>,
 }
 
@@ -54,6 +53,13 @@ pub struct TopLevelTargetSpec {
 pub struct PerBuildEvents {
     pub executed_actions: buck2_hash::BuckMutSet<ActionKey>,
     pub top_level_targets: Vec<TopLevelTargetSpec>,
+}
+
+/// Full configured graphs are needed only by detailed metrics. Recording a
+/// top-level build must not restore or retain them for the other consumers.
+pub(crate) struct DetailedMetricsInput {
+    pub executed_actions: buck2_hash::BuckMutSet<ActionKey>,
+    pub top_level_targets: Vec<(TopLevelTargetSpec, ConfiguredTargetNode)>,
 }
 
 #[derive(Default)]
@@ -201,7 +207,9 @@ impl TopLevelTargetAggregatedData {
                 self.local_max_memory_peak_bytes =
                     max(self.local_max_memory_peak_bytes, memory_peak);
             }
-            ActionExecutionKind::Remote | ActionExecutionKind::RemoteWorker => {
+            ActionExecutionKind::Remote
+            | ActionExecutionKind::RemoteWorker
+            | ActionExecutionKind::RemoteDeduplicated => {
                 self.remote_max_memory_peak_bytes =
                     max(self.remote_max_memory_peak_bytes, memory_peak);
             }
@@ -211,7 +219,8 @@ impl TopLevelTargetAggregatedData {
             | ActionExecutionKind::Deferred
             | ActionExecutionKind::LocalDepFile
             | ActionExecutionKind::RemoteDepFileCache
-            | ActionExecutionKind::LocalActionCache => {
+            | ActionExecutionKind::LocalActionCache
+            | ActionExecutionKind::RemoteServedFromCache => {
                 // ignore
             }
             ActionExecutionKind::LocalTestResultCache => {
@@ -260,12 +269,14 @@ impl AggregatedBuildMetrics {
                     self.local_executions += factor;
                 }
                 buck2_data::ActionExecutionKind::Remote
-                | buck2_data::ActionExecutionKind::RemoteWorker => {
+                | buck2_data::ActionExecutionKind::RemoteWorker
+                | buck2_data::ActionExecutionKind::RemoteDeduplicated => {
                     self.remote_execution_time_ms += factor * (ev.execution_time_ms as f64);
                     self.remote_executions += factor;
                 }
                 buck2_data::ActionExecutionKind::ActionCache
-                | buck2_data::ActionExecutionKind::RemoteDepFileCache => {
+                | buck2_data::ActionExecutionKind::RemoteDepFileCache
+                | buck2_data::ActionExecutionKind::RemoteServedFromCache => {
                     self.remote_cache_hits += factor;
                 }
                 buck2_data::ActionExecutionKind::LocalTestResultCache => {

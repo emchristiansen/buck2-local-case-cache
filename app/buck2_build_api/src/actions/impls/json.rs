@@ -12,9 +12,9 @@ use std::io::Write;
 use std::io::sink;
 use std::sync::Arc;
 
+use buck2_artifact::artifact::artifact_dyn::ArtifactDyn;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_error::BuckErrorContext;
-use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_hash::BuckMutMap;
 use buck2_interpreter::types::cell_path::StarlarkCellPath;
@@ -45,6 +45,7 @@ use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use crate::interpreter::rule_defs::cmd_args::FrozenStarlarkCmdArgs;
+use crate::interpreter::rule_defs::cmd_args::InputProperties;
 use crate::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use crate::interpreter::rule_defs::cmd_args::path_format;
 use crate::interpreter::rule_defs::cmd_args::path_format_absolute;
@@ -88,6 +89,18 @@ impl<'a, 'v> SerializeValue<'a, 'v> {
                     absolute: self.absolute,
                     artifact_path_mapping: self.artifact_path_mapping,
                 }),
+        }
+    }
+}
+
+/// Serializes a value, or fails the serialization with the error that stood in for it.
+pub(crate) struct SerializeOrFail<T>(pub(crate) buck2_error::Result<T>);
+
+impl<T: Serialize> Serialize for SerializeOrFail<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.0 {
+            Ok(value) => value.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!("{e:#}"))),
         }
     }
 }
@@ -168,9 +181,11 @@ impl<'a, 'v> Serialize for SerializeValue<'a, 'v> {
                     // Skip validation when fs == None because it can be expensive.
                     // TransitiveSet::new already did validate_json for projected values.
                     None => serializer.collect_seq(std::iter::empty::<u8>()),
-                    Some(_) => {
-                        serializer.collect_seq(err(x.iter_values())?.map(|v| self.with_value(v)))
-                    }
+                    Some(_) => serializer.collect_seq(
+                        err(x.collect_values())?
+                            .into_iter()
+                            .map(|v| self.with_value(v)),
+                    ),
                 }
             }
             JsonUnpack::TargetLabel(x) => {
@@ -355,6 +370,7 @@ pub fn visit_json_artifacts<'v>(
         }
         JsonUnpack::TransitiveSetJsonProjection(x) => visitor.visit_input(
             ArtifactGroup::TransitiveSetProjection(Arc::new(x.to_projection_key_wrapper()?)),
+            InputProperties::default(),
             vec![],
         ),
         JsonUnpack::Artifact(_x) => {

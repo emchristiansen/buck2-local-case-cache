@@ -98,7 +98,7 @@ pub struct TActionResult2 {
     pub stdout_digest: Option<TDigest>,
     pub stderr_raw: Option<Vec<u8>>,
     pub stderr_digest: Option<TDigest>,
-    pub execution_metadata: TExecutedActionMetadata,
+    pub execution_metadata: Box<TExecutedActionMetadata>,
     pub auxiliary_metadata: Vec<TAny>,
     pub output_symlinks: Vec<TSymlink>,
     // Compatibility with the Thrift structs
@@ -254,7 +254,16 @@ pub struct NoAgentAvailableTaskState {}
 pub struct CancelledTaskState {}
 
 #[derive(Clone, Default)]
-pub struct OverQuotaTaskState {}
+pub struct OverQuotaTaskState {
+    pub exceeded_quotas: Vec<ExceededQuota>,
+}
+
+#[derive(Clone, Default)]
+pub struct ExceededQuota {
+    pub name: String,
+    pub limit: i64,
+    pub used: i64,
+}
 
 #[derive(Clone, Default)]
 pub struct WaitingOnReservationTaskState {}

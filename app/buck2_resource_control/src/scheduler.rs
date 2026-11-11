@@ -203,6 +203,8 @@ pub(crate) struct Scheduler {
     /// At any given time, we're either considering increasing or decreasing parallelism. This
     /// indicates which.
     current_intent: CurrentIntent,
+    /// Memory pressure as reported outside the scheduler; see [`Self::under_memory_pressure`].
+    memory_pressure: bool,
     /// Tracks wake-side hysteresis only. Suspend timing maintains its own state.
     last_parallelism_increase_time: Instant,
     /// Current best estimate for the maximum amount of memory we can use.
@@ -222,6 +224,20 @@ pub(crate) struct Scheduler {
     /// Tags that are always present on every event (set at init time)
     base_tags: Vec<String>,
     next_scene_id: SceneId,
+}
+
+/// Closes the open suspension, if any, into the scene's counters.
+impl SuspendedScene {
+    fn record_suspension_end(&mut self, now: Instant) {
+        if let Some(suspend_start) = self.suspend_start.take() {
+            let suspend_elapsed = now - suspend_start;
+            self.scene.suspend_duration = Some(match self.scene.suspend_duration {
+                Some(duration) => duration + suspend_elapsed,
+                None => suspend_elapsed,
+            });
+            self.scene.suspend_count += 1;
+        }
+    }
 }
 
 impl Scheduler {
@@ -267,10 +283,13 @@ impl Scheduler {
         daemon_id: &DaemonId,
         now: Instant,
     ) -> Self {
-        let estimated_memory_cap = effective_resource_constraints
-            .memory_high
-            .or(effective_resource_constraints.memory_max)
-            .unwrap_or(system_memory_max);
+        let estimated_memory_cap = match (
+            effective_resource_constraints.memory_high,
+            effective_resource_constraints.memory_max,
+        ) {
+            (Some(high), Some(max)) => high.min(max),
+            (high, max) => high.or(max).unwrap_or(system_memory_max),
+        };
         let mut base_tags = Vec::new();
         if enable_suspension {
             base_tags.push("suspension:enabled".to_owned());
@@ -290,6 +309,7 @@ impl Scheduler {
             running_scenes: Vec::new(),
             suspended_scenes: VecDeque::new(),
             current_intent: CurrentIntent::Increase,
+            memory_pressure: false,
             last_parallelism_increase_time: now,
             estimated_memory_cap,
             allprocs_memory_current: Timeseries::new(Duration::from_secs(60), now, 0.0),
@@ -392,13 +412,22 @@ impl Scheduler {
             .iter()
             .position(|cg| cg.scene.scene_id == scene_id.as_ref())
         {
-            let cgroup = self.suspended_scenes.remove(i).unwrap();
+            let mut cgroup = self.suspended_scenes.remove(i).unwrap();
             // Command can finish after freezing a cgroup either because freezing may take some time
             // or because we started freezing after the command finished.
+            cgroup.record_suspension_end(now);
             SceneResult::from_info(&cgroup.scene)
         } else {
             unreachable!("Scene disappeared!")
         }
+    }
+
+    /// Whether the system is under memory pressure: on once the short-term pressure average
+    /// rises, off only once both the short- and the long-term average have eased. Latched apart
+    /// from the intent, which flips back and forth while the long-term average catches up with
+    /// sustained pressure; each onset reported here starts an eviction.
+    pub(crate) fn under_memory_pressure(&self) -> bool {
+        self.memory_pressure
     }
 
     pub(crate) fn update(
@@ -479,6 +508,18 @@ impl Scheduler {
         match self.current_intent {
             CurrentIntent::Decrease => self.maybe_decrease_running_count(now),
             CurrentIntent::Increase => self.maybe_increase_running_count(now),
+        }
+
+        let avg5 = self
+            .allprocs_memory_pressure
+            .average_over_last(Duration::from_secs(5));
+        let avg30 = self
+            .allprocs_memory_pressure
+            .average_over_last(Duration::from_secs(30));
+        if !self.memory_pressure && avg5 > 10.0 {
+            self.memory_pressure = true;
+        } else if self.memory_pressure && avg5 < 5.0 && avg30 < 5.0 {
+            self.memory_pressure = false;
         }
 
         // Update dynamic tags based on current state
@@ -619,16 +660,7 @@ impl Scheduler {
             return;
         };
 
-        if let Some(suspend_start) = suspended_cgroup.suspend_start {
-            let suspend_elapsed = now - suspend_start;
-
-            suspended_cgroup.scene.suspend_duration =
-                Some(match suspended_cgroup.scene.suspend_duration {
-                    Some(duration) => duration + suspend_elapsed,
-                    None => suspend_elapsed,
-                });
-            suspended_cgroup.scene.suspend_count += 1;
-        }
+        suspended_cgroup.record_suspension_end(now);
 
         let (running_cgroup, event_kind) =
             wake_scene(suspended_cgroup.scene, suspended_cgroup.wake_implementation);
@@ -778,6 +810,67 @@ mod tests {
         fn secs(&self, n: u64) -> Instant {
             self.0 + Duration::from_secs(n)
         }
+    }
+
+    /// A scene that finishes while it is suspended counts that suspension in its result like a scene
+    /// that was woken.
+    #[test]
+    fn test_scene_finished_while_suspended() {
+        let (mut scheduler, timeline) = TestTimeline::new();
+        let pressure = MemoryReading {
+            allprocs_memory_current: 10000,
+            allprocs_swap_current: 0,
+            allprocs_memory_pressure: 80.0,
+            daemon_memory_current: 8000,
+            daemon_swap_current: 0,
+            time_collected: SystemTime::now(),
+        };
+        scheduler.update(pressure, UpdateBuilder::new().build(), timeline.secs(0));
+        scheduler.update(pressure, UpdateBuilder::new().build(), timeline.secs(60));
+        let desc = || SceneDescription {
+            command_type: CommandType::Build,
+            action_digest: None,
+        };
+        let (scene1, mut start1) = scheduler.scene_started(desc(), false);
+        let (scene2, mut start2) = scheduler.scene_started(desc(), false);
+        let _kill1 = start1.0.try_recv().unwrap().0;
+        let mut kill2 = start2.0.try_recv().unwrap().0;
+        scheduler.update(
+            pressure,
+            UpdateBuilder::new()
+                .add(scene1.as_ref(), 2)
+                .add(scene2.as_ref(), 3)
+                .build(),
+            timeline.secs(100),
+        );
+        assert!(kill2.0.try_recv().is_ok(), "scene2 is suspended at t=100");
+        // The action had completed when the kill arrived; the executor reports it at t=110.
+        let res = scheduler.scene_finished(scene2, timeline.secs(110));
+        assert_eq!(res.suspend_count, 1);
+        assert_eq!(res.suspend_duration, Some(Duration::from_secs(10)));
+        scheduler.scene_finished(scene1, timeline.secs(120));
+    }
+
+    /// The initial memory cap is the smaller of the ancestor `memory.high` and `memory.max`.
+    #[test]
+    fn test_initial_cap_with_high_above_max() {
+        let now = Instant::now();
+        let scheduler = Scheduler::new(
+            true,
+            ExperimentalAlgoVariant::new(None),
+            ActionSuspendStrategy::KillAndRetry,
+            Box::new(InflatedCurrentPressureForecast),
+            Box::new(SpreadHalfSuspendTiming::new()),
+            EffectiveResourceConstraints {
+                memory_high: Some(32 << 30),
+                memory_max: Some(16 << 30),
+                ..Default::default()
+            },
+            64 << 30,
+            &DaemonId::new(),
+            now,
+        );
+        assert_eq!(scheduler.estimated_memory_cap, 16 << 30);
     }
 
     #[test]
@@ -1008,6 +1101,66 @@ mod tests {
             &[(60, 0.0), (after_duration, second_level)],
             expect_kill,
         )
+    }
+
+    /// The pressure signal turns on once at the onset of sustained pressure, stays on through
+    /// the intent's flapping while the long-term average catches up and through short dips, and
+    /// turns off once after pressure has subsided; at the production sampling cadence.
+    #[test]
+    fn test_memory_pressure_signal_latches_per_episode() {
+        let (mut scheduler, timeline) = TestTimeline::new();
+        let reading = |level: f64| MemoryReading {
+            allprocs_memory_pressure: level,
+            allprocs_swap_current: 0,
+            allprocs_memory_current: 0,
+            daemon_memory_current: 0,
+            daemon_swap_current: 0,
+            time_collected: SystemTime::now(),
+        };
+        let mut now_ms = 0;
+        let mut was_on = false;
+        // Runs `seconds` of `level` at a 300ms cadence, returning the (rising, falling) edges.
+        let mut run = |scheduler: &mut Scheduler, level: f64, seconds: u64| {
+            let (mut rising, mut falling) = (0, 0);
+            for _ in 0..(seconds * 1000 / 300) {
+                scheduler.update(
+                    reading(level),
+                    UpdateBuilder::new().build(),
+                    timeline.0 + Duration::from_millis(now_ms),
+                );
+                now_ms += 300;
+                let on = scheduler.under_memory_pressure();
+                match (was_on, on) {
+                    (false, true) => rising += 1,
+                    (true, false) => falling += 1,
+                    _ => {}
+                }
+                was_on = on;
+            }
+            (rising, falling)
+        };
+        assert_eq!(run(&mut scheduler, 0.0, 10), (0, 0));
+        assert_eq!(
+            run(&mut scheduler, 12.0, 40),
+            (1, 0),
+            "steady pressure is one onset, however often the intent flips"
+        );
+        assert_eq!(
+            run(&mut scheduler, 0.0, 8),
+            (0, 0),
+            "a dip shorter than the long-term window is not the end of the episode"
+        );
+        assert_eq!(run(&mut scheduler, 12.0, 10), (0, 0));
+        assert_eq!(
+            run(&mut scheduler, 0.0, 40),
+            (0, 1),
+            "the episode ends once both averages have eased"
+        );
+        assert_eq!(
+            run(&mut scheduler, 50.0, 6),
+            (1, 0),
+            "a new episode is a new onset"
+        );
     }
 
     #[test]

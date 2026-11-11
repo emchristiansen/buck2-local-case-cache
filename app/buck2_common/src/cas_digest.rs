@@ -15,6 +15,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
 use std::marker::PhantomData;
+use std::str;
 
 use allocative::Allocative;
 use derivative::Derivative;
@@ -33,7 +34,10 @@ use strong_hash::StrongHash;
 
 pub use crate::cas_digest::interner::DigestInterner;
 pub use crate::cas_digest::interner::DigestInternerStats;
+pub use crate::cas_digest::interner::StashRecord;
+pub use crate::cas_digest::interner::SweepStats;
 pub use crate::cas_digest::interner::TrackedFileDigest;
+pub use crate::cas_digest::interner::Verdict;
 pub use crate::cas_digest::interner::file_digest_interner;
 pub use crate::cas_digest::interner::file_digest_interner_stats;
 
@@ -103,10 +107,35 @@ impl RawDigest {
     }
 }
 
+impl fmt::Debug for RawDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 impl fmt::Display for RawDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.as_bytes()))
+        match self {
+            Self::Sha1(x) => fmt_hex::<SHA1_SIZE, { SHA1_SIZE * 2 }>(x, f),
+            Self::Sha256(x) => fmt_hex::<SHA256_SIZE, { SHA256_SIZE * 2 }>(x, f),
+            Self::Blake3(x) | Self::Blake3Keyed(x) => {
+                fmt_hex::<BLAKE3_SIZE, { BLAKE3_SIZE * 2 }>(x, f)
+            }
+        }
     }
+}
+
+/// Hex-encodes `bytes` into a stack buffer, honoring the formatter's fill, alignment, width and
+/// precision like `str` does. `HEX_LEN` must be `N * 2`; the compiler enforces it.
+fn fmt_hex<const N: usize, const HEX_LEN: usize>(
+    bytes: &[u8; N],
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    const { assert!(HEX_LEN == N * 2) };
+    let mut encoded = [0u8; HEX_LEN];
+    hex::encode_to_slice(bytes, &mut encoded)
+        .expect("should fit: the buffer is exactly twice the digest length");
+    f.pad(str::from_utf8(&encoded).expect("should be valid UTF-8: hex output is ASCII"))
 }
 
 /// The family of digest algorithm associated with a digest. This tells you what kind of digest it
@@ -219,6 +248,13 @@ impl CasDigestConfig {
         self.inner.empty_file_digest.dupe()
     }
 
+    /// Whether `digest` is the digest of empty content under one of the configured algorithms. A
+    /// size of 0 alone does not qualify: a declared digest can pair a size of 0 with the hash of
+    /// other content, and that pair names nothing in a CAS.
+    pub fn is_empty_digest<Kind: CasDigestKind>(self, digest: &CasDigest<Kind>) -> bool {
+        digest.size() == 0 && self.inner.empty_digests.contains(digest.raw_digest())
+    }
+
     pub fn preferred_algorithm(self) -> DigestAlgorithm {
         self.inner.preferred_algorithm
     }
@@ -248,6 +284,20 @@ impl CasDigestConfig {
             self.inner.digest256,
             Some(DigestAlgorithm::Blake3Keyed | DigestAlgorithm::Blake3KeyedTest)
         )
+    }
+
+    /// The configured algorithm of `family`, if this config accepts digests of that family.
+    ///
+    /// This is what to hash with when the result has to compare equal to a digest that is already
+    /// in hand: the preferred algorithm may be a different family from that digest's.
+    pub fn algorithm_for_family(self, family: DigestAlgorithmFamily) -> Option<DigestAlgorithm> {
+        let slot = match family {
+            DigestAlgorithmFamily::Sha1 => self.inner.digest160,
+            DigestAlgorithmFamily::Sha256
+            | DigestAlgorithmFamily::Blake3
+            | DigestAlgorithmFamily::Blake3Keyed => self.inner.digest256,
+        };
+        slot.filter(|algorithm| algorithm.family() == family)
     }
 
     /// Access the config for source files. Note that there is no method to go back to the
@@ -284,6 +334,8 @@ struct CasDigestConfigInner {
     digest160: Option<DigestAlgorithm>,
     digest256: Option<DigestAlgorithm>,
     empty_file_digest: TrackedFileDigest,
+    /// The digest of empty content under each configured algorithm.
+    empty_digests: Vec<RawDigest>,
     /// A potentially different configuration to use when digesting source files.
     source: SourceFilesConfig,
 }
@@ -314,6 +366,15 @@ impl CasDigestConfigInner {
                 }
             })
             .transpose()?;
+
+        let empty_digests = algorithms
+            .iter()
+            .map(|algo| {
+                CasDigestData::digester_for_algorithm(*algo)
+                    .finalize()
+                    .digest
+            })
+            .collect();
 
         let mut digest160 = None;
         let mut digest256 = None;
@@ -350,6 +411,7 @@ impl CasDigestConfigInner {
             digest160,
             digest256,
             empty_file_digest,
+            empty_digests,
             source,
         })
     }
@@ -800,6 +862,46 @@ pub mod testing {
 mod tests {
     use super::*;
     use crate::file_ops::metadata::FileDigestKind;
+
+    #[test]
+    fn test_raw_digest_display_all_algorithms() {
+        // Cover every byte value, including leading zeroes and high-bit bytes.
+        for start in (0u8..=224).step_by(32) {
+            let bytes = std::array::from_fn(|i| start + i as u8);
+            let digests = [
+                RawDigest::Sha1(bytes[..SHA1_SIZE].try_into().unwrap()),
+                RawDigest::Sha256(bytes),
+                RawDigest::Blake3(bytes),
+                RawDigest::Blake3Keyed(bytes),
+            ];
+            for digest in digests {
+                assert_eq!(hex::encode(digest.as_bytes()), digest.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn test_raw_digest_display_format_options() {
+        let digests = [
+            RawDigest::Sha1([0x9a; SHA1_SIZE]),
+            RawDigest::Sha256([0x9a; SHA256_SIZE]),
+        ];
+        for digest in digests {
+            // Width, fill, alignment and precision apply exactly as they would to the hex `str`.
+            let hex = hex::encode(digest.as_bytes());
+            assert_eq!(format!("{hex:>80}"), format!("{digest:>80}"));
+            assert_eq!(format!("{hex:_<80}"), format!("{digest:_<80}"));
+            assert_eq!(format!("{hex:^80}"), format!("{digest:^80}"));
+            assert_eq!(format!("{hex:.7}"), format!("{digest:.7}"));
+        }
+
+        let digest = RawDigest::Sha256([0x9a; SHA256_SIZE]);
+        assert_eq!(
+            format!("{:>16}{}", "", "9a".repeat(SHA256_SIZE)),
+            format!("{digest:>80}")
+        );
+        assert_eq!("9a9a9a9", format!("{digest:.7}"));
+    }
 
     #[test]
     fn test_digest_from_str() {

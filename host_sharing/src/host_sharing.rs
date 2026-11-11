@@ -229,13 +229,19 @@ impl HostSharingBroker {
         sorted_identifiers: impl Iterator<Item = &'a String>,
     ) -> HostSharingGuard {
         // Ensure that there is only one active run per identifier. The identifiers must be sorted
-        // to avoid a potential deadlock.
+        // to avoid a potential deadlock. A repeated identifier is skipped: its semaphore has a
+        // single permit, and this request already holds it.
         //
         // Acquire the identifier semaphores first, then acquire the permits needed to actually run.
         // This is so that no permits (which map to system resources / cores) are held while waiting
         // for the previous runs on these identifiers to finish.
         let mut name_guards = Vec::new();
+        let mut previous_identifier: Option<&String> = None;
         for identifier in sorted_identifiers {
+            if previous_identifier == Some(identifier) {
+                continue;
+            }
+            previous_identifier = Some(identifier);
             let run_semaphore = self.named_semaphores.get(identifier);
             let name_guard = run_semaphore.acquire(SINGLE_RUN).await;
             name_guards.push(name_guard);
@@ -274,6 +280,48 @@ mod tests {
             .requested_permits(&WeightClass::Permits(4))
             .into_count_uncapped();
         assert_eq!(4, permits);
+    }
+
+    #[test]
+    fn test_one_per_tokens_with_repeated_token() {
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Waker;
+
+        let broker = HostSharingBroker::new(HostSharingStrategy::Fifo, 1);
+        let mut cx = Context::from_waker(Waker::noop());
+        let requirements = |tokens: &[&str]| {
+            HostSharingRequirements::OnePerTokens(
+                SortedVec::from(tokens.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>()),
+                WeightClass::Permits(1),
+            )
+        };
+
+        // Nothing is held, so distinct tokens are acquired on the first poll.
+        let distinct = requirements(&["a", "b"]);
+        assert!(
+            std::pin::pin!(broker.acquire(&distinct))
+                .as_mut()
+                .poll(&mut cx)
+                .is_ready()
+        );
+
+        // A repeated token is acquired once, so the acquire completes on the first poll.
+        let repeated = requirements(&["a", "b", "a"]);
+        let guard = match std::pin::pin!(broker.acquire(&repeated))
+            .as_mut()
+            .poll(&mut cx)
+        {
+            std::task::Poll::Ready(guard) => guard,
+            std::task::Poll::Pending => panic!("acquire with a repeated token must complete"),
+        };
+
+        // The token is held exactly once: another acquire waits until the guard is dropped.
+        let other = requirements(&["a"]);
+        let mut other_acquire = std::pin::pin!(broker.acquire(&other));
+        assert!(other_acquire.as_mut().poll(&mut cx).is_pending());
+        drop(guard);
+        assert!(other_acquire.as_mut().poll(&mut cx).is_ready());
     }
 
     #[test]

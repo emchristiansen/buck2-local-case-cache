@@ -10,9 +10,11 @@ license.workspace = true
 [dependencies]
 allocative.workspace = true
 anyhow.workspace = true
+async-condvar-fair.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 buck2_action_metadata_proto.workspace = true
+buck2_artifact.workspace = true
 buck2_build_info.workspace = true
 buck2_build_signals.workspace = true
 buck2_cli_proto.workspace = true
@@ -42,7 +44,6 @@ either.workspace = true
 faccess.workspace = true
 fbinit.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 hex.workspace = true
 host_sharing.workspace = true
 http.workspace = true
@@ -50,6 +51,7 @@ hyper.workspace = true
 itertools.workspace = true
 jiff.workspace = true
 pagable.workspace = true
+parking_lot.workspace = true
 pathdiff.workspace = true
 prost.workspace = true
 ref-cast.workspace = true
@@ -60,17 +62,15 @@ sha1.workspace = true
 sha2.workspace = true
 slog.workspace = true
 smallvec.workspace = true
-sorted_vector_map.workspace = true
-starlark_map.workspace = true
 static_interner.workspace = true
 strong_hash.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 assert_matches.workspace = true
 prost-types.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

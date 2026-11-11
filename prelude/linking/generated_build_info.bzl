@@ -169,7 +169,7 @@ def _generate_build_info_data(
         )
         if manifest_entries != None:
             command.add("--output-manifest-entries", manifest_entries.as_output())
-        command.add(cmd_args(hidden = invalidation_inputs))
+        command.add(cmd_args(hidden = invalidation_inputs, experimental_salt_hidden = True))
         ctx.actions.run(
             command,
             category = "generate_build_info_json",
@@ -324,6 +324,8 @@ def generate_build_info_shared_library(
     )
 
 def generated_build_info_is_shared_library(ctx: AnalysisContext) -> bool:
+    if not getattr(ctx.attrs, "build_info_as_shared_library", True):
+        return False
     spec = getattr(ctx.attrs, "_generated_build_info_spec", {})
     configured_enabled = getattr(ctx.attrs, "_generated_build_info_enabled", None)
     enabled = configured_enabled if configured_enabled != None else spec.get("enabled", False)

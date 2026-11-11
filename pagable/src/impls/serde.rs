@@ -112,14 +112,20 @@ impl PagableSerialize for serde_json::Value {
             }
             serde_json::Value::Number(val) => {
                 usize::serialize(&2, serializer.serde())?;
-                if let Some(val) = val.as_f64() {
-                    bool::serialize(&true, serializer.serde())?;
-                    f64::serialize(&val, serializer.serde())?;
-                } else if let Some(val) = val.as_i64() {
+                // `as_f64` is `Some` for every number, so integers have to be tried first.
+                if let Some(val) = val
+                    .as_i64()
+                    .map(i128::from)
+                    .or(val.as_u64().map(i128::from))
+                {
                     bool::serialize(&false, serializer.serde())?;
-                    i64::serialize(&val, serializer.serde())?;
+                    i128::serialize(&val, serializer.serde())?;
                 } else {
-                    panic!()
+                    bool::serialize(&true, serializer.serde())?;
+                    f64::serialize(
+                        &val.as_f64().expect("a non-integer Number is an f64"),
+                        serializer.serde(),
+                    )?;
                 }
             }
             serde_json::Value::String(val) => {
@@ -162,7 +168,7 @@ impl<'de> PagableDeserialize<'de> for serde_json::Value {
                     ))
                 } else {
                     Ok(serde_json::Value::Number(
-                        serde_json::Number::from_i128(i64::deserialize(deserializer.serde())? as _)
+                        serde_json::Number::from_i128(i128::deserialize(deserializer.serde())?)
                             .ok_or_else(|| anyhow::anyhow!("deserialization error"))?,
                     ))
                 }
@@ -186,5 +192,40 @@ impl<'de> PagableDeserialize<'de> for serde_json::Value {
             }
             case => Err(anyhow::anyhow!("invalid serde_json::Value case {}", case)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::PagableDeserialize;
+    use crate::PagableSerialize;
+    use crate::testing::TestingDeserializer;
+    use crate::testing::TestingSerializer;
+
+    fn roundtrip(v: &serde_json::Value) -> serde_json::Value {
+        let mut ser = TestingSerializer::new();
+        v.pagable_serialize(&mut ser).unwrap();
+        let bytes = ser.finish();
+        let mut de = TestingDeserializer::new(&bytes);
+        serde_json::Value::pagable_deserialize(&mut de).unwrap()
+    }
+
+    /// Integers survive a round trip unchanged, including values an `f64` or an `i64` cannot hold.
+    #[test]
+    fn test_json_numbers_round_trip() {
+        let v = serde_json::json!({
+            "n": 42,
+            "big": 9007199254740993u64,
+            "neg": -3,
+            "max": u64::MAX,
+            "min": i64::MIN,
+            "f": 1.5,
+        });
+        let r = roundtrip(&v);
+        assert_eq!(r, v);
+        assert_eq!(r["n"].as_u64(), Some(42));
+        assert_eq!(r["big"].as_u64(), Some(9007199254740993));
+        assert_eq!(r["max"].as_u64(), Some(u64::MAX));
+        assert_eq!(r["f"].as_f64(), Some(1.5));
     }
 }

@@ -19,16 +19,18 @@ use buck2_artifact::actions::key::ActionKey;
 use buck2_artifact::artifact::artifact_type::DeclaredArtifact;
 use buck2_artifact::artifact::artifact_type::OutputArtifact;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
+use buck2_artifact::artifact::output_type::OutputType;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::deferred::key::DeferredHolderKey;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
+use buck2_core::execution_types::execution_group::ExecutionGroup;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::internal_error;
-use buck2_execute::execute::request::OutputType;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
-use buck2_hash::BuckIndexSet;
+use buck2_hash::BuckMutInsertionMap;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::testing::Buck2TestHeapName;
@@ -36,8 +38,6 @@ use derivative::Derivative;
 use dupe::Dupe;
 use itertools::Itertools;
 use mini_vec::MiniBoxSlice;
-use pagable::PagableDeserialize;
-use pagable::PagableSerialize;
 use starlark::StarlarkPagable;
 use starlark::StarlarkPagablePanic;
 use starlark::any::ProvidesStaticType;
@@ -45,10 +45,10 @@ use starlark::codemap::FileSpan;
 use starlark::environment::FrozenModule;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
-use starlark::pagable::StarlarkDeserialize;
 use starlark::pagable::StarlarkDeserializeContext;
 use starlark::pagable::StarlarkSerialize;
 use starlark::pagable::StarlarkSerializeContext;
+use starlark::values::DeferredOwnedFrozen;
 use starlark::values::DynStarlark;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
@@ -63,8 +63,8 @@ use starlark::values::Value;
 use starlark::values::ValueTyped;
 use starlark::values::any_complex::StarlarkAnyComplex;
 use starlark::values::typing::StarlarkCallable;
-use starlark_map::small_map::SmallMap;
 
+use crate::actions::ActionName;
 use crate::actions::RegisteredAction;
 use crate::actions::UnregisteredAction;
 use crate::actions::registry::ActionsRegistry;
@@ -259,7 +259,7 @@ impl<'v> AnalysisRegistry<'v> {
 
     pub fn register_action<A: UnregisteredAction + 'static>(
         &mut self,
-        outputs: BuckIndexSet<OutputArtifact>,
+        outputs: BuckMutInsertionSet<OutputArtifact>,
         action: A,
         associated_value: Option<Value<'v>>,
         error_handler: Option<StarlarkCallable<'v>>,
@@ -267,6 +267,29 @@ impl<'v> AnalysisRegistry<'v> {
         let id = self
             .actions
             .register(&self.analysis_value_storage.self_key, outputs, action)?;
+        self.analysis_value_storage
+            .set_action_data(id, (associated_value, error_handler))?;
+        Ok(())
+    }
+
+    /// Like `register_action`, running the action on the execution platform of
+    /// `execution_group`. `action_name` names the action in registration errors.
+    pub fn register_action_in_group<A: UnregisteredAction + 'static>(
+        &mut self,
+        outputs: BuckMutInsertionSet<OutputArtifact>,
+        action: A,
+        associated_value: Option<Value<'v>>,
+        error_handler: Option<StarlarkCallable<'v>>,
+        execution_group: ExecutionGroup,
+        action_name: impl FnOnce() -> ActionName,
+    ) -> buck2_error::Result<()> {
+        let id = self.actions.register_in_group(
+            &self.analysis_value_storage.self_key,
+            outputs,
+            action,
+            execution_group,
+            action_name,
+        )?;
         self.analysis_value_storage
             .set_action_data(id, (associated_value, error_handler))?;
         Ok(())
@@ -392,7 +415,8 @@ impl<'v> ArtifactDeclaration<'v> {
 #[derive(Debug, Allocative, ProvidesStaticType, StarlarkPagablePanic)]
 pub struct AnalysisValueStorage<'v> {
     pub self_key: DeferredHolderKey,
-    action_data: SmallMap<ActionIndex, (Option<Value<'v>>, Option<StarlarkCallable<'v>>)>,
+    action_data:
+        BuckMutInsertionMap<ActionIndex, (Option<Value<'v>>, Option<StarlarkCallable<'v>>)>,
     transitive_sets: Vec<ValueTyped<'v, TransitiveSet<'v>>>,
     pub lambda_params: Box<DynStarlark<'v, dyn DynamicLambdaParamsStorage<'v>>>,
     result_value: OnceCell<ValueTyped<'v, ProviderCollection<'v>>>,
@@ -402,11 +426,8 @@ pub struct AnalysisValueStorage<'v> {
 pub struct FrozenAnalysisValueStorage<'fv> {
     #[starlark_pagable(pagable)]
     pub self_key: DeferredHolderKey,
-    action_data: SmallMap<ActionIndex, (Option<Value<'fv>>, Option<StarlarkCallable<'fv>>)>,
-    #[starlark_pagable(
-        serialize_with = "serialize_transitive_sets",
-        deserialize_with = "deserialize_transitive_sets"
-    )]
+    action_data:
+        BuckMutInsertionMap<ActionIndex, (Option<Value<'fv>>, Option<StarlarkCallable<'fv>>)>,
     transitive_sets: MiniBoxSlice<ValueTyped<'fv, TransitiveSet<'fv>>>,
     #[starlark_pagable(
         serialize_with = "serialize_lambda_params",
@@ -429,28 +450,6 @@ fn deserialize_lambda_params<'fv>(
     DYNAMIC_LAMBDA_PARAMS_STORAGES
         .get()?
         .deserialize_frozen_dynamic_lambda_params_storage(ctx)
-}
-
-fn serialize_transitive_sets<'v>(
-    field: &MiniBoxSlice<ValueTyped<'v, TransitiveSet<'v>>>,
-    ctx: &mut dyn StarlarkSerializeContext,
-) -> starlark::Result<()> {
-    PagableSerialize::pagable_serialize(&field.len(), ctx.pagable())?;
-    for item in field.iter() {
-        StarlarkSerialize::starlark_serialize(item, ctx)?;
-    }
-    Ok(())
-}
-
-fn deserialize_transitive_sets<'v>(
-    ctx: &mut dyn StarlarkDeserializeContext<'_, 'v>,
-) -> starlark::Result<MiniBoxSlice<ValueTyped<'v, TransitiveSet<'v>>>> {
-    let len = usize::pagable_deserialize(ctx.pagable())?;
-    let mut items = Vec::with_capacity(len);
-    for _ in 0..len {
-        items.push(ValueTyped::<TransitiveSet>::starlark_deserialize(ctx)?);
-    }
-    Ok(MiniBoxSlice::from_iter(items))
 }
 
 unsafe impl<'v> Trace<'v> for AnalysisValueStorage<'v> {
@@ -489,7 +488,7 @@ impl<'v> Freeze<'v> for AnalysisValueStorage<'v> {
 
         // N.B. collect::<Result<_>> sets the lower bound to zero,
         // which can cause over-allocations in frozen containers.
-        let mut frozen_action_data = SmallMap::with_capacity(action_data.len());
+        let mut frozen_action_data = BuckMutInsertionMap::with_capacity(action_data.len());
         for (k, (data, error_handler)) in action_data {
             frozen_action_data.insert(
                 k,
@@ -542,7 +541,7 @@ impl<'v> AnalysisValueStorage<'v> {
     fn new(self_key: DeferredHolderKey) -> Self {
         Self {
             self_key: self_key.dupe(),
-            action_data: SmallMap::new(),
+            action_data: BuckMutInsertionMap::new(),
             transitive_sets: Vec::new(),
             lambda_params: DYNAMIC_LAMBDA_PARAMS_STORAGES
                 .get()
@@ -656,7 +655,7 @@ impl AnalysisValueFetcher {
 
         Ok(RecordedAnalysisValues {
             self_key: self.self_key.dupe(),
-            analysis_storage,
+            analysis_storage: analysis_storage.map(DeferredOwnedFrozen::new),
             actions,
         })
     }
@@ -666,7 +665,11 @@ impl AnalysisValueFetcher {
 #[derive(Debug, Allocative, pagable::Pagable)]
 pub struct RecordedAnalysisValues {
     self_key: DeferredHolderKey,
-    analysis_storage: Option<OwnedFrozenAnalysisValueStorage>,
+    analysis_storage: Option<
+        DeferredOwnedFrozen<
+            ValueTyped<'static, StarlarkAnyComplex<FrozenAnalysisValueStorage<'static>>>,
+        >,
+    >,
     actions: RecordedActions,
 }
 
@@ -702,7 +705,7 @@ impl RecordedAnalysisValues {
                 heap.alloc_simple_typed(StarlarkAnyComplex {
                     value: FrozenAnalysisValueStorage {
                         self_key: self_key.dupe(),
-                        action_data: SmallMap::new(),
+                        action_data: BuckMutInsertionMap::new(),
                         transitive_sets: alloced_tsets.into_iter().collect(),
                         lambda_params: DYNAMIC_LAMBDA_PARAMS_STORAGES
                             .get()
@@ -714,7 +717,7 @@ impl RecordedAnalysisValues {
             });
         Self {
             self_key,
-            analysis_storage: Some(analysis_storage),
+            analysis_storage: Some(DeferredOwnedFrozen::new(analysis_storage)),
             actions,
         }
     }
@@ -734,7 +737,7 @@ impl RecordedAnalysisValues {
             .analysis_storage
             .as_ref()
             .with_internal_error(|| format!("Missing analysis storage for `{key}`"))?
-            .as_ref()
+            .read()?
             .maybe_map::<ValueTyped<'static, TransitiveSet<'static>>, _>(|v| {
                 v.as_ref()
                     .value
@@ -757,8 +760,14 @@ impl RecordedAnalysisValues {
         self.actions.lookup(key)
     }
 
-    /// Iterates over the actions created in this analysis.
-    pub fn iter_actions(&self) -> impl Iterator<Item = &Arc<RegisteredAction>> + '_ {
+    pub fn num_actions(&self) -> usize {
+        self.actions.num_actions()
+    }
+
+    /// Reads each action created in this analysis on demand.
+    pub fn iter_actions(
+        &self,
+    ) -> impl Iterator<Item = buck2_error::Result<&Arc<RegisteredAction>>> + '_ {
         self.actions.iter_actions()
     }
 
@@ -769,19 +778,24 @@ impl RecordedAnalysisValues {
             .analysis_storage
             .as_ref()
             .internal_error("missing analysis storage")?
-            .as_ref()
+            .read()?
             .map::<&'static FrozenAnalysisValueStorage<'static>, _>(|v| &v.as_ref().value))
     }
 
     /// Iterates over the declared dynamic_output/actions.
-    pub fn iter_dynamic_lambda_outputs(&self) -> impl Iterator<Item = BuildArtifact> + '_ {
-        self.analysis_storage.iter().flat_map(|v| {
-            v.as_ref()
-                .map::<&'static FrozenAnalysisValueStorage<'static>, _>(|v| &v.as_ref().value)
+    pub fn iter_dynamic_lambda_outputs(
+        &self,
+    ) -> buck2_error::Result<impl Iterator<Item = BuildArtifact> + '_> {
+        let storage = match &self.analysis_storage {
+            Some(storage) => Some(storage.read()?),
+            None => None,
+        };
+        Ok(storage.into_iter().flat_map(|v| {
+            v.map::<&'static FrozenAnalysisValueStorage<'static>, _>(|v| &v.as_ref().value)
                 .value()
                 .lambda_params
                 .dynamic_lambda_outputs()
-        })
+        }))
     }
 
     pub fn provider_collection(&self) -> buck2_error::Result<FrozenProviderCollectionValueRef<'_>> {
@@ -789,7 +803,7 @@ impl RecordedAnalysisValues {
             .analysis_storage
             .as_ref()
             .internal_error("missing analysis storage")?
-            .as_ref()
+            .read()?
             .try_map::<FrozenValueTyped<'static, ProviderCollection<'static>>, buck2_error::Error, _>(
                 |v| {
                     let collection = v
@@ -802,6 +816,15 @@ impl RecordedAnalysisValues {
                 },
             )?;
         Ok(FrozenProviderCollectionValueRef::from_inner(inner))
+    }
+
+    pub(crate) fn provider_collection_if_present(
+        &self,
+    ) -> buck2_error::Result<Option<FrozenProviderCollectionValueRef<'_>>> {
+        if self.analysis_storage.is_none() {
+            return Ok(None);
+        }
+        self.provider_collection().map(Some)
     }
 
     pub(crate) fn retained_memory(&self) -> buck2_error::Result<usize> {

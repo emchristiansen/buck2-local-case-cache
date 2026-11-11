@@ -8,8 +8,10 @@
 
 
 import json
+import math
 import random
 import re
+import stat
 import string
 import sys
 import typing
@@ -19,6 +21,37 @@ from pathlib import Path
 import psutil
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.api.buck_result import InvocationRecord
+
+
+class approx:
+    """
+    Compares equal to a number within `abs` of `expected`, or within a relative tolerance of
+    `rel` (one in a million unless given), so that a float measured by buck2 can sit inside an
+    equality assertion over a larger structure, like `pytest.approx`.
+    """
+
+    def __init__(
+        self,
+        expected: float,
+        *,
+        abs: typing.Optional[float] = None,  # noqa: A002 the name `pytest.approx` has
+        rel: typing.Optional[float] = None,
+    ) -> None:
+        self.expected = expected
+        self.abs = abs
+        self.rel = rel
+
+    def __eq__(self, actual: object) -> bool:
+        if not isinstance(actual, (int, float)):
+            return False
+        if self.abs is None and self.rel is None:
+            return math.isclose(actual, self.expected, rel_tol=1e-6, abs_tol=1e-12)
+        return math.isclose(
+            actual, self.expected, rel_tol=self.rel or 0.0, abs_tol=self.abs or 0.0
+        )
+
+    def __repr__(self) -> str:
+        return f"approx({self.expected!r}, abs={self.abs!r}, rel={self.rel!r})"
 
 
 def daemon_is_alive(pid: int) -> bool:
@@ -57,6 +90,15 @@ async def read_timestamps(buck: Buck, *args) -> typing.List[int]:
     ]
 
 
+def remove_output(path: Path) -> None:
+    """
+    Deletes a build output, which is read-only (`buck2.readonly_outputs`). Unix needs only the
+    directory for that; Windows refuses until the attribute is cleared.
+    """
+    path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    path.unlink()
+
+
 def is_running_on_linux() -> bool:
     return sys.platform == "linux"
 
@@ -77,7 +119,10 @@ def get_targets_from_what_ran(
     for entry in what_ran:
         m = re.match(r"^(.*?)( \((.*?)\))?( \((.*?)\))?$", entry["identity"])
         assert m is not None
-        rule, category = m.group(1), m.group(5)
+        # `target [(configuration)] (category [identifier])`: the category is the
+        # last parenthesised segment, whether or not a configuration precedes it.
+        rule = m.group(1)
+        category = m.group(5) if m.group(5) is not None else m.group(3)
         targets.add((rule, category))
 
     return targets
@@ -163,6 +208,39 @@ def _get_buck2_re_use_case_from_config_file(path: Path) -> typing.Optional[str]:
 
 def read_invocation_record(record: Path) -> InvocationRecord:
     return InvocationRecord(record)
+
+
+def read_streaming_report(path: Path) -> typing.List[typing.Dict[str, typing.Any]]:
+    """Parses a `--streaming-build-report` file, one report per line. It may be empty."""
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def replay_streaming_report(
+    reports: typing.List[typing.Dict[str, typing.Any]],
+) -> typing.Dict[str, typing.Any]:
+    """Merges the `results` of streaming report lines; a key's newest entry wins.
+
+    Works whether each line repeats every entry so far or carries only some of them.
+    """
+    return {
+        key: entry for report in reports for key, entry in report["results"].items()
+    }
+
+
+def streaming_status_history(
+    reports: typing.List[typing.Dict[str, typing.Any]],
+) -> typing.Dict[str, typing.List[str]]:
+    """Each key's successive top-level `success` values across streaming report lines.
+
+    Repeats are collapsed, so the result doesn't depend on how many lines carry an entry.
+    """
+    history: typing.Dict[str, typing.List[str]] = {}
+    for report in reports:
+        for key, entry in report["results"].items():
+            statuses = history.setdefault(key, [])
+            if statuses[-1:] != [entry["success"]]:
+                statuses.append(entry["success"])
+    return history
 
 
 async def get_last_execution_kind(

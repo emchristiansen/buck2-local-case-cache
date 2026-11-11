@@ -588,10 +588,11 @@ impl DebugServer for ServerState {
         &mut self,
         x: ContinueArguments,
     ) -> buck2_error::Result<dap::ContinueResponseBody> {
-        let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
+        let hook = self.find_hook_by_pseudo_thread_mut(x.thread_id)?;
         hook.adapter
             .continue_()
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::StarlarkServer))?;
+        hook.stopped_at = None;
 
         Ok(dap::ContinueResponseBody {
             all_threads_continued: Some(false),
@@ -599,26 +600,29 @@ impl DebugServer for ServerState {
     }
 
     fn next(&mut self, x: dap::NextArguments) -> buck2_error::Result<()> {
-        let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
+        let hook = self.find_hook_by_pseudo_thread_mut(x.thread_id)?;
         hook.adapter
             .step(StepKind::Over)
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::StarlarkServer))?;
+        hook.stopped_at = None;
         Ok(())
     }
 
     fn step_in(&mut self, x: dap::StepInArguments) -> buck2_error::Result<()> {
-        let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
+        let hook = self.find_hook_by_pseudo_thread_mut(x.thread_id)?;
         hook.adapter
             .step(StepKind::Into)
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::StarlarkServer))?;
+        hook.stopped_at = None;
         Ok(())
     }
 
     fn step_out(&mut self, x: dap::StepOutArguments) -> buck2_error::Result<()> {
-        let hook = self.find_hook_by_pseudo_thread(x.thread_id)?;
+        let hook = self.find_hook_by_pseudo_thread_mut(x.thread_id)?;
         hook.adapter
             .step(StepKind::Out)
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::StarlarkServer))?;
+        hook.stopped_at = None;
         Ok(())
     }
 
@@ -922,17 +926,44 @@ impl ServerState {
         self.current_hooks.clear();
     }
 
-    fn find_hook_by_pseudo_thread(&self, thread_id: i64) -> buck2_error::Result<&HookState> {
+    /// The requests that act on an evaluation are only valid while it is stopped. Injecting one
+    /// into a running evaluation blocks this state until the evaluation next stops, and the
+    /// evaluation then consumes the stale command and runs through its breakpoint.
+    fn hook_id_by_pseudo_thread(&self, thread_id: i64) -> buck2_error::Result<HookId> {
         let thread_id = thread_id as u32;
-        for hook_state in self.current_hooks.values() {
+        for (hook_id, hook_state) in &self.current_hooks {
             if hook_state.pseudo_thread_id == thread_id {
-                return Ok(hook_state);
+                if hook_state.stopped_at.is_none() {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "Thread `{}` is not stopped",
+                        thread_id
+                    ));
+                }
+                return Ok(*hook_id);
             }
         }
         Err(buck2_error::buck2_error!(
             buck2_error::ErrorTag::StarlarkServer,
             "can't find evaluator thread"
         ))
+    }
+
+    fn find_hook_by_pseudo_thread(&self, thread_id: i64) -> buck2_error::Result<&HookState> {
+        let hook_id = self.hook_id_by_pseudo_thread(thread_id)?;
+        self.current_hooks
+            .get(&hook_id)
+            .ok_or_else(|| internal_error!("hook `{}` was just found", hook_id))
+    }
+
+    fn find_hook_by_pseudo_thread_mut(
+        &mut self,
+        thread_id: i64,
+    ) -> buck2_error::Result<&mut HookState> {
+        let hook_id = self.hook_id_by_pseudo_thread(thread_id)?;
+        self.current_hooks
+            .get_mut(&hook_id)
+            .ok_or_else(|| internal_error!("hook `{}` was just found", hook_id))
     }
 
     fn get_ast(&self, source: &ProjectRelativePath) -> buck2_error::Result<AstModule> {
@@ -1089,5 +1120,309 @@ mod tests {
                 "Encoded VariableId for ({frame_id}, {thread_id}, {variable_id}) was 0"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stopped_eval_tests {
+    use std::sync::Arc;
+    use std::sync::Condvar;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use buck2_events::Event;
+    use buck2_events::create_source_sink_pair;
+    use buck2_events::daemon_id::DaemonId;
+    use buck2_events::dispatch::EventDispatcher;
+    use buck2_events::source::ChannelEventSource;
+    use buck2_interpreter::starlark_debug::StarlarkDebugController;
+    use debugserver_types as dap;
+    use dupe::Dupe;
+    use starlark::environment::GlobalsBuilder;
+    use starlark::environment::Module;
+    use starlark::eval::Evaluator;
+    use starlark::starlark_module;
+    use starlark::syntax::AstModule;
+    use starlark::syntax::Dialect;
+    use starlark::values::none::NoneType;
+    use tokio::sync::mpsc;
+
+    use crate::BuckStarlarkDebuggerHandle;
+    use crate::run::ToClientMessage;
+    use crate::server::BuckStarlarkDebuggerServer;
+
+    /// Holds a starlark evaluation inside a native call until the test releases it.
+    struct Gate {
+        open: Mutex<bool>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        const fn new() -> Self {
+            Self {
+                open: Mutex::new(false),
+                cv: Condvar::new(),
+            }
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
+
+    static GATE_STALE: Gate = Gate::new();
+    static GATE_EARLY: Gate = Gate::new();
+
+    #[starlark_module]
+    fn gate_functions(builder: &mut GlobalsBuilder) {
+        fn wait_gate_stale() -> starlark::Result<NoneType> {
+            GATE_STALE.wait();
+            Ok(NoneType)
+        }
+
+        fn wait_gate_early() -> starlark::Result<NoneType> {
+            GATE_EARLY.wait();
+            Ok(NoneType)
+        }
+    }
+
+    fn request(seq: i64, command: &str, arguments: serde_json::Value) -> dap::Request {
+        serde_json::from_value(serde_json::json!({
+            "seq": seq, "type": "request", "command": command, "arguments": arguments
+        }))
+        .unwrap()
+    }
+
+    struct Setup {
+        root: ProjectRootTemp,
+        server: Arc<BuckStarlarkDebuggerServer>,
+        to_client: mpsc::UnboundedReceiver<ToClientMessage>,
+        source: ChannelEventSource,
+        handle: BuckStarlarkDebuggerHandle,
+    }
+
+    /// A server with one command handle and one breakpoint on `line` of `test.bzl`.
+    async fn setup(content: &str, line: i64) -> Setup {
+        let root = ProjectRootTemp::new().unwrap();
+        root.write_file("test.bzl", content);
+        let abs = root
+            .path()
+            .resolve(ProjectRelativePath::new("test.bzl").unwrap())
+            .to_string();
+        let (send, mut to_client) = mpsc::unbounded_channel();
+        let server = Arc::new(BuckStarlarkDebuggerServer::new(send, root.path().dupe()));
+        let (source, sink) = create_source_sink_pair();
+        let handle = server
+            .new_handle(EventDispatcher::new(
+                EventDispatcher::null().trace_id().clone(),
+                DaemonId::null(),
+                sink,
+            ))
+            .unwrap();
+        server
+            .send_request(request(
+                1,
+                "setBreakpoints",
+                serde_json::json!({"source": {"path": abs}, "breakpoints": [{"line": line}]}),
+            ))
+            .unwrap();
+        loop {
+            match to_client.recv().await.unwrap() {
+                ToClientMessage::Response(r) if r.command == "setBreakpoints" => {
+                    assert!(r.success, "{:?}", r.message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Setup {
+            root,
+            server,
+            to_client,
+            source,
+            handle,
+        }
+    }
+
+    fn run_eval(controller: &mut Box<dyn StarlarkDebugController>, content: &str) {
+        let ast = AstModule::parse("test.bzl", content.to_owned(), &Dialect::Standard).unwrap();
+        let globals = GlobalsBuilder::standard().with(gate_functions).build();
+        Module::with_temp_heap(|module| {
+            let mut eval = Evaluator::new(&module);
+            controller.initialize(&mut eval).unwrap();
+            eval.eval_module(ast, &globals).unwrap();
+        });
+    }
+
+    /// The number of stopped evaluations a debugger snapshot event reports, if `ev` is one.
+    fn stopped_evals_in(ev: &Event) -> Option<usize> {
+        let Event::Buck(ev) = ev else {
+            return None;
+        };
+        let buck2_data::buck_event::Data::Instant(inst) = ev.data() else {
+            return None;
+        };
+        let Some(buck2_data::instant_event::Data::DebugAdapterSnapshot(snap)) = &inst.data else {
+            return None;
+        };
+        Some(
+            snap.current_handles
+                .values()
+                .map(|h| h.stopped_evals.len())
+                .sum(),
+        )
+    }
+
+    /// Stops at a breakpoint inside `f`, continues, and collects the stopped-evaluation count
+    /// of the snapshots the server emits after the continue was answered.
+    async fn stopped_evals_after_continue() -> Vec<usize> {
+        // Breakpoints go inside a function: a top-level statement is hit twice.
+        let content = "def f():\n    x = 1\n    wait_gate_stale()\n    return x\nf()\n";
+        let Setup {
+            root: _root,
+            server,
+            mut to_client,
+            mut source,
+            handle,
+        } = setup(content, 2).await;
+        let mut controller = server.start_eval(&handle, "test eval").await.unwrap();
+        let srv = server.dupe();
+        let client = std::thread::spawn(move || {
+            let tid = loop {
+                match to_client.blocking_recv().unwrap() {
+                    ToClientMessage::Event(ev) if ev.event == "stopped" => {
+                        break ev.body.unwrap()["threadId"].as_i64().unwrap();
+                    }
+                    _ => {}
+                }
+            };
+            srv.send_request(request(2, "continue", serde_json::json!({"threadId": tid})))
+                .unwrap();
+            loop {
+                match to_client.blocking_recv().unwrap() {
+                    ToClientMessage::Response(r) if r.command == "continue" => {
+                        assert!(r.success, "{:?}", r.message);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Everything the server emits from now on is after the continue took effect.
+            while source.try_receive().is_some() {}
+            // A request makes the server schedule a snapshot within a second.
+            srv.send_request(request(3, "threads", serde_json::json!({})))
+                .unwrap();
+            let start = std::time::Instant::now();
+            let mut snapshots = Vec::new();
+            while std::time::Instant::now() - start < Duration::from_secs(4) && snapshots.is_empty()
+            {
+                match source.try_receive() {
+                    Some(ev) => snapshots.extend(stopped_evals_in(&ev)),
+                    None => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            GATE_STALE.release();
+            snapshots
+        });
+        tokio::task::block_in_place(|| run_eval(&mut controller, content));
+        let snapshots = client.join().unwrap();
+        drop(controller);
+        snapshots
+    }
+
+    /// After `continue` the snapshots no longer list the evaluation as stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_stops_listing_an_eval_after_continue() {
+        assert_eq!(stopped_evals_after_continue().await, vec![0]);
+    }
+
+    /// Sends `continue` and then `threads` while the evaluation is running (held in a native
+    /// call before its breakpoint). Returns the responses answered while it ran, as (command,
+    /// success), and whether the evaluation finished although the client never continued it
+    /// after its stop.
+    async fn continue_while_running() -> (Vec<(String, bool)>, bool) {
+        let content = "def f():\n    wait_gate_early()\n    y = 2\n    return y\nf()\n";
+        let Setup {
+            root: _root,
+            server,
+            mut to_client,
+            source: _source,
+            handle,
+        } = setup(content, 3).await;
+        let mut controller = server.start_eval(&handle, "test eval").await.unwrap();
+        let eval_finished = Arc::new(AtomicBool::new(false));
+        let finished = eval_finished.dupe();
+        let srv = server.dupe();
+        let client = std::thread::spawn(move || {
+            let tid = loop {
+                match to_client.blocking_recv().unwrap() {
+                    ToClientMessage::Event(ev) if ev.event == "thread" => {
+                        break ev.body.unwrap()["threadId"].as_i64().unwrap();
+                    }
+                    _ => {}
+                }
+            };
+            // Give the evaluation time to reach the native call; it is running, not stopped.
+            std::thread::sleep(Duration::from_millis(200));
+            srv.send_request(request(2, "continue", serde_json::json!({"threadId": tid})))
+                .unwrap();
+            srv.send_request(request(3, "threads", serde_json::json!({})))
+                .unwrap();
+            let mut answered_while_running = Vec::new();
+            let start = std::time::Instant::now();
+            while std::time::Instant::now() - start < Duration::from_secs(2) {
+                match to_client.try_recv() {
+                    Ok(ToClientMessage::Response(r)) => {
+                        answered_while_running.push((r.command, r.success))
+                    }
+                    Ok(_) => {}
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            GATE_EARLY.release();
+            // The client does not continue after the stop; see whether the evaluation ends anyway.
+            let start = std::time::Instant::now();
+            let mut finished_without_continue = false;
+            while std::time::Instant::now() - start < Duration::from_secs(2) {
+                let _ignored = to_client.try_recv();
+                if finished.load(Ordering::SeqCst) {
+                    finished_without_continue = true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !finished.load(Ordering::SeqCst) {
+                srv.send_request(request(4, "continue", serde_json::json!({"threadId": tid})))
+                    .unwrap();
+            }
+            (answered_while_running, finished_without_continue)
+        });
+        tokio::task::block_in_place(|| run_eval(&mut controller, content));
+        eval_finished.store(true, Ordering::SeqCst);
+        drop(controller);
+        client.join().unwrap()
+    }
+
+    /// A `continue` for a running evaluation is refused, the server keeps answering, and the
+    /// evaluation waits at its breakpoint for the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn continue_for_a_running_eval_is_refused() {
+        let (answered, finished_without_continue) = continue_while_running().await;
+        assert_eq!(
+            answered,
+            vec![("continue".to_owned(), false), ("threads".to_owned(), true)]
+        );
+        assert!(!finished_without_continue);
     }
 }

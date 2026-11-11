@@ -86,7 +86,6 @@ use buck2_fs::paths::relative_path::RelativePath;
 use buck2_fs::paths::relative_path::RelativePathBuf;
 use buck2_util::arc_str::StringInside;
 use derivative::Derivative;
-use gazebo::prelude::IterOwned;
 use pagable::Pagable;
 use ref_cast::RefCast;
 use serde::Deserialize;
@@ -99,12 +98,12 @@ use strong_hash::StrongHash;
     derive_more::Display,
     Derivative,
     Hash,
+    StrongHash,
     PartialEq,
     Eq,
     PartialOrd,
     Ord,
-    RefCast,
-    StrongHash
+    RefCast
 )]
 #[derivative(Debug)]
 #[repr(transparent)]
@@ -119,6 +118,7 @@ pub struct ProjectRelativePath(
 #[derive(
     Default,
     Hash,
+    StrongHash,
     PartialEq,
     Eq,
     PartialOrd,
@@ -126,8 +126,7 @@ pub struct ProjectRelativePath(
     Serialize,
     Deserialize,
     Pagable,
-    Allocative,
-    StrongHash
+    Allocative
 )]
 #[derivative(Debug)]
 pub struct ProjectRelativePathBuf(
@@ -728,7 +727,7 @@ impl<'a> IntoFileNameBufIterator for &'a ProjectRelativePath {
     type Iterator = impl Iterator<Item = FileNameBuf> + 'a;
 
     fn into_iter(self) -> Self::Iterator {
-        self.iter().owned()
+        self.iter().map(FileName::to_owned)
     }
 }
 
@@ -736,7 +735,7 @@ impl<'a> IntoFileNameBufIterator for &'a ProjectRelativePathBuf {
     type Iterator = impl Iterator<Item = FileNameBuf> + 'a;
 
     fn into_iter(self) -> Self::Iterator {
-        self.iter().owned()
+        self.iter().map(FileName::to_owned)
     }
 }
 

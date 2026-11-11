@@ -14,7 +14,7 @@ load(
     "@prelude//apple:modularization_dependency_graph.bzl",
     "create_modularization_dep_graph_subtargets_and_provider",
 )
-load("@prelude//apple:xcassets_asset_symbols.bzl", "meta_xcassets_asset_symbol_usage_providers_and_subtargets")
+load("@prelude//apple:xcassets_asset_symbols.bzl", "xcassets_asset_symbol_usage_providers_and_subtargets")
 # @oss-disable[end= ]: load(
     # @oss-disable[end= ]: "@prelude//apple/meta_only:linker_outputs.bzl",
     # @oss-disable[end= ]: "extra_distributed_thin_lto_opt_outputs_merger",
@@ -41,6 +41,7 @@ load(
 )
 load("@prelude//cxx:cxx_context.bzl", "get_cxx_toolchain_info")
 load("@prelude//cxx:cxx_executable.bzl", "cxx_executable")
+load("@prelude//cxx:cxx_flags.bzl", "cxx_attr_flags")
 load("@prelude//cxx:cxx_library_utility.bzl", "cxx_attr_deps", "cxx_attr_exported_deps", "cxx_attr_link_style")
 load(
     "@prelude//cxx:cxx_sources.bzl",
@@ -163,6 +164,10 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
                 ),
             ],
         }
+        if xcode_data_enabled():
+            # The objects of the binary's own Swift sources, which the link takes as
+            # `extra_link_input` and `[objects]` (the C-family objects) does not list.
+            binary_subtargets["swift-objects"] = [DefaultInfo(default_outputs = swift_object_files)]
 
         validation_deps_outputs = get_validation_deps_outputs(ctx)
         stripped = get_apple_stripped_attr_value_with_default_fallback(ctx)
@@ -197,6 +202,7 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
             link_groups_force_static_follows_dependents = False,
             swiftmodule_linkable = get_swiftmodule_linkable(swift_compile),
             compiler_flags = ctx.attrs.compiler_flags + extension_compiler_flags,
+            cxx_flags = cxx_attr_flags(ctx),
             lang_compiler_flags = ctx.attrs.lang_compiler_flags,
             preprocessor_flags = ctx.attrs.preprocessor_flags,
             lang_preprocessor_flags = ctx.attrs.lang_preprocessor_flags,
@@ -261,8 +267,10 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
 
         all_deps = non_exported_deps + exported_deps
 
-        meta_xcassets_usage_providers, meta_xcassets_usage_subtargets = meta_xcassets_asset_symbol_usage_providers_and_subtargets(ctx, cxx_srcs, swift_srcs)
-        cxx_output.sub_targets.update(meta_xcassets_usage_subtargets)
+        xcassets_usage_providers, xcassets_usage_subtargets = xcassets_asset_symbol_usage_providers_and_subtargets(
+            ctx, cxx_srcs, swift_srcs, always_provide = True
+        )
+        cxx_output.sub_targets.update(xcassets_usage_subtargets)
 
         index_store_subtargets, index_store_info = create_index_store_subtargets_and_provider(ctx, index_stores, swift_index_stores, all_deps)
         cxx_output.sub_targets.update(index_store_subtargets)
@@ -343,7 +351,7 @@ def apple_binary_impl(ctx: AnalysisContext) -> [list[Provider], Promise]:
             + validation_providers
             + diagnostics_providers
             + target_stats_providers
-            + meta_xcassets_usage_providers
+            + xcassets_usage_providers
         )
 
         if cxx_output.xplugins_debug_artifacts_info:

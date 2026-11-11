@@ -19,7 +19,6 @@ use allocative::Allocative;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::configuration::transition::id::TransitionId;
-use buck2_core::package::PackageLabel;
 use buck2_core::package::source_path::SourcePathRef;
 use buck2_core::plugins::PluginKind;
 use buck2_core::provider::label::ProvidersLabel;
@@ -30,13 +29,13 @@ use dupe::Dupe;
 use pagable::Pagable;
 use strong_hash::StrongHash;
 
+use crate::attrs::arena::CoercedAttrArena;
+use crate::attrs::arena::OwnedCoercedAttr;
 use crate::attrs::attr_type::configuration_dep::ConfigurationDepKind;
-use crate::attrs::attr_type::string::StringLiteral;
-use crate::attrs::coerced_attr::CoercedAttr;
+use crate::attrs::coerced::kinds;
 use crate::attrs::coerced_attr_full::CoercedAttrFull;
 use crate::attrs::coerced_deps_collector::CoercedDeps;
 use crate::attrs::coerced_deps_collector::CoercedDepsCollector;
-use crate::attrs::coerced_deps_collector::DepPackagesCollector;
 use crate::attrs::display::AttrDisplayWithContextExt;
 use crate::attrs::inspect_options::AttrInspectOptions;
 use crate::attrs::spec::AttributeId;
@@ -46,13 +45,14 @@ use crate::attrs::spec::internal::METADATA_ATTRIBUTE;
 use crate::attrs::spec::internal::TARGET_MODIFIERS_ATTRIBUTE;
 use crate::attrs::spec::internal::TESTS_ATTRIBUTE;
 use crate::attrs::spec::internal::VISIBILITY_ATTRIBUTE;
+use crate::attrs::special_attr::SpecialAttr;
 use crate::attrs::traversal::CoercedAttrTraversal;
 use crate::attrs::values::AttrValues;
-use crate::attrs::values::TargetModifiersValue;
+use crate::attrs::values::UnsealedAttrValues;
 use crate::call_stack::StarlarkCallStack;
 use crate::call_stack::StarlarkTargetCallStackRoot;
 use crate::metadata::map::MetadataMap;
-use crate::modifiers::PackageCfgModifiersValue;
+use crate::modifiers::CfgModifiers;
 use crate::nodes::attributes::CONFIGURATION_DEPS;
 use crate::nodes::attributes::DEPS;
 use crate::nodes::attributes::ONCALL;
@@ -61,9 +61,10 @@ use crate::nodes::attributes::PACKAGE_CFG_MODIFIERS;
 use crate::nodes::attributes::TYPE;
 use crate::package::Package;
 use crate::rule::Rule;
+use crate::rule::RuleExecutionGroup;
 use crate::rule_type::RuleType;
 use crate::visibility::VisibilityError;
-use crate::visibility::VisibilityPatternList;
+use crate::visibility::VisibilityIntersection;
 use crate::visibility::VisibilitySpecification;
 
 /// Describes a target including its name, type, and the values that the user provided.
@@ -76,6 +77,15 @@ use crate::visibility::VisibilitySpecification;
 /// need to look at both the attrs held by the TargetNode and the information in the AttributeSpec.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Allocative, Pagable)]
 pub struct TargetNode(triomphe::Arc<TargetNodeData>);
+
+// SAFETY: as for `ConfiguredTargetNode`.
+unsafe impl Send for TargetNode {}
+unsafe impl Sync for TargetNode {}
+
+fn _assert_send_sync(TargetNode(inner): &TargetNode) {
+    fn assert<T: Send + Sync>(_: &T) {}
+    assert(inner);
+}
 
 impl Dupe for TargetNode {}
 
@@ -142,7 +152,7 @@ pub struct TargetNodeData {
     call_stack: Option<StarlarkCallStack>,
 
     /// Config modifiers set in the package this target belongs to
-    package_cfg_modifiers: Option<PackageCfgModifiersValue>,
+    package_cfg_modifiers: Option<CfgModifiers>,
 
     test_config_unification_rollout: bool,
 }
@@ -188,7 +198,7 @@ impl TargetNodeData {
         self.call_stack.as_ref().and_then(|s| s.root_location())
     }
 
-    pub fn package_cfg_modifiers(&self) -> Option<&PackageCfgModifiersValue> {
+    pub fn package_cfg_modifiers(&self) -> Option<&CfgModifiers> {
         self.package_cfg_modifiers.as_ref()
     }
 
@@ -206,13 +216,11 @@ impl TargetNodeData {
             {
                 // Infallible, which is what lets the deps accessors stay non-`Result`. Every
                 // `CoercedDepsCollector` callback returns `Ok`, and the only errors `traverse`
-                // raises on its own are two `internal_error!` invariant checks: a tuple whose
-                // arity disagrees with its type (the coercer builds tuples by zipping against
-                // that type and rejects longer ones, so it cannot construct a mismatched one),
-                // and a missing package (we pass `Some`). Either would be a buck2 bug, and
-                // panicking is the only option here because the callers cannot surface an
-                // error. `OnceLock` does not poison, so the cell stays empty and a later
-                // access retries.
+                // raises on its own are internal invariant checks: a value whose kind does not
+                // fit its attribute type (the coercer established that pairing) and a missing
+                // package (we pass `Some`). Either would be a buck2 bug, and panicking is the
+                // only option here because the callers cannot surface an error. `OnceLock`
+                // does not poison, so the cell stays empty and a later access retries.
                 a.traverse(self.label.pkg(), &mut collector)
                     .expect("should be unreachable: collector callbacks all return Ok");
             }
@@ -220,11 +228,42 @@ impl TargetNodeData {
         })
     }
 
-    /// Cap inherited from `enforce_visibility_intersection()`. `Public` = no cap.
+    /// Intersection inherited from `enforce_visibility_intersection()`.
+    /// Empty = no restriction.
     /// Stored on `Package` (per build file), so all targets in the same BUCK
-    /// file share the same cap allocation.
-    pub fn visibility_cap(&self) -> &VisibilityPatternList {
-        &self.package.visibility_cap
+    /// file share the same allocation.
+    pub fn visibility_intersection(&self) -> &VisibilityIntersection {
+        &self.package.visibility_intersection
+    }
+}
+
+/// A target as recorded while its package is still evaluating: everything a
+/// [`TargetNode`] holds except the package's attr arena, which exists only
+/// once evaluation ends.
+#[derive(Debug)]
+pub struct UnsealedTargetNode {
+    pub rule: Arc<Rule>,
+    pub package: Arc<Package>,
+    pub label: TargetLabel,
+    pub attributes: UnsealedAttrValues,
+    pub call_stack: Option<StarlarkCallStack>,
+    pub package_cfg_modifiers: Option<CfgModifiers>,
+    pub test_config_unification_rollout: bool,
+}
+
+impl UnsealedTargetNode {
+    /// The node, given the sealed arena its attribute values were encoded
+    /// into.
+    pub fn seal(self, arena: &Arc<CoercedAttrArena>) -> TargetNode {
+        TargetNode::new(
+            self.rule,
+            self.package,
+            self.label,
+            AttrValues::new(arena.dupe(), self.attributes),
+            self.call_stack,
+            self.package_cfg_modifiers,
+            self.test_config_unification_rollout,
+        )
     }
 }
 
@@ -235,7 +274,7 @@ impl TargetNode {
         label: TargetLabel,
         attributes: AttrValues,
         call_stack: Option<StarlarkCallStack>,
-        package_cfg_modifiers: Option<PackageCfgModifiersValue>,
+        package_cfg_modifiers: Option<CfgModifiers>,
         test_config_unification_rollout: bool,
     ) -> TargetNode {
         TargetNode(triomphe::Arc::new(TargetNodeData {
@@ -250,6 +289,27 @@ impl TargetNode {
         }))
     }
 
+    /// Testing-only: clone with the given intersection, modelling PACKAGE
+    /// evaluation for harnesses without PACKAGE files. Call stack is dropped (debug-only).
+    pub fn testing_with_visibility_intersection(
+        &self,
+        intersection: VisibilityIntersection,
+    ) -> TargetNode {
+        TargetNode::new(
+            self.0.rule.dupe(),
+            Arc::new(Package {
+                buildfile_path: self.0.package.buildfile_path.dupe(),
+                oncall: self.0.package.oncall.dupe(),
+                visibility_intersection: intersection,
+            }),
+            self.0.label.dupe(),
+            self.0.attributes.clone(),
+            None,
+            self.0.package_cfg_modifiers.dupe(),
+            self.0.test_config_unification_rollout,
+        )
+    }
+
     pub fn rule_kind(&self) -> RuleKind {
         self.0.rule.rule_kind
     }
@@ -262,21 +322,24 @@ impl TargetNode {
         self.as_ref().uses_plugins()
     }
 
-    pub fn get_default_target_platform(&self) -> Option<&TargetLabel> {
-        match self.known_attr_or_none(
-            DEFAULT_TARGET_PLATFORM_ATTRIBUTE.id,
-            AttrInspectOptions::All,
-        ) {
-            Some(v) => match v.value {
-                CoercedAttr::None => None,
-                CoercedAttr::ConfigurationDep(t) => Some(t.target()),
-                CoercedAttr::Selector(_) | CoercedAttr::Concat(_) => {
-                    unreachable!("coercer verified attribute is not configurable")
-                }
-                _ => unreachable!("coercer verified the attribute is dep"),
-            },
-            None => None,
-        }
+    pub fn execution_groups(&self) -> &[RuleExecutionGroup] {
+        self.as_ref().execution_groups()
+    }
+
+    pub fn default_execution_group(&self) -> bool {
+        self.as_ref().default_execution_group()
+    }
+
+    pub fn get_default_target_platform(&self) -> buck2_error::Result<Option<&TargetLabel>> {
+        Ok(self
+            .known_attr_or_none(
+                DEFAULT_TARGET_PLATFORM_ATTRIBUTE.id,
+                AttrInspectOptions::All,
+            )
+            .map(|v| v.value.unpack_configuration_dep())
+            .transpose()?
+            .flatten()
+            .map(|t| t.target()))
     }
 
     #[inline]
@@ -288,13 +351,6 @@ impl TargetNode {
     #[inline]
     pub fn deps(&self) -> impl Iterator<Item = &TargetLabel> {
         self.as_ref().deps()
-    }
-
-    /// Returns the deduplicated packages of this node's deps. See
-    /// [`TargetNodeRef::dep_packages`].
-    #[inline]
-    pub fn dep_packages(&self) -> impl Iterator<Item = PackageLabel> + '_ {
-        self.as_ref().dep_packages()
     }
 
     /// Deps which are to be transitioned to other configuration using transition function.
@@ -310,7 +366,7 @@ impl TargetNode {
     /// Get the iterator of all special attributes.
     ///
     /// "special" attributes are generated by buck, not provided by users.
-    pub fn special_attrs(&self) -> impl Iterator<Item = (&str, CoercedAttr)> {
+    pub fn special_attrs(&self) -> impl Iterator<Item = (&str, SpecialAttr)> {
         self.as_ref().special_attrs()
     }
 
@@ -318,22 +374,24 @@ impl TargetNode {
     ///
     /// "special" attributes are generated by buck, not provided by users.
     #[inline]
-    pub fn special_attr_or_none(&self, key: &str) -> Option<CoercedAttr> {
+    pub fn special_attr_or_none(&self, key: &str) -> Option<SpecialAttr> {
         self.as_ref().special_attr_or_none(key)
     }
 
     pub fn visibility(&self) -> buck2_error::Result<&VisibilitySpecification> {
         match self.0.attributes.get(VISIBILITY_ATTRIBUTE.id) {
-            Some(CoercedAttr::Visibility(v)) => Ok(v),
-            Some(a) => {
-                // This code is unreachable: visibility attributes are validated
-                // at the coercion stage. But if we did it wrong,
-                // better error with all the context than panic.
-                Err(internal_error!(
-                    "`visibility` attribute coerced incorrectly (`{0}`)",
-                    a.as_display_no_ctx().to_string(),
-                ))
-            }
+            Some(a) => match a.downcast::<kinds::Visibility>() {
+                Some(v) => Ok(v),
+                _ => {
+                    // This code is unreachable: visibility attributes are validated
+                    // at the coercion stage. But if we did it wrong,
+                    // better error with all the context than panic.
+                    Err(internal_error!(
+                        "`visibility` attribute coerced incorrectly (`{0}`)",
+                        a.as_display_no_ctx(),
+                    ))
+                }
+            },
             None => {
                 static DEFAULT: VisibilitySpecification = VisibilitySpecification::DEFAULT;
                 Ok(&DEFAULT)
@@ -348,19 +406,43 @@ impl TargetNode {
         if !self.visibility()?.0.matches_target(target)? {
             return Ok(false);
         }
-        self.0.package.visibility_cap.matches_target(target)
+        self.0.package.visibility_intersection.matches(target)
+    }
+
+    /// Audit-mode helper: true for blocks caused only by `Default` intersection
+    /// layers (downgraded to warnings), distinguishing them from own-visibility
+    /// and marker-boundary violations (fail in every mode).
+    pub fn is_visible_to_ignoring_default_layers(
+        &self,
+        target: &TargetLabel,
+    ) -> buck2_error::Result<bool> {
+        if self.label().pkg() == target.pkg() {
+            return Ok(true);
+        }
+        if !self.visibility()?.0.matches_target(target)? {
+            return Ok(false);
+        }
+        self.0
+            .package
+            .visibility_intersection
+            .matches_marker_layers(target)
     }
 
     pub fn not_visible_to_error(&self, consumer: TargetLabel) -> VisibilityError {
-        let cap = self.0.package.visibility_cap.dupe();
-        if matches!(cap, VisibilityPatternList::Public) {
+        let intersection = self.0.package.visibility_intersection.dupe();
+        if intersection.is_unrestricted() {
             VisibilityError::NotVisibleTo(self.label().dupe(), consumer)
         } else {
             let visibility = self
                 .visibility()
                 .map(|v| v.dupe())
                 .unwrap_or(VisibilitySpecification::DEFAULT);
-            VisibilityError::NotVisibleToWithCap(self.label().dupe(), consumer, visibility, cap)
+            VisibilityError::NotVisibleToWithIntersection(
+                self.label().dupe(),
+                consumer,
+                visibility,
+                intersection,
+            )
         }
     }
 
@@ -394,6 +476,27 @@ impl TargetNode {
         opts: AttrInspectOptions,
     ) -> Option<CoercedAttrFull<'_>> {
         self.as_ref().known_attr_or_none(id, opts)
+    }
+
+    /// Like [`Self::attr_or_none`], but as an owned handle sharing this
+    /// target's storage, for holders that outlive the borrow of the node.
+    #[inline]
+    pub fn owned_attr_or_none(
+        &self,
+        key: &str,
+        opts: AttrInspectOptions,
+    ) -> Option<OwnedCoercedAttr> {
+        self.as_ref().owned_attr_or_none(key, opts)
+    }
+
+    /// Like [`Self::attrs`], but yielding owned handles sharing this
+    /// target's storage.
+    #[inline]
+    pub fn owned_attrs(
+        &self,
+        opts: AttrInspectOptions,
+    ) -> impl Iterator<Item = (&str, OwnedCoercedAttr)> {
+        self.as_ref().owned_attrs(opts)
     }
 
     /// Get attribute.
@@ -467,17 +570,23 @@ impl TargetNode {
     /// Hash the fields that impact how this target is built.
     /// Don't do any recursive hashing of the dependencies.
     pub fn target_hash<H: Hasher>(&self, state: &mut H) {
-        self.label().hash(state);
+        self.label().strong_hash(state);
         self.rule_type().hash(state);
         self.package_cfg_modifiers().hash(state);
-        // Hash the visibility_cap so that tightening the visibility
+        // Hash the visibility intersection so that tightening the visibility
         // at the PACKAGE level still invalidates the target hash
-        self.visibility_cap().hash(state);
+        self.visibility_intersection().hash(state);
         self.attrs(AttrInspectOptions::All).for_each(|x| {
             // We deliberately don't hash the attribute, as if the value being passed to analysis
             // stays the same, we don't care if the attribute that generated it changed.
             x.name.hash(state);
-            x.value.hash(state);
+            // The stored identity hash is 128-bit blake3 over full content
+            // (`CoercedAttrArena::strong_of`), so folding it preserves the strength
+            // of hashing the value itself without re-walking the tree.
+            x.value
+                .root_strong_hash()
+                .expect("should be a root: attr reads serve row and default values")
+                .hash(state);
         });
         self.test_config_unification_rollout().hash(state);
     }
@@ -578,36 +687,57 @@ impl<'a> TargetNodeRef<'a> {
             .attrs(&self.0.get().attributes, opts)
     }
 
+    /// Like [`Self::attr_or_none`], but as an owned handle sharing this
+    /// target's storage, for holders that outlive the borrow of the node.
+    pub fn owned_attr_or_none(
+        &self,
+        key: &str,
+        opts: AttrInspectOptions,
+    ) -> Option<OwnedCoercedAttr> {
+        self.0
+            .get()
+            .rule
+            .attributes
+            .owned_attr_or_none(&self.0.get().attributes, key, opts)
+    }
+
+    /// Like [`Self::attrs`], but yielding owned handles sharing this
+    /// target's storage.
+    pub fn owned_attrs(
+        self,
+        opts: AttrInspectOptions,
+    ) -> impl Iterator<Item = (&'a str, OwnedCoercedAttr)> + 'a {
+        self.0
+            .get()
+            .rule
+            .attributes
+            .owned_attrs(&self.0.get().attributes, opts)
+    }
+
     /// Get special attribute value if it exists, otherwise return None.
     ///
     /// "special" attributes are generated by buck, not provided by users.
-    pub fn special_attr_or_none(self, key: &str) -> Option<CoercedAttr> {
+    pub fn special_attr_or_none(self, key: &str) -> Option<SpecialAttr> {
         match key {
-            TYPE => Some(CoercedAttr::String(StringLiteral(
-                self.rule_type().name().into(),
-            ))),
-            CONFIGURATION_DEPS => Some(CoercedAttr::List(
-                self.get_configuration_deps()
-                    .map(|t| CoercedAttr::ConfigurationDep(t.dupe()))
-                    .collect(),
+            TYPE => Some(SpecialAttr::String(self.rule_type().name().into())),
+            CONFIGURATION_DEPS => Some(SpecialAttr::ConfigurationDepList(
+                self.get_configuration_deps().map(|t| t.dupe()).collect(),
             )),
-            DEPS => Some(CoercedAttr::List(
+            DEPS => Some(SpecialAttr::LabelList(
                 self.deps()
-                    .map(|t| CoercedAttr::Label(ProvidersLabel::default_for(t.dupe())))
+                    .map(|t| ProvidersLabel::default_for(t.dupe()))
                     .collect(),
             )),
-            PACKAGE => Some(CoercedAttr::String(StringLiteral(ArcStr::from(
+            PACKAGE => Some(SpecialAttr::String(ArcStr::from(
                 self.buildfile_path().to_string().as_str(),
-            )))),
+            ))),
             ONCALL => match self.oncall() {
-                None => Some(CoercedAttr::None),
-                Some(x) => Some(CoercedAttr::String(StringLiteral(ArcStr::from(x)))),
+                None => Some(SpecialAttr::None),
+                Some(x) => Some(SpecialAttr::String(ArcStr::from(x))),
             },
             PACKAGE_CFG_MODIFIERS => match self.package_cfg_modifiers() {
-                Some(x) => Some(CoercedAttr::TargetModifiers(
-                    TargetModifiersValue::from_package_modifiers(x),
-                )),
-                None => Some(CoercedAttr::None),
+                Some(x) => Some(SpecialAttr::TargetModifiers(*x)),
+                None => Some(SpecialAttr::None),
             },
             _ => None,
         }
@@ -616,7 +746,7 @@ impl<'a> TargetNodeRef<'a> {
     /// Get the iterator of all special attributes.
     ///
     /// "special" attributes are generated by buck, not provided by users.
-    pub fn special_attrs(self) -> impl Iterator<Item = (&'a str, CoercedAttr)> + 'a {
+    pub fn special_attrs(self) -> impl Iterator<Item = (&'a str, SpecialAttr)> + 'a {
         [
             TYPE,
             CONFIGURATION_DEPS,
@@ -633,19 +763,20 @@ impl<'a> TargetNodeRef<'a> {
 
     pub fn metadata(self) -> buck2_error::Result<Option<&'a MetadataMap>> {
         self.known_attr_or_none(METADATA_ATTRIBUTE.id, AttrInspectOptions::All)
-            .map(|attr| match attr.value {
-                CoercedAttr::Metadata(m) => Ok(m),
+            .map(|attr| match attr.value.downcast::<kinds::Metadata>() {
+                Some(m) => Ok(m),
                 x => Err(internal_error!("`metadata` attribute should be coerced as a dict of strings to JSON values. Found `{:?}` instead", x)),
             })
             .transpose()
     }
 
-    pub fn target_modifiers(self) -> buck2_error::Result<Option<&'a TargetModifiersValue>> {
+    /// The target's own `modifiers`, shared with the stored value.
+    pub fn target_modifiers(self) -> buck2_error::Result<Option<CfgModifiers>> {
         self.known_attr_or_none(TARGET_MODIFIERS_ATTRIBUTE.id, AttrInspectOptions::All)
-            .map(|attr| match attr.value {
-                CoercedAttr::TargetModifiers(m) => Ok(m),
+            .map(|attr| match attr.value.downcast::<kinds::Modifiers>() {
+                Some(m) => Ok(m.dupe()),
                 x => Err(internal_error!(
-                    "`modifiers` attribute should be coerced as a JSON value. Found `{:?}` instead",
+                    "`modifiers` attribute should be coerced as modifiers. Found `{:?}` instead",
                     x
                 )),
             })
@@ -705,21 +836,17 @@ impl<'a> TargetNodeRef<'a> {
         &self.0.get().rule.uses_plugins
     }
 
-    /// Returns the deduplicated packages of every dep of this node — target, transition, exec,
-    /// toolchain, plugin *and* configuration deps. Note this is a wider set than [`Self::deps`],
-    /// which omits configuration deps: a configuration dep still forces its package to load, so
-    /// package-level callers must account for it.
-    ///
-    /// Unlike [`Self::deps`], this runs an on-demand attribute traversal and does not read
-    /// `deps_cache`, so callers that only need dep package labels don't force that cache to
-    /// materialize.
-    pub fn dep_packages(self) -> impl Iterator<Item = PackageLabel> + 'a {
-        let mut traversal = DepPackagesCollector::new();
-        for a in self.attrs(AttrInspectOptions::All) {
-            a.traverse(self.label().pkg(), &mut traversal)
-                .expect("dep_packages collector shouldn't return errors");
-        }
-        traversal.packages.into_iter()
+    pub fn execution_groups(self) -> &'a [RuleExecutionGroup] {
+        &self.0.get().rule.execution_groups
+    }
+
+    /// The attribute whose constraints only the default execution group's platform must satisfy.
+    pub fn default_exec_compatible_with_attr(self) -> Option<AttributeId> {
+        self.0.get().rule.default_exec_compatible_with_attr
+    }
+
+    pub fn default_execution_group(self) -> bool {
+        self.0.get().rule.default_execution_group
     }
 
     pub fn inputs(self) -> impl Iterator<Item = CellPath> + 'a {
@@ -752,7 +879,6 @@ pub mod testing {
     use buck2_fs::paths::file_name::FileNameBuf;
     use serde_json::map::Map;
     use serde_json::value::Value;
-    use starlark_map::vec2::Vec2;
 
     use super::*;
     use crate::attrs::attr::Attribute;
@@ -769,7 +895,7 @@ pub mod testing {
         fn testing_new(
             label: TargetLabel,
             rule_type: RuleType,
-            attrs: Vec<(&str, Attribute, CoercedAttr)>,
+            attrs: Vec<(&str, Attribute, OwnedCoercedAttr)>,
             call_stack: Option<StarlarkCallStack>,
         ) -> Self;
     }
@@ -778,7 +904,7 @@ pub mod testing {
         fn testing_new(
             label: TargetLabel,
             rule_type: RuleType,
-            attrs: Vec<(&str, Attribute, CoercedAttr)>,
+            attrs: Vec<(&str, Attribute, OwnedCoercedAttr)>,
             call_stack: Option<StarlarkCallStack>,
         ) -> TargetNode {
             let attr_spec = AttributeSpec::testing_new(
@@ -788,18 +914,19 @@ pub mod testing {
                     .collect(),
             );
 
-            let mut attributes = Vec2::with_capacity(attrs.len() + 1);
+            let mut builder = CoercedAttrArena::builder();
+            let mut attributes = UnsealedAttrValues::with_capacity(attrs.len() + 1);
 
-            attributes.push(
-                NAME_ATTRIBUTE.id,
-                CoercedAttr::String(StringLiteral(label.name().as_str().into())),
-            );
+            let name = builder.encode_string(label.name().as_str()).unwrap();
+            attributes.push(&mut builder, NAME_ATTRIBUTE.id, name);
 
             for (name, _attr, val) in attrs.into_iter() {
                 let idx = attr_spec.attribute_id_by_name(name).unwrap();
-                attributes.push(idx, val);
+                let val = builder.encode_view(val.as_ref()).unwrap();
+                attributes.push(&mut builder, idx, val);
             }
-            let attributes = AttrValues::new(attributes);
+
+            let attributes = AttrValues::new(Arc::new(builder.finish()), attributes);
 
             let buildfile_path = Arc::new(BuildFilePath::new(
                 label.pkg().dupe(),
@@ -812,11 +939,14 @@ pub mod testing {
                     rule_kind: RuleKind::Normal,
                     cfg: RuleIncomingTransition::None,
                     uses_plugins: Vec::new(),
+                    execution_groups: Vec::new(),
+                    default_execution_group: true,
+                    default_exec_compatible_with_attr: None,
                 }),
                 Arc::new(Package {
                     buildfile_path,
                     oncall: None,
-                    visibility_cap: VisibilityPatternList::Public,
+                    visibility_intersection: VisibilityIntersection::unrestricted(),
                 }),
                 label,
                 attributes,
@@ -858,107 +988,5 @@ pub mod testing {
             })
             .collect::<buck2_error::Result<Map<String, Value>>>()?;
         Ok(Value::from(map))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use buck2_core::bzl::ImportPath;
-    use buck2_core::plugins::PluginKindSet;
-
-    use super::*;
-    use crate::attrs::attr::Attribute;
-    use crate::attrs::attr_type::AttrType;
-    use crate::bzl_or_bxl_path::BzlOrBxlPath;
-    use crate::nodes::unconfigured::testing::TargetNodeExt;
-    use crate::provider_id_set::ProviderIdSet;
-    use crate::rule_type::StarlarkRuleType;
-
-    /// `dep_packages()` (used by build-signal load enrichment) must collect the package of every
-    /// dep bucket — regular/exec/toolchain *and* configuration. Configuration deps are the
-    /// difference from `deps()`: they force their package to load, so the load graph needs them.
-    /// Guards against a future dep bucket being dropped from the traversal.
-    #[test]
-    fn dep_packages_covers_every_bucket_including_configuration() {
-        let label = TargetLabel::testing_parse("root//pkg:foo");
-        let rule_type = RuleType::Starlark(Arc::new(StarlarkRuleType {
-            path: BzlOrBxlPath::Bzl(ImportPath::testing_new("root//rules:defs.bzl")),
-            name: "my_rule".to_owned(),
-        }));
-
-        let dep_label = ProvidersLabel::default_for(TargetLabel::testing_parse("root//dep:d"));
-        let exec_label = ProvidersLabel::default_for(TargetLabel::testing_parse("root//exec:e"));
-        let tc_label = ProvidersLabel::default_for(TargetLabel::testing_parse("root//tc:t"));
-        let cfg_label = ProvidersLabel::default_for(TargetLabel::testing_parse("root//cfg:c"));
-
-        // Capture expected packages before the labels are moved into the attrs.
-        let dep_pkg = dep_label.target().pkg();
-        let exec_pkg = exec_label.target().pkg();
-        let tc_pkg = tc_label.target().pkg();
-        let cfg_pkg = cfg_label.target().pkg();
-
-        // The dep BUCKET is determined by the AttrType's transition, not the CoercedAttr variant:
-        // regular/exec/toolchain deps all use CoercedAttr::Dep; only the AttrType differs.
-        let attrs = vec![
-            (
-                "dep",
-                Attribute::new_const(
-                    None,
-                    "",
-                    AttrType::dep(ProviderIdSet::EMPTY, PluginKindSet::EMPTY),
-                ),
-                CoercedAttr::Dep(dep_label),
-            ),
-            (
-                "exec_dep",
-                Attribute::new_const(None, "", AttrType::exec_dep(ProviderIdSet::EMPTY)),
-                CoercedAttr::Dep(exec_label),
-            ),
-            (
-                "toolchain_dep",
-                Attribute::new_const(None, "", AttrType::toolchain_dep(ProviderIdSet::EMPTY)),
-                CoercedAttr::Dep(tc_label),
-            ),
-            (
-                "configuration_dep",
-                Attribute::new_const(
-                    None,
-                    "",
-                    AttrType::configuration_dep(ConfigurationDepKind::SelectKey),
-                ),
-                CoercedAttr::ConfigurationDep(cfg_label),
-            ),
-        ];
-
-        let node = TargetNode::testing_new(label, rule_type, attrs, None);
-
-        let dedup = |mut v: Vec<PackageLabel>| {
-            v.sort();
-            v.dedup();
-            v
-        };
-        let from_packages = dedup(node.as_ref().dep_packages().collect());
-        let from_deps = dedup(node.as_ref().deps().map(|t| t.pkg()).collect());
-
-        let mut expected = from_deps.clone();
-        expected.push(cfg_pkg);
-        assert_eq!(
-            from_packages,
-            dedup(expected),
-            "dep_packages() must be deps()'s packages plus the configuration dep packages"
-        );
-
-        for (pkg, bucket) in [
-            (&dep_pkg, "regular"),
-            (&exec_pkg, "exec"),
-            (&tc_pkg, "toolchain"),
-            (&cfg_pkg, "configuration"),
-        ] {
-            assert!(from_packages.contains(pkg), "{bucket} dep package missing");
-        }
-        assert!(
-            !from_deps.contains(&cfg_pkg),
-            "deps() omits configuration deps; dep_packages() being the wider set is the point"
-        );
     }
 }

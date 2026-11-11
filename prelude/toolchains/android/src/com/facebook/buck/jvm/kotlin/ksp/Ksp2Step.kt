@@ -20,7 +20,6 @@ import com.facebook.buck.jvm.core.BuildTargetValue
 import com.facebook.buck.jvm.java.CompilerOutputPaths
 import com.facebook.buck.jvm.kotlin.cd.analytics.KotlinCDAnalytics
 import com.facebook.buck.jvm.kotlin.cd.analytics.KotlinCDLoggingContext
-import com.facebook.buck.jvm.kotlin.ksp.incremental.Ksp2Mode
 import com.facebook.buck.jvm.kotlin.util.getExpandedSourcePaths
 import com.facebook.buck.step.StepExecutionResult
 import com.facebook.buck.step.StepExecutionResults
@@ -64,7 +63,8 @@ class Ksp2Step(
     private val jvmDefaultMode: String,
     private val javaBinary: Optional<String>,
     private val kotlinCDAnalytics: KotlinCDAnalytics,
-    private val ksp2Mode: Ksp2Mode,
+    private val kspCachesOutput: RelPath,
+    private val friendPaths: Collection<AbsPath> = emptyList(),
 ) : IsolatedStep {
 
   private val noOpDetector = Ksp2NoOpDetector()
@@ -84,7 +84,7 @@ class Ksp2Step(
             sourceFilePaths.size,
         )
         kotlinCDAnalytics.log(
-            KotlinCDLoggingContext(languageVersion, ksp2Mode, durationMs).apply {
+            KotlinCDLoggingContext(languageVersion, durationMs).apply {
               addExtras(
                   this@Ksp2Step::class.java.simpleName,
                   "Ksp2 step duration: $durationMs ms",
@@ -94,7 +94,6 @@ class Ksp2Step(
                   shouldRecordProcessorCounts(
                       exitCode == KotlinSymbolProcessing.ExitCode.OK,
                       counts.isNotEmpty(),
-                      ksp2Mode,
                   )
               ) {
                 addExtras(
@@ -152,6 +151,8 @@ class Ksp2Step(
 
     // Build processor options
     val apOptions = getApOptions()
+    val (kspLibraries, kspFriends) =
+        librariesAndFriends(allClasspaths.map { it.toFile() }, friendPaths.map { it.toFile() })
 
     // Expand source paths
     val sourceFilePathsExpanded = getExpandedSourcePathsOrThrow(
@@ -184,23 +185,12 @@ class Ksp2Step(
               javaSourceRoots = sourceFilePathsResolved
               languageVersion = this@Ksp2Step.languageVersion.value
               apiVersion = this@Ksp2Step.languageVersion.value
-              libraries = allClasspaths.map { it.toFile() }
+              libraries = kspLibraries
+              friends = kspFriends
               jvmDefaultMode = this@Ksp2Step.jvmDefaultMode
               resolveJdkHome(this@Ksp2Step.javaBinary)?.let { jdkHome = it }
 
-              when (ksp2Mode) {
-                is Ksp2Mode.NonIncremental -> {
-                  cachesDir = rootPath.resolve(ksp2Mode.kspCachesOutput).toFile()
-                }
-                is Ksp2Mode.Incremental -> {
-                  incremental = true
-                  cachesDir = ksp2Mode.cachesDir.toFile()
-                  incrementalLog = ksp2Mode.incrementalLog
-                  modifiedSources = ksp2Mode.modifiedSources.map { it.toFile() }
-                  removedSources = ksp2Mode.removedSources.map { it.toFile() }
-                  changedClasses = ksp2Mode.changedClasses
-                }
-              }
+              cachesDir = rootPath.resolve(kspCachesOutput).toFile()
             }
             .build()
 
@@ -224,13 +214,9 @@ class Ksp2Step(
               |  languageVersion = ${kspConfig.languageVersion}
               |  apiVersion = ${kspConfig.apiVersion}
               |  libraries = ${kspConfig.libraries}
+              |  friends = ${kspConfig.friends}
               |  jvmDefaultMode = ${kspConfig.jvmDefaultMode}
               |  jdkHome = ${kspConfig.jdkHome}
-              |  incremental = ${kspConfig.incremental}
-              |  incrementalLog = ${kspConfig.incrementalLog}
-              |  modifiedSources = ${kspConfig.modifiedSources.joinToString()}
-              |  removedSources = ${kspConfig.removedSources.joinToString()}
-              |  changedClasses = ${kspConfig.changedClasses.joinToString()}
               |]"""
             .trimMargin(),
     )
@@ -296,20 +282,35 @@ class Ksp2Step(
       }
 
   companion object {
+    /**
+     * The KSP2 libraries and friends: the friend jars are passed as friends and left out of the
+     * libraries, because a jar that is also a library hides the friend module's `internal`
+     * declarations from KSP2.
+     */
+    @JvmStatic
+    fun librariesAndFriends(
+        classpath: List<File>,
+        friendPaths: List<File>,
+    ): Pair<List<File>, List<File>> {
+      if (friendPaths.isEmpty()) {
+        return classpath to emptyList()
+      }
+      val friends = friendPaths.toSet()
+      return classpath.filterNot { it in friends } to friendPaths
+    }
+
     private val LOG: Logger = Logger.get(Ksp2Step::class.java)
 
     private const val PROCESSOR_OUTPUT_EXTRAS_KEY = "ksp2_processor_generated_files"
 
     /**
-     * Telemetry records only successful non-incremental runs that produced counts: an aborted run
-     * leaves never-ran processors reading zero, and in an incremental round a zero mixes genuine
-     * no-ops with legitimately idle processors.
+     * Telemetry records only successful runs that produced counts: an aborted run leaves never-ran
+     * processors reading zero.
      */
     fun shouldRecordProcessorCounts(
         succeeded: Boolean,
         hasCounts: Boolean,
-        ksp2Mode: Ksp2Mode,
-    ): Boolean = succeeded && hasCounts && ksp2Mode is Ksp2Mode.NonIncremental
+    ): Boolean = succeeded && hasCounts
 
     private val jdkHomeCache = java.util.concurrent.ConcurrentHashMap<String, File>()
     private val JAVA_HOME_REGEX = Regex("""java\.home\s*=\s*(.+)""")

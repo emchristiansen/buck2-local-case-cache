@@ -88,9 +88,6 @@ fn sqlite_db_setup_metadata_and_versions(
     })? {
         versions.insert("buckconfig_version".to_owned(), buckconfig_version);
     }
-    if let Some(hostname) = metadata.get("hostname") {
-        versions.insert("hostname".to_owned(), hostname.to_owned());
-    }
 
     Ok((metadata, versions))
 }
@@ -212,10 +209,14 @@ pub(crate) async fn maybe_initialize_dep_file_sqlite_db(
         })?
         .unwrap_or(false);
     if requested && !options.sqlite_materializer_state {
-        tracing::warn!(
-            "Ignoring `buck2.sqlite_dep_file_state`: it needs `buck2.sqlite_materializer_state`, \
+        soft_error!(
+            "sqlite_dep_file_state_needs_materializer_state",
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Ignoring `buck2.sqlite_dep_file_state`: it needs `buck2.sqlite_materializer_state`, \
              which is disabled. The persisted dep-file cache re-validates outputs against the \
              materializer state db after a restart. Startup continues with the cache disabled."
+            )
         );
     }
     let enabled = requested && options.sqlite_materializer_state;
@@ -232,14 +233,13 @@ pub(crate) async fn maybe_initialize_dep_file_sqlite_db(
             })
             .await;
         if let Err(e) = removed {
-            let _unused = soft_error!(
+            soft_error!(
                 "dep_file_state_db_remove",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Tier0,
                     "Failed to delete the disabled dep-file state db. {}",
                     e
-                ),
-                quiet: true
+                )
             );
         }
         return Ok(None);
@@ -295,14 +295,13 @@ pub(crate) async fn maybe_initialize_dep_file_sqlite_db(
     {
         Ok(db) => db,
         Err(e) => {
-            let _unused = soft_error!(
+            soft_error!(
                 "dep_file_state_db_init",
                 buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Tier0,
                     "Failed to open the dep-file state db; continuing without persistence. {}",
                     e
-                ),
-                quiet: true
+                )
             );
             return Ok(None);
         }

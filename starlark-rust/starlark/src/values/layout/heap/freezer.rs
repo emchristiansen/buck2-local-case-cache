@@ -23,13 +23,9 @@ use crate::eval::compiler::def::Def;
 use crate::values::AllocFrozenValue;
 use crate::values::FreezeResult;
 use crate::values::FrozenHeap;
-use crate::values::HeapSendable;
 use crate::values::SealEdge;
 use crate::values::ValueTyped;
-use crate::values::layout::avalue::AValue;
-use crate::values::layout::heap::arena::FrozenReservation;
 use crate::values::layout::heap::repr::AValueHeapEntryState;
-use crate::values::layout::heap::send::HeapSyncable;
 use crate::values::layout::value::Value;
 
 /// Copies values from the heap of `'v` onto the frozen heap of `'fv`; the argument of
@@ -76,18 +72,6 @@ impl<'v, 'fv> Freezer<'v, 'fv> {
         self.heap.alloc(val)
     }
 
-    pub(crate) fn reserve<'v2, T>(&self) -> FrozenReservation<'fv, 'v2, T>
-    where
-        T: AValue<'v2, ExtraElem = ()>,
-        T::StarlarkValue: HeapSendable<'v2>,
-        T::StarlarkValue: HeapSyncable<'v2>,
-    {
-        let (r, extra) = self.heap.reserve_with_extra::<T>(0);
-        let extra = unsafe { &mut *extra };
-        debug_assert!(extra.is_empty());
-        r
-    }
-
     /// Freeze a nested value while freezing yourself.
     pub fn freeze(&self, value: Value<'v>) -> FreezeResult<Value<'fv>> {
         // An error leaves sources forwarding to unpublished reservations, so
@@ -104,12 +88,14 @@ impl<'v, 'fv> Freezer<'v, 'fv> {
         }
 
         // Case 2: We have already been replaced with a forwarding, or need to freeze
-        let value = value.0.unpack_ptr().unwrap();
-        match value.state() {
+        let entry = value.0.unpack_ptr().unwrap();
+        match entry.state() {
             AValueHeapEntryState::Forward(x) => {
                 Ok(unsafe { x.forward_ptr().unpack_frozen_value() })
             }
-            AValueHeapEntryState::Value(v) => {
+            AValueHeapEntryState::Value(_) => {
+                // SAFETY: just checked to be a live value.
+                let v = unsafe { value.0.value_header_ptr_unchecked() };
                 let result = unsafe { v.unpack().heap_freeze(self) };
                 #[cfg(debug_assertions)]
                 if result.is_err() {

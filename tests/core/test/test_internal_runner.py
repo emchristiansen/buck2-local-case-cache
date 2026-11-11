@@ -9,7 +9,6 @@
 
 # pyre-strict
 
-
 import asyncio
 import json
 import os
@@ -23,105 +22,14 @@ from pathlib import Path
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.api.buck_result import BuckResult
 from buck2.tests.e2e_util.asserts import expect_failure
-from buck2.tests.e2e_util.buck_workspace import buck_test, env
+from buck2.tests.e2e_util.buck_workspace import buck_test, BuckTestCase, env
 
 # Empty test executor forces internal test executor to be used.
 INTERNAL_TEST_EXECUTOR = ""
 
 
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_test_executor(buck: Buck) -> None:
-    await buck.test(
-        ":trivial_pass",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-
-
-@buck_test()
-@env("TEST_VAR", "BAD_VALUE")
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_test_executor_env(buck: Buck) -> None:
-    await buck.test(
-        ":check_env",
-        "--",
-        "--env",
-        "TEST_VAR=TEST_VALUE",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_test_executor_timeout(buck: Buck) -> None:
-    await expect_failure(
-        buck.test(
-            ":timeout",
-            "--",
-            "--timeout",
-            "1",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-        stderr_regex="Timeout: ",
-    )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_provider_without_cache_permission(buck: Buck) -> None:
-    await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        ":internal_default_pass",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_cache_request_without_root_executes_normally(buck: Buck) -> None:
-    # Reuse needs an explicitly configured store; without one the case runs and nothing is
-    # published.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        ":internal_cache_request",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert "no [test] local_case_result_cache_root is configured" in result.stderr
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_cache_request_with_literal_tool_executes_normally(
-    buck: Buck,
-) -> None:
-    # `fbpython` is found through PATH, so the command is not bound to its declared inputs:
-    # the case is ineligible and executes normally instead of being reused. Which unbound input
-    # the closure check reports first depends on the host's PATH, so any of them will do; a
-    # second run is not served from the store either.
-    store = buck.cwd / "local-case-store"
-    for _ in range(2):
-        result = await buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            "-c",
-            f"test.local_case_result_cache_root={store}",
-            ":internal_cache_request",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        )
-        assert_exactly_one_pass(result)
-        stderr = _plain_stderr(result)
-        assert re.search(
-            r"Local case result reuse unavailable for \S*:internal_cache_request\b.*: "
-            r"the command is not bound: .+; the case executes normally",
-            stderr,
-        ), stderr
-        assert "Local test-result reuse" not in stderr, stderr
-    assert not (store / "v1").exists() or not any((store / "v1").iterdir())
-
-
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 _EXACTLY_ONE_PASS = (
     "Tests finished: Pass 1. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
@@ -139,209 +47,6 @@ def assert_exactly_one_pass(result: BuckResult) -> None:
     stderr = _plain_stderr(result)
     assert _EXACTLY_ONE_PASS in stderr, stderr
     assert "NO TESTS RAN" not in stderr, stderr
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_pair_runner_disabled_runs_external(buck: Buck) -> None:
-    # The executor spec and its expansion both come from the External provider: its command
-    # runs with its own environment, and the Internal-only `INTERNAL_ONLY` is neither a
-    # dangling handle nor set.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=false",
-        "-c",
-        "provider_pair.expected=external",
-        ":provider_pair",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_pair_unselected_framework_runs_external(buck: Buck) -> None:
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=rust",
-        "-c",
-        "provider_pair.expected=external",
-        ":provider_pair",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_pair_runner_enabled_runs_internal(buck: Buck) -> None:
-    # The fixture's External command fails when Internal is expected, so passing proves the
-    # Internal provider ran.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        "-c",
-        "provider_pair.expected=internal",
-        ":provider_pair",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_pair_wrong_provider_fails(buck: Buck) -> None:
-    # Control for the fixture: running the other provider than the expected one fails.
-    await expect_failure(
-        buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            "-c",
-            "provider_pair.expected=external",
-            ":provider_pair",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-    )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_pair_labels_come_from_the_selected_provider(buck: Buck) -> None:
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=false",
-        "-c",
-        "provider_pair.expected=external",
-        ":provider_pair",
-        "--include",
-        "external_provider",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        "-c",
-        "provider_pair.expected=internal",
-        ":provider_pair",
-        "--include",
-        "internal_provider",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_exactly_one_pass_rejects_a_run_without_results(buck: Buck) -> None:
-    # With the runner disabled the External provider's labels apply, so including only the
-    # Internal provider's label runs nothing; the assertion must reject that run.
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=false",
-        "-c",
-        "provider_pair.expected=external",
-        ":provider_pair",
-        "--include",
-        "internal_provider",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert "NO TESTS RAN" in _plain_stderr(result)
-    try:
-        assert_exactly_one_pass(result)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError("a run without results was accepted as exactly one pass")
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_artifact_pair_runner_disabled_builds_only_external_inputs(
-    buck: Buck,
-) -> None:
-    # The Internal provider's input action always fails: the run passes only if the build
-    # builds the External provider's distinct input and not the Internal provider's.
-    for runner in ["false", "rust"]:
-        result = await buck.test(
-            "-c",
-            f"test.use_internal_runner={runner}",
-            ":provider_artifact_pair",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        )
-        assert_exactly_one_pass(result)
-        assert "internal_only_input" not in _plain_stderr(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_provider_artifact_pair_runner_enabled_builds_internal_inputs(
-    buck: Buck,
-) -> None:
-    for config in [["-c", "test.use_internal_runner=true"], []]:
-        await expect_failure(
-            buck.test(
-                *config,
-                ":provider_artifact_pair",
-                test_executor=INTERNAL_TEST_EXECUTOR,
-            ),
-            stderr_regex="internal_only_input",
-        )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_internal_only_provider_with_runner_disabled_is_refused(buck: Buck) -> None:
-    await expect_failure(
-        buck.test(
-            "-c",
-            "test.use_internal_runner=false",
-            ":internal_default_pass",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-        stderr_regex="does not select test type `custom`, and the target has no `ExternalRunnerTestInfo`",
-    )
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_gives_each_run_new_empty_directories(buck: Buck) -> None:
-    # The case fails unless TMPDIR holds exactly its two declared directories, each empty and
-    # owner-only, and it leaves files in them; so the second run passes only if they were
-    # removed and recreated before it.
-    for _ in range(2):
-        result = await buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            ":internal_fresh_dirs",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        )
-        assert_exactly_one_pass(result)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
-    buck: Buck,
-) -> None:
-    # Each run holds its files for a while before checking them; a concurrent run of the same
-    # case that removed or reused the case's directories in between would fail one of them.
-    results = await asyncio.gather(
-        *(
-            buck.test(
-                "-c",
-                "test.use_internal_runner=true",
-                "-c",
-                "fresh_dirs.hold=3",
-                ":internal_fresh_dirs",
-                test_executor=INTERNAL_TEST_EXECUTOR,
-            )
-            for _ in range(2)
-        )
-    )
-    for result in results:
-        assert_exactly_one_pass(result)
-
 
 _PASS_2 = (
     "Tests finished: Pass 2. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. "
@@ -443,295 +148,11 @@ async def _holder_beside_parser_failure(
         _stop_if_running(signals)
 
 
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_cancelled_holder_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    await _cancel_holder_with_queued_run(buck, ":fresh_hold")
-    await _expect_forkserver(buck, True)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_cancelled_holder_releases_after_its_child_without_forkserver(
-    buck: Buck,
-) -> None:
-    await _without_forkserver(buck)
-    await _cancel_holder_with_queued_run(buck, ":fresh_hold")
-    await _expect_forkserver(buck, False)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_cancelled_holder_without_store_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    # Reuse requested, but no store is configured: the case executes normally.
-    await _without_forkserver(buck)
-    await _cancel_holder_with_queued_run(buck, ":fresh_hold_cache_requested")
-    await _expect_forkserver(buck, False)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_cancelled_holder_with_unsupported_parser_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    # Reuse requested with a store, but the parser cannot be keyed: the case executes
-    # normally.
-    await _without_forkserver(buck)
-    store = buck.cwd / "local-case-store"
-    await _cancel_holder_with_queued_run(
-        buck,
-        ":fresh_hold_unsupported_parser",
-        "-c",
-        f"test.local_case_result_cache_root={store}",
-    )
-    await _expect_forkserver(buck, False)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    await _holder_beside_parser_failure(buck)
-    await _expect_forkserver(buck, True)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child_without_forkserver(
-    buck: Buck,
-) -> None:
-    await _without_forkserver(buck)
-    await _holder_beside_parser_failure(buck)
-    await _expect_forkserver(buck, False)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_holder_without_store_beside_parser_failure_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    # Reuse requested, but no store is configured: the case executes normally.
-    await _without_forkserver(buck)
-    await _holder_beside_parser_failure(
-        buck, ":fresh_hold_beside_parser_failure_cache_requested"
-    )
-    await _expect_forkserver(buck, False)
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_holder_with_unsupported_parser_beside_parser_failure_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    # Reuse requested with a store, but the parser cannot be keyed: the case executes
-    # normally.
-    await _without_forkserver(buck)
-    store = buck.cwd / "local-case-store"
-    await _holder_beside_parser_failure(
-        buck,
-        ":fresh_hold_beside_parser_failure_unsupported_parser",
-        "-c",
-        f"test.local_case_result_cache_root={store}",
-    )
-    await _expect_forkserver(buck, False)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_names_are_not_replaced_by_invocation_identity(
-    buck: Buck,
-) -> None:
-    # `BUCK_BUILD_ID` and `BUCK2_DAEMON_UUID` are otherwise set by the executor for every
-    # command; declared as fresh directory names they must still be the case's directories.
-    started = buck.cwd / "started.json"
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        "-c",
-        f"fresh_dirs.started={started}",
-        ":fresh_identity_names",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-    assert started.exists()
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_name_set_by_a_local_resource_is_refused(
-    buck: Buck,
-) -> None:
-    # A local resource would set the case's fresh directory variable to its own value; the
-    # case is refused before its child starts.
-    started = buck.cwd / "started.json"
-    await expect_failure(
-        buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            "-c",
-            f"fresh_dirs.started={started}",
-            ":fresh_name_set_by_resource",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-        stderr_regex="Scratch directory variable `FRESH_A` is also set by a local resource",
-    )
-    assert not started.exists()
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_beside_an_unrelated_local_resource(buck: Buck) -> None:
-    # The control: a local resource setting another variable leaves the fresh directory in
-    # place and still sets its own.
-    started = buck.cwd / "started.json"
-    result = await buck.test(
-        "-c",
-        "test.use_internal_runner=true",
-        "-c",
-        f"fresh_dirs.started={started}",
-        ":fresh_beside_unrelated_resource",
-        test_executor=INTERNAL_TEST_EXECUTOR,
-    )
-    assert_exactly_one_pass(result)
-    assert json.loads(started.read_text())["OTHER"] == "42"
-
-
-@buck_test(skip_for_os=["windows"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_socket_does_not_fit_in_buck_out(buck: Buck) -> None:
-    # A `buck-out` scratch path leaves too little of an AF_UNIX address for the socket.
-    await expect_failure(
-        buck.test(
-            "-c",
-            "test.use_internal_runner=true",
-            ":fresh_socket",
-            test_executor=INTERNAL_TEST_EXECUTOR,
-        ),
-        stderr_regex="AF_UNIX path too long",
-    )
-
-
-@buck_test(skip_for_os=["windows"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_socket_fits_in_a_scratch_root(buck: Buck) -> None:
-    # With a short scratch root the socket fits. The engine creates the root, owner-only; the
-    # case's scratch path in it is removed before each run, so the second run can bind the
-    # socket the first one left behind.
-    root = _short_scratch_root()
-    try:
-        for _ in range(2):
-            result = await buck.test(
-                "-c",
-                "test.use_internal_runner=true",
-                "-c",
-                f"test.local_case_scratch_root={root}",
-                ":fresh_socket",
-                test_executor=INTERNAL_TEST_EXECUTOR,
-            )
-            assert_exactly_one_pass(result)
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
-        [scratch] = list(root.iterdir())
-        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
-        assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
-    finally:
-        if root.exists():
-            shutil.rmtree(root)
-
-
-@buck_test(skip_for_os=["windows"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_invalid_scratch_root_is_refused(buck: Buck) -> None:
-    # An invalid root refuses the case before its child starts, rather than falling back to
-    # `buck-out`, and nothing is created. (The runner reports the refusal as a fatal result;
-    # which rule refused it is covered where the root is validated.)
-    started = buck.cwd / "started.json"
-    shared = buck.cwd / "shared"
-    shared.mkdir()
-    shared.chmod(0o770)
-    for root in ["relative", str(shared / "root")]:
-        result = await expect_failure(
-            buck.test(
-                "-c",
-                "test.use_internal_runner=true",
-                "-c",
-                f"fresh_dirs.started={started}",
-                "-c",
-                f"test.local_case_scratch_root={root}",
-                ":fresh_started",
-                test_executor=INTERNAL_TEST_EXECUTOR,
-            ),
-        )
-        assert (
-            "Tests finished: Pass 0. Fail 0. Timeout 0. Fatal 1." in _plain_stderr(result)
-        ), result.stderr
-        assert not started.exists()
-    assert not (buck.cwd / "relative").exists()
-    assert not (shared / "root").exists()
-
-
 def _short_scratch_root() -> Path:
     root = Path(tempfile.gettempdir()) / f"b2s{os.getpid()}"
     assert len(str(root)) <= 70, f"the scratch root {root} is too long for this test"
     assert not root.exists(), root
     return root
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_holder_in_a_scratch_root_beside_parser_failure_releases_after_its_child(
-    buck: Buck,
-) -> None:
-    # The scratch path in a scratch root is held, like a `buck-out` one, until an abandoned
-    # child has gone.
-    await _without_forkserver(buck)
-    root = _short_scratch_root()
-    try:
-        await _holder_beside_parser_failure(
-            buck,
-            ":fresh_hold_beside_parser_failure",
-            "-c",
-            f"test.local_case_scratch_root={root}",
-        )
-    finally:
-        if root.exists():
-            shutil.rmtree(root)
-    await _expect_forkserver(buck, False)
-
-
-@buck_test()
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_concurrent_runs_of_a_case_in_a_scratch_root_do_not_share_directories(
-    buck: Buck,
-) -> None:
-    root = _short_scratch_root()
-    try:
-        results = await asyncio.gather(
-            *(
-                buck.test(
-                    "-c",
-                    "test.use_internal_runner=true",
-                    "-c",
-                    "fresh_dirs.hold=3",
-                    "-c",
-                    f"test.local_case_scratch_root={root}",
-                    ":internal_fresh_dirs",
-                    test_executor=INTERNAL_TEST_EXECUTOR,
-                )
-                for _ in range(2)
-            )
-        )
-        for result in results:
-            assert_exactly_one_pass(result)
-        [scratch] = list(root.iterdir())
-        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
-    finally:
-        if root.exists():
-            shutil.rmtree(root)
 
 
 def _store_tools() -> tuple[str, str]:
@@ -809,26 +230,588 @@ async def _tracked_fresh_dirs_produce_and_reuse(buck: Buck, *config: str) -> Pat
     return Path(scratch)
 
 
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_tracked_case_is_published_then_reused(buck: Buck) -> None:
-    scratch = await _tracked_fresh_dirs_produce_and_reuse(buck)
-    assert scratch.parent.name == "local_case_fresh", scratch
-    assert (buck.cwd / "buck-out") in scratch.parents, scratch
-
-
-@buck_test(skip_for_os=["windows", "darwin"])
-@env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
-async def test_fresh_dir_env_tracked_case_in_a_scratch_root_is_published_then_reused(
-    buck: Buck,
-) -> None:
-    root = _short_scratch_root()
-    try:
-        scratch = await _tracked_fresh_dirs_produce_and_reuse(
-            buck, "-c", f"test.local_case_scratch_root={root}"
+class InternalRunnerTest(BuckTestCase):
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_test_executor(self, buck: Buck) -> None:
+        await buck.test(
+            ":trivial_pass",
+            test_executor=INTERNAL_TEST_EXECUTOR,
         )
-        assert scratch.parent == root, scratch
-        assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
-    finally:
-        if root.exists():
-            shutil.rmtree(root)
+
+    @buck_test()
+    @env("TEST_VAR", "BAD_VALUE")
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_test_executor_env(self, buck: Buck) -> None:
+        await buck.test(
+            ":check_env",
+            "--",
+            "--env",
+            "TEST_VAR=TEST_VALUE",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_test_executor_timeout(self, buck: Buck) -> None:
+        await expect_failure(
+            buck.test(
+                ":timeout",
+                "--",
+                "--timeout",
+                "1",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+            stderr_regex="Timeout: ",
+        )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_provider_without_cache_permission(self, buck: Buck) -> None:
+        await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            ":internal_default_pass",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_cache_request_without_root_executes_normally(self, buck: Buck) -> None:
+        # Reuse needs an explicitly configured store; without one the case runs and nothing is
+        # published.
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            ":internal_cache_request",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert "no [test] local_case_result_cache_root is configured" in result.stderr
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_cache_request_with_literal_tool_executes_normally(
+        self,
+        buck: Buck,
+    ) -> None:
+        # `fbpython` is found through PATH, so the command is not bound to its declared inputs:
+        # the case is ineligible and executes normally instead of being reused. Which unbound input
+        # the closure check reports first depends on the host's PATH, so any of them will do; a
+        # second run is not served from the store either.
+        store = buck.cwd / "local-case-store"
+        for _ in range(2):
+            result = await buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                f"test.local_case_result_cache_root={store}",
+                ":internal_cache_request",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            )
+            assert_exactly_one_pass(result)
+            stderr = _plain_stderr(result)
+            assert re.search(
+                r"Local case result reuse unavailable for \S*:internal_cache_request\b.*: "
+                r"the command is not bound: .+; the case executes normally",
+                stderr,
+            ), stderr
+            assert "Local test-result reuse" not in stderr, stderr
+        assert not (store / "v1").exists() or not any((store / "v1").iterdir())
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_pair_runner_disabled_runs_external(self, buck: Buck) -> None:
+        # The executor spec and its expansion both come from the External provider: its command
+        # runs with its own environment, and the Internal-only `INTERNAL_ONLY` is neither a
+        # dangling handle nor set.
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=false",
+            "-c",
+            "provider_pair.expected=external",
+            ":provider_pair",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_pair_unselected_framework_runs_external(self, buck: Buck) -> None:
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=rust",
+            "-c",
+            "provider_pair.expected=external",
+            ":provider_pair",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_pair_runner_enabled_runs_internal(self, buck: Buck) -> None:
+        # The fixture's External command fails when Internal is expected, so passing proves the
+        # Internal provider ran.
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            "provider_pair.expected=internal",
+            ":provider_pair",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_pair_wrong_provider_fails(self, buck: Buck) -> None:
+        # Control for the fixture: running the other provider than the expected one fails.
+        await expect_failure(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                "provider_pair.expected=external",
+                ":provider_pair",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+        )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_pair_labels_come_from_the_selected_provider(self, buck: Buck) -> None:
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=false",
+            "-c",
+            "provider_pair.expected=external",
+            ":provider_pair",
+            "--include",
+            "external_provider",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            "provider_pair.expected=internal",
+            ":provider_pair",
+            "--include",
+            "internal_provider",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_exactly_one_pass_rejects_a_run_without_results(self, buck: Buck) -> None:
+        # With the runner disabled the External provider's labels apply, so including only the
+        # Internal provider's label runs nothing; the assertion must reject that run.
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=false",
+            "-c",
+            "provider_pair.expected=external",
+            ":provider_pair",
+            "--include",
+            "internal_provider",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert "NO TESTS RAN" in _plain_stderr(result)
+        try:
+            assert_exactly_one_pass(result)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("a run without results was accepted as exactly one pass")
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_artifact_pair_runner_disabled_builds_only_external_inputs(
+        self,
+        buck: Buck,
+    ) -> None:
+        # The Internal provider's input action always fails: the run passes only if the build
+        # builds the External provider's distinct input and not the Internal provider's.
+        for runner in ["false", "rust"]:
+            result = await buck.test(
+                "-c",
+                f"test.use_internal_runner={runner}",
+                ":provider_artifact_pair",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            )
+            assert_exactly_one_pass(result)
+            assert "internal_only_input" not in _plain_stderr(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_provider_artifact_pair_runner_enabled_builds_internal_inputs(
+        self,
+        buck: Buck,
+    ) -> None:
+        for config in [["-c", "test.use_internal_runner=true"], []]:
+            await expect_failure(
+                buck.test(
+                    *config,
+                    ":provider_artifact_pair",
+                    test_executor=INTERNAL_TEST_EXECUTOR,
+                ),
+                stderr_regex="internal_only_input",
+            )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_internal_only_provider_with_runner_disabled_is_refused(self, buck: Buck) -> None:
+        await expect_failure(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=false",
+                ":internal_default_pass",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+            stderr_regex="does not select test type `custom`, and the target has no `ExternalRunnerTestInfo`",
+        )
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_gives_each_run_new_empty_directories(self, buck: Buck) -> None:
+        # The case fails unless TMPDIR holds exactly its two declared directories, each empty and
+        # owner-only, and it leaves files in them; so the second run passes only if they were
+        # removed and recreated before it.
+        for _ in range(2):
+            result = await buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                ":internal_fresh_dirs",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            )
+            assert_exactly_one_pass(result)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_concurrent_runs_of_a_case_do_not_share_directories(
+        self,
+        buck: Buck,
+    ) -> None:
+        # Each run holds its files for a while before checking them; a concurrent run of the same
+        # case that removed or reused the case's directories in between would fail one of them.
+        results = await asyncio.gather(
+            *(
+                buck.test(
+                    "-c",
+                    "test.use_internal_runner=true",
+                    "-c",
+                    "fresh_dirs.hold=3",
+                    ":internal_fresh_dirs",
+                    test_executor=INTERNAL_TEST_EXECUTOR,
+                )
+                for _ in range(2)
+            )
+        )
+        for result in results:
+            assert_exactly_one_pass(result)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_cancelled_holder_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        await _cancel_holder_with_queued_run(buck, ":fresh_hold")
+        await _expect_forkserver(buck, True)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_cancelled_holder_releases_after_its_child_without_forkserver(
+        self,
+        buck: Buck,
+    ) -> None:
+        await _without_forkserver(buck)
+        await _cancel_holder_with_queued_run(buck, ":fresh_hold")
+        await _expect_forkserver(buck, False)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_cancelled_holder_without_store_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        # Reuse requested, but no store is configured: the case executes normally.
+        await _without_forkserver(buck)
+        await _cancel_holder_with_queued_run(buck, ":fresh_hold_cache_requested")
+        await _expect_forkserver(buck, False)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_cancelled_holder_with_unsupported_parser_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        # Reuse requested with a store, but the parser cannot be keyed: the case executes
+        # normally.
+        await _without_forkserver(buck)
+        store = buck.cwd / "local-case-store"
+        await _cancel_holder_with_queued_run(
+            buck,
+            ":fresh_hold_unsupported_parser",
+            "-c",
+            f"test.local_case_result_cache_root={store}",
+        )
+        await _expect_forkserver(buck, False)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        await _holder_beside_parser_failure(buck)
+        await _expect_forkserver(buck, True)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_holder_beside_parser_failure_releases_after_its_child_without_forkserver(
+        self,
+        buck: Buck,
+    ) -> None:
+        await _without_forkserver(buck)
+        await _holder_beside_parser_failure(buck)
+        await _expect_forkserver(buck, False)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_holder_without_store_beside_parser_failure_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        # Reuse requested, but no store is configured: the case executes normally.
+        await _without_forkserver(buck)
+        await _holder_beside_parser_failure(
+            buck, ":fresh_hold_beside_parser_failure_cache_requested"
+        )
+        await _expect_forkserver(buck, False)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_holder_with_unsupported_parser_beside_parser_failure_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        # Reuse requested with a store, but the parser cannot be keyed: the case executes
+        # normally.
+        await _without_forkserver(buck)
+        store = buck.cwd / "local-case-store"
+        await _holder_beside_parser_failure(
+            buck,
+            ":fresh_hold_beside_parser_failure_unsupported_parser",
+            "-c",
+            f"test.local_case_result_cache_root={store}",
+        )
+        await _expect_forkserver(buck, False)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_names_are_not_replaced_by_invocation_identity(
+        self,
+        buck: Buck,
+    ) -> None:
+        # `BUCK_BUILD_ID` and `BUCK2_DAEMON_UUID` are otherwise set by the executor for every
+        # command; declared as fresh directory names they must still be the case's directories.
+        started = buck.cwd / "started.json"
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            f"fresh_dirs.started={started}",
+            ":fresh_identity_names",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+        assert started.exists()
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_name_set_by_a_local_resource_is_refused(
+        self,
+        buck: Buck,
+    ) -> None:
+        # A local resource would set the case's fresh directory variable to its own value; the
+        # case is refused before its child starts.
+        started = buck.cwd / "started.json"
+        await expect_failure(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                "-c",
+                f"fresh_dirs.started={started}",
+                ":fresh_name_set_by_resource",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+            stderr_regex="Scratch directory variable `FRESH_A` is also set by a local resource",
+        )
+        assert not started.exists()
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_beside_an_unrelated_local_resource(self, buck: Buck) -> None:
+        # The control: a local resource setting another variable leaves the fresh directory in
+        # place and still sets its own.
+        started = buck.cwd / "started.json"
+        result = await buck.test(
+            "-c",
+            "test.use_internal_runner=true",
+            "-c",
+            f"fresh_dirs.started={started}",
+            ":fresh_beside_unrelated_resource",
+            test_executor=INTERNAL_TEST_EXECUTOR,
+        )
+        assert_exactly_one_pass(result)
+        assert json.loads(started.read_text())["OTHER"] == "42"
+
+    @buck_test(skip_for_os=["windows"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_socket_does_not_fit_in_buck_out(self, buck: Buck) -> None:
+        # A `buck-out` scratch path leaves too little of an AF_UNIX address for the socket.
+        await expect_failure(
+            buck.test(
+                "-c",
+                "test.use_internal_runner=true",
+                ":fresh_socket",
+                test_executor=INTERNAL_TEST_EXECUTOR,
+            ),
+            stderr_regex="AF_UNIX path too long",
+        )
+
+    @buck_test(skip_for_os=["windows"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_socket_fits_in_a_scratch_root(self, buck: Buck) -> None:
+        # With a short scratch root the socket fits. The engine creates the root, owner-only; the
+        # case's scratch path in it is removed before each run, so the second run can bind the
+        # socket the first one left behind.
+        root = _short_scratch_root()
+        try:
+            for _ in range(2):
+                result = await buck.test(
+                    "-c",
+                    "test.use_internal_runner=true",
+                    "-c",
+                    f"test.local_case_scratch_root={root}",
+                    ":fresh_socket",
+                    test_executor=INTERNAL_TEST_EXECUTOR,
+                )
+                assert_exactly_one_pass(result)
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
+            [scratch] = list(root.iterdir())
+            assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+            assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
+        finally:
+            if root.exists():
+                shutil.rmtree(root)
+
+    @buck_test(skip_for_os=["windows"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_invalid_scratch_root_is_refused(self, buck: Buck) -> None:
+        # An invalid root refuses the case before its child starts, rather than falling back to
+        # `buck-out`, and nothing is created. (The runner reports the refusal as a fatal result;
+        # which rule refused it is covered where the root is validated.)
+        started = buck.cwd / "started.json"
+        shared = buck.cwd / "shared"
+        shared.mkdir()
+        shared.chmod(0o770)
+        for root in ["relative", str(shared / "root")]:
+            result = await expect_failure(
+                buck.test(
+                    "-c",
+                    "test.use_internal_runner=true",
+                    "-c",
+                    f"fresh_dirs.started={started}",
+                    "-c",
+                    f"test.local_case_scratch_root={root}",
+                    ":fresh_started",
+                    test_executor=INTERNAL_TEST_EXECUTOR,
+                ),
+            )
+            assert (
+                "Tests finished: Pass 0. Fail 0. Timeout 0. Fatal 1." in _plain_stderr(result)
+            ), result.stderr
+            assert not started.exists()
+        assert not (buck.cwd / "relative").exists()
+        assert not (shared / "root").exists()
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_holder_in_a_scratch_root_beside_parser_failure_releases_after_its_child(
+        self,
+        buck: Buck,
+    ) -> None:
+        # The scratch path in a scratch root is held, like a `buck-out` one, until an abandoned
+        # child has gone.
+        await _without_forkserver(buck)
+        root = _short_scratch_root()
+        try:
+            await _holder_beside_parser_failure(
+                buck,
+                ":fresh_hold_beside_parser_failure",
+                "-c",
+                f"test.local_case_scratch_root={root}",
+            )
+        finally:
+            if root.exists():
+                shutil.rmtree(root)
+        await _expect_forkserver(buck, False)
+
+    @buck_test()
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_concurrent_runs_of_a_case_in_a_scratch_root_do_not_share_directories(
+        self,
+        buck: Buck,
+    ) -> None:
+        root = _short_scratch_root()
+        try:
+            results = await asyncio.gather(
+                *(
+                    buck.test(
+                        "-c",
+                        "test.use_internal_runner=true",
+                        "-c",
+                        "fresh_dirs.hold=3",
+                        "-c",
+                        f"test.local_case_scratch_root={root}",
+                        ":internal_fresh_dirs",
+                        test_executor=INTERNAL_TEST_EXECUTOR,
+                    )
+                    for _ in range(2)
+                )
+            )
+            for result in results:
+                assert_exactly_one_pass(result)
+            [scratch] = list(root.iterdir())
+            assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+        finally:
+            if root.exists():
+                shutil.rmtree(root)
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_tracked_case_is_published_then_reused(self, buck: Buck) -> None:
+        scratch = await _tracked_fresh_dirs_produce_and_reuse(buck)
+        assert scratch.parent.name == "local_case_fresh", scratch
+        assert (buck.cwd / "buck-out") in scratch.parents, scratch
+
+    @buck_test(skip_for_os=["windows", "darwin"])
+    @env("BUCK2_ALLOW_INTERNAL_TEST_RUNNER_DO_NOT_USE", "1")
+    async def test_fresh_dir_env_tracked_case_in_a_scratch_root_is_published_then_reused(
+        self,
+        buck: Buck,
+    ) -> None:
+        root = _short_scratch_root()
+        try:
+            scratch = await _tracked_fresh_dirs_produce_and_reuse(
+                buck, "-c", f"test.local_case_scratch_root={root}"
+            )
+            assert scratch.parent == root, scratch
+            assert re.fullmatch("[0-9a-f]{16}", scratch.name), scratch
+        finally:
+            if root.exists():
+                shutil.rmtree(root)

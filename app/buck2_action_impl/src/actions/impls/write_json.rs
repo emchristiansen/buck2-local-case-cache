@@ -20,7 +20,6 @@ use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::actions::errors::execute_error::ExecuteError;
-use buck2_build_api::actions::execute::action_executor::ActionExecutionKind;
 use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::impls::json;
@@ -42,9 +41,9 @@ use buck2_error::BuckErrorOptionContext;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::WriteRequest;
-use buck2_hash::BuckIndexMap;
-use buck2_hash::BuckIndexSet;
-use buck2_hash::buck_indexmap;
+use buck2_hash::BuckMutInsertionMap;
+use buck2_hash::BuckMutInsertionSet;
+use buck2_hash::buck_mut_insertion_map;
 use dupe::Dupe;
 use pagable::Pagable;
 use pagable::pagable_typetag;
@@ -64,6 +63,7 @@ use starlark::values::Value;
 use starlark::values::starlark_value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
+use crate::actions::impls::declare_writes::declare_writes;
 use crate::actions::impls::run::DepFilesPlaceholderArtifactPathMapper;
 use crate::actions::impls::write::CommandLineContentBasedInputVisitor;
 
@@ -107,7 +107,7 @@ impl UnregisteredWriteJsonAction {
 impl UnregisteredAction for UnregisteredWriteJsonAction {
     fn register(
         self: Box<Self>,
-        outputs: BuckIndexSet<BuildArtifact>,
+        outputs: BuckMutInsertionSet<BuildArtifact>,
         starlark_data: Option<OwnedFrozen<Value<'static>>>,
         _error_handler: Option<OwnedFrozen<Value<'static>>>,
     ) -> buck2_error::Result<Box<dyn Action>> {
@@ -127,7 +127,7 @@ struct WriteJsonAction {
 impl WriteJsonAction {
     fn new(
         contents: OwnedFrozen<Value<'static>>,
-        outputs: BuckIndexSet<BuildArtifact>,
+        outputs: BuckMutInsertionSet<BuildArtifact>,
         inner: UnregisteredWriteJsonAction,
     ) -> buck2_error::Result<Self> {
         contents.by_ref(|v| -> buck2_error::Result<()> {
@@ -211,19 +211,12 @@ impl Action for WriteJsonAction {
         &self,
         fs: &ExecutorFs,
         artifact_path_mapping: &dyn ArtifactPathMapper,
-    ) -> BuckIndexMap<String, String> {
-        let res: buck2_error::Result<String> = try {
-            let content = self.get_contents(fs, artifact_path_mapping)?;
-            String::from_utf8(content).map_err(buck2_error::Error::from)?
-        };
-        // TODO(cjhopman): We should change this api to support returning a Result.
-        buck_indexmap! {
-            "contents".to_owned() => match res {
-                Ok(v) => v,
-                Err(e) => format!("ERROR: constructing contents ({e})")
-            },
+    ) -> buck2_error::Result<BuckMutInsertionMap<String, String>> {
+        let content = self.get_contents(fs, artifact_path_mapping)?;
+        Ok(buck_mut_insertion_map! {
+            "contents".to_owned() => String::from_utf8(content)?,
             "absolute".to_owned() => self.inner.absolute.to_string(),
-        }
+        })
     }
 
     async fn execute(
@@ -234,9 +227,9 @@ impl Action for WriteJsonAction {
         let fs = ctx.fs();
 
         let mut execution_start = None;
-        let value = ctx
-            .materializer()
-            .declare_write(Box::new(|| {
+        let (values, execution_kind) = declare_writes(
+            ctx,
+            Box::new(|| {
                 execution_start = Some(Instant::now());
                 let content = if self.inner.use_dep_files_placeholder_for_content_based_paths {
                     self.get_contents(
@@ -265,8 +258,10 @@ impl Action for WriteJsonAction {
                     is_executable: false,
                     path_kind: self.output.get_path().path_resolution_method(),
                 }])
-            }))
-            .await?
+            }),
+        )
+        .await?;
+        let value = values
             .into_iter()
             .next()
             .internal_error("Write did not execute")?;
@@ -275,10 +270,10 @@ impl Action for WriteJsonAction {
             - execution_start.internal_error("Action did not set execution_start")?;
 
         Ok((
-            ActionOutputs::new(buck_indexmap![self.output.get_path().dupe() => value]),
+            ActionOutputs::new(buck_mut_insertion_map![self.output.get_path().dupe() => value]),
             ActionExecutionMetadata {
                 dep_file_db_writes_queued: 0,
-                execution_kind: ActionExecutionKind::Simple,
+                execution_kind,
                 timing: ActionExecutionTimingData { wall_time },
                 input_files_bytes: None,
                 waiting_data,

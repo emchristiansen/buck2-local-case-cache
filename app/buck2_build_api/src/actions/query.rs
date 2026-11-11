@@ -30,7 +30,7 @@ use buck2_core::package::PackageLabel;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
-use buck2_hash::BuckIndexMap;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutSet;
 use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_query::query::environment::QueryTarget;
@@ -41,13 +41,13 @@ use derivative::Derivative;
 use dice::DiceComputations;
 use dupe::Dupe;
 use either::Either;
-use gazebo::variants::VariantName;
 use internment::ArcIntern;
 use pagable::Pagable;
 use ref_cast::RefCast;
 use serde::Serialize;
 use starlark::values::Heap;
 use starlark::values::Value;
+use variant_name::VariantName;
 
 use crate::actions::RegisteredAction;
 use crate::analysis::AnalysisResult;
@@ -120,11 +120,25 @@ pub enum ActionInput {
 
 /// Both the fields are enums here. Ideally they wouldn't be, but since the query interface wants a
 /// &NodeRef (and that is rather hard to change), we pull this out.
-#[derive(Debug, Clone, Dupe, Allocative)]
+///
+/// Not pagable: it carries a `RegisteredAction` and an `AnalysisResult`. Anything holding one
+/// fails page-out with an error and stays resident.
+#[derive(Debug, Clone, Dupe, Allocative, pagable::PagableUnsupported)]
 pub struct ActionQueryNode {
     key: ActionQueryNodeRef,
     #[allocative(skip)] // TODO(@wendyy) we should derive allocative for action-related structs
     data: ActionQueryNodeData,
+}
+
+// SAFETY: `_assert_send_sync` requires every field to be `Send + Sync`. Spelled out
+// so that auto-trait proofs for aquery futures stop here; see `dice::DiceComputations`.
+unsafe impl Send for ActionQueryNode {}
+unsafe impl Sync for ActionQueryNode {}
+
+fn _assert_send_sync(ActionQueryNode { key, data }: &ActionQueryNode) {
+    fn assert<T: Send + Sync>(_: &T) {}
+    assert(key);
+    assert(data);
 }
 
 impl PartialEq for ActionQueryNode {
@@ -248,7 +262,7 @@ impl ActionData {
         &self.deps
     }
 
-    fn attrs(&self) -> BuckIndexMap<String, String> {
+    fn attrs(&self) -> buck2_error::Result<BuckMutInsertionMap<String, String>> {
         let mut attrs = self.action.action().aquery_attributes(
             &ExecutorFs::new(
                 &self.fs,
@@ -257,11 +271,14 @@ impl ActionData {
             &AqueryArtifactPathMapper {
                 aquery_placeholder: ContentBasedPathHash::AqueryPlaceholder,
             },
-        );
+        )?;
         attrs.insert(
             "buck.executor_configuration".to_owned(),
             self.action.execution_config().executor.to_string(),
         );
+        if let Some(group) = self.action.execution_group() {
+            attrs.insert("buck.exec_group".to_owned(), group.to_string());
+        }
         attrs.insert(
             "buck.all_outputs_are_content_based".to_owned(),
             self.action
@@ -285,7 +302,7 @@ impl ActionData {
             );
         }
 
-        attrs
+        Ok(attrs)
     }
 }
 
@@ -382,14 +399,20 @@ impl QueryTarget for ActionQueryNode {
         filter(&attr.0)
     }
 
-    fn special_attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+    fn special_attrs_for_each<
+        E: From<buck2_error::Error>,
+        F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+    >(
         &self,
         mut _func: F,
     ) -> Result<(), E> {
         Ok(())
     }
 
-    fn attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+    fn attrs_for_each<
+        E: From<buck2_error::Error>,
+        F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+    >(
         &self,
         mut func: F,
     ) -> Result<(), E> {
@@ -411,20 +434,27 @@ impl QueryTarget for ActionQueryNode {
 
         // inputs and outputs are not supported for aquery
 
-        for (k, v) in action.attrs() {
+        for (k, v) in action.attrs()? {
             func(&k, ActionAttr::new(&v))?;
         }
         Ok(())
     }
 
-    fn defined_attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+    fn defined_attrs_for_each<
+        E: From<buck2_error::Error>,
+        F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+    >(
         &self,
         func: F,
     ) -> Result<(), E> {
         self.attrs_for_each(func)
     }
 
-    fn map_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(&self, key: &str, mut func: F) -> R {
+    fn map_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(
+        &self,
+        key: &str,
+        mut func: F,
+    ) -> buck2_error::Result<R> {
         let mut res = None;
 
         self.attrs_for_each(|k, attr| {
@@ -432,12 +462,11 @@ impl QueryTarget for ActionQueryNode {
                 res = Some(func(Some(attr)));
             }
             Ok::<(), buck2_error::Error>(())
-        })
-        .unwrap();
-        match res {
+        })?;
+        Ok(match res {
             Some(v) => v,
             None => func(None),
-        }
+        })
     }
 
     fn inputs_for_each<E, F: FnMut(CellPath) -> Result<(), E>>(
@@ -448,7 +477,11 @@ impl QueryTarget for ActionQueryNode {
         unimplemented!("inputs not yet implemented in aquery")
     }
 
-    fn map_any_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(&self, key: &str, func: F) -> R {
+    fn map_any_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(
+        &self,
+        key: &str,
+        func: F,
+    ) -> buck2_error::Result<R> {
         // aquery doesn't have special attrs, so this is the same as map_attr
         self.map_attr(key, func)
     }

@@ -6,7 +6,6 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# pyre-strict
 
 from __future__ import annotations
 
@@ -135,6 +134,18 @@ class SourceKeyTest(unittest.TestCase):
             "a/b/c/d.py",
         )
 
+    def test_a_dotted_file_name_keeps_both_of_its_parts(self) -> None:
+        self.assertEqual(
+            gen_bytecode_bundle.source_key(
+                cache_from_source(os.path.join("a", "b.c.py"))
+            ),
+            "a/b.c.py",
+        )
+
+    def test_bytecode_outside_pycache_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            gen_bytecode_bundle.source_key(os.path.join("a", "b.cpython-312.pyc"))
+
 
 class BuildTest(BundleTestBase):
     def test_header_pins_the_format_and_interpreter(self) -> None:
@@ -150,8 +161,6 @@ class BuildTest(BundleTestBase):
         # rust_make_par synthesizes for a namespace directory; whether it is
         # importable at all is likewise not the packer's business.
         paths = ["top.py", "__init__.py", "pkg.py", "pkg/__init__.py", "pkg/mod.py"]
-        # pyre-fixme[6]: For 2nd argument expected `Dict[str, str]` but got
-        #  `Dict[str, Literal['VALUE = 1']]`.
         bundle = self._bundle(self._library("lib", dict.fromkeys(paths, "VALUE = 1")))
 
         self.assertEqual(set(bundle.index), set(paths))

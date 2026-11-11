@@ -9,7 +9,9 @@
  */
 
 use std::fmt;
+use std::hash::Hasher;
 use std::iter;
+use std::ptr;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -21,11 +23,14 @@ use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_error::buck2_error;
 use buck2_error::internal_error;
+use buck2_hash::BuckMutSet;
+use buck2_util::strong_hasher::Blake3StrongHasher;
+use buck2_util::strong_hasher::StrongHash128;
 use display_container::display_pair;
 use display_container::fmt_container;
 use display_container::iter_display_chain;
 use dupe::Dupe;
-use gazebo::prelude::*;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use serde::Serialize;
@@ -36,14 +41,18 @@ use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
 use starlark::type_matcher;
+use starlark::values::Deferred;
 use starlark::values::Freeze;
+use starlark::values::FreezeError;
+use starlark::values::FreezeResult;
+use starlark::values::Freezer;
 use starlark::values::FrozenValueTyped;
 use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
+use starlark::values::ThinBoxSliceValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOf;
 use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTyped;
 use starlark::values::list::AllocList;
@@ -51,6 +60,7 @@ use starlark::values::starlark_value;
 use starlark::values::typing::TypeInstanceId;
 use starlark::values::typing::TypeMatcher;
 use starlark::values::typing::TypeMatcherDyn;
+use strong_hash::StrongHash;
 
 use crate::actions::impls::json::JsonUnpack;
 use crate::actions::impls::json::validate_json;
@@ -62,6 +72,8 @@ use crate::artifact_groups::deferred::TransitiveSetKey;
 use crate::interpreter::rule_defs::artifact_tagging::ArtifactTag;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
+use crate::interpreter::rule_defs::cmd_args::CommandLineBuilder;
+use crate::interpreter::rule_defs::cmd_args::InputProperties;
 use crate::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::transitive_set::FrozenTransitiveSetDefinition;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSetArgsProjection;
@@ -143,20 +155,11 @@ impl ProjectionBitSet {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Trace,
-    Freeze,
-    ProvidesStaticType,
-    Allocative,
-    StarlarkPagable
-)]
+#[derive(Debug, Clone, Trace, ProvidesStaticType, Allocative, StarlarkPagable)]
 #[repr(C)]
 pub struct TransitiveSet<'v> {
     /// A Deferred key that maps back to this set. This is used to compute its inputs.
     #[starlark_pagable(pagable)]
-    #[freeze(identity)]
     pub key: TransitiveSetKey,
 
     /// The TransitiveSetCallable that this set uses.
@@ -167,14 +170,20 @@ pub struct TransitiveSet<'v> {
     pub(crate) node: Option<Node<'v>>,
 
     /// Pre-computed reductions. Those are arbitrary values based on the set's definition.
-    pub(crate) reductions: Box<[Value<'v>]>,
+    pub(crate) reductions: MiniBoxSlice<Value<'v>>,
 
     pub(crate) projection_path_resolution_may_require_artifact_value: ProjectionBitSet,
 
     pub(crate) projection_is_eligible_for_dedupe: ProjectionBitSet,
 
-    /// Further transitive sets.
-    pub children: Box<[Value<'v>]>,
+    /// Each projection's hash, see `projection_hash`: one per projection once frozen, none
+    /// before.
+    #[trace(static)]
+    #[starlark_pagable(pagable)]
+    projection_hashes: MiniBoxSlice<StrongHash128>,
+
+    /// Read together on first access; `len()` does not read them.
+    pub children: Deferred<ThinBoxSliceValue<'v>>,
 }
 
 #[derive(Debug, Clone, Trace, Freeze, Allocative, StarlarkPagable)]
@@ -184,7 +193,7 @@ pub struct Node<'v> {
     pub value: Value<'v>,
 
     /// Pre-computed projections.
-    pub projections: Box<[Value<'v>]>,
+    pub projections: MiniBoxSlice<Value<'v>>,
 }
 
 impl<'v> fmt::Display for TransitiveSet<'v> {
@@ -298,7 +307,7 @@ impl<'v> TransitiveSet<'v> {
         }
 
         // Reuse the same projection for children sets.
-        for v in self.children.iter() {
+        for v in self.children.read()?.iter() {
             let v = TransitiveSet::from_value(v.to_value()).internal_error("Invalid deferred")?;
             sub_inputs.push(ArtifactGroup::TransitiveSetProjection(Arc::new(
                 TransitiveSetProjectionWrapper::new(
@@ -316,61 +325,182 @@ impl<'v> TransitiveSet<'v> {
     }
 }
 
+/// Resolves the children of every node reachable from `root`, one level of
+/// the graph at a time with each level's resolutions overlapping, so the
+/// traversal that follows finds them resident. A level's children, once
+/// resident, are what name the next level.
+fn prefetch_all_children<'a, 'v: 'a>(root: &'a TransitiveSet<'v>) -> buck2_error::Result<()> {
+    let mut seen: BuckMutSet<usize> = BuckMutSet::from_iter([ptr::from_ref(root) as usize]);
+    let mut level: Vec<&'a TransitiveSet<'v>> = vec![root];
+    while !level.is_empty() {
+        Deferred::prefetch_many(level.iter().map(|set| &set.children))?;
+        let mut next = Vec::new();
+        for set in level {
+            for child in set.children.read()?.iter() {
+                if let Some(child) = TransitiveSet::from_value(*child)
+                    && seen.insert(ptr::from_ref(child) as usize)
+                {
+                    next.push(child);
+                }
+            }
+        }
+        level = next;
+    }
+    Ok(())
+}
+
 impl<'v> TransitiveSet<'v> {
+    /// Makes every reachable node's children resident before a traversal that
+    /// will visit all of them. A set whose own children are unread was
+    /// restored from storage and its descendants' children will be too; one
+    /// read per node in turn would serialize the page-ins. Callers that may
+    /// stop early should use [`iter`](Self::iter) without this.
+    pub fn prefetch_children(&self) -> buck2_error::Result<()> {
+        if self.children.peek().is_none() {
+            prefetch_all_children(self)?;
+        }
+        Ok(())
+    }
+
+    /// A lazy traversal; reads each node's children when it is reached.
     pub fn iter<'a>(
         &'a self,
         ordering: TransitiveSetOrdering,
-    ) -> Box<dyn TransitiveSetIteratorLike<'a, 'v> + 'a>
+    ) -> buck2_error::Result<Box<dyn TransitiveSetIteratorLike<'a, 'v> + 'a>>
     where
         'v: 'a,
     {
-        match ordering {
+        Ok(match ordering {
             TransitiveSetOrdering::Preorder => Box::new(PreorderTransitiveSetIterator::new(self)),
-            TransitiveSetOrdering::Postorder => Box::new(PostorderTransitiveSetIterator::new(self)),
+            TransitiveSetOrdering::Postorder => {
+                Box::new(PostorderTransitiveSetIterator::new(self)?)
+            }
             TransitiveSetOrdering::Topological => {
-                Box::new(TopologicalTransitiveSetIterator::new(self))
+                Box::new(TopologicalTransitiveSetIterator::new(self)?)
             }
             TransitiveSetOrdering::Bfs => Box::new(BfsTransitiveSetIterator::new(self)),
             TransitiveSetOrdering::Dfs => Box::new(DfsTransitiveSetIterator::new(self)),
-        }
+        })
     }
 
-    pub fn iter_values<'a>(
-        &'a self,
+    /// Every node's value in `ordering`. Consumes the whole set, so the
+    /// children are prefetched first.
+    pub fn collect_values(
+        &self,
         ordering: TransitiveSetOrdering,
-    ) -> buck2_error::Result<Box<dyn Iterator<Item = Value<'v>> + 'a>>
-    where
-        'v: 'a,
-    {
-        Ok(Box::new(
-            self.iter(ordering)
-                .values()
-                .map(|node| node.value.to_value()),
-        ))
+    ) -> buck2_error::Result<Vec<Value<'v>>> {
+        self.prefetch_children()?;
+        self.iter(ordering)?
+            .values()
+            .map(|node| node.map(|node| node.value.to_value()))
+            .collect()
     }
 
-    pub(super) fn iter_projection_values<'a>(
-        &'a self,
+    /// Every node's `projection` value in `ordering`. Consumes the whole set,
+    /// so the children are prefetched first.
+    pub(super) fn collect_projection_values(
+        &self,
         ordering: TransitiveSetOrdering,
         projection: usize,
-    ) -> buck2_error::Result<Box<dyn Iterator<Item = Value<'v>> + 'a>>
-    where
-        'v: 'a,
-    {
-        let mut iter = self.iter(ordering).values().peekable();
-
-        // Defensively, check the projection is valid. We know the set has the same definition
-        // throughout so it'll be safe (enough) to unwrap if it is valid on the first one.
-        if let Some(v) = iter.peek() {
-            v.projections
-                .get(projection)
-                .internal_error("Invalid projection")?;
-        }
-
-        Ok(Box::new(iter.map(move |node| {
-            node.projections.get(projection).unwrap().to_value()
-        })))
+    ) -> buck2_error::Result<Vec<Value<'v>>> {
+        self.prefetch_children()?;
+        self.iter(ordering)?
+            .values()
+            .map(|node| {
+                Ok(node?
+                    .projections
+                    .get(projection)
+                    .internal_error("Invalid projection")?
+                    .to_value())
+            })
+            .collect()
     }
+}
+
+impl<'v> Freeze<'v> for TransitiveSet<'v> {
+    type Frozen<'fv> = TransitiveSet<'fv>;
+
+    fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
+        let TransitiveSet {
+            key,
+            definition,
+            node,
+            reductions,
+            projection_path_resolution_may_require_artifact_value,
+            projection_is_eligible_for_dedupe,
+            projection_hashes: _,
+            children,
+        } = self;
+        let definition = definition.freeze(freezer)?;
+        let node = node.freeze(freezer)?;
+        let reductions = reductions.freeze(freezer)?;
+        // Freezes the children first, so each has its hashes by the time this set's are
+        // computed from them.
+        let children = children.freeze(freezer)?;
+        let projection_hashes = hash_projections(&key, &definition, node.as_ref(), &children)
+            .map_err(|e| FreezeError::new(format!("Hashing the projections of {key}: {e:#}")))?;
+        Ok(TransitiveSet {
+            key,
+            definition,
+            node,
+            reductions,
+            projection_path_resolution_may_require_artifact_value,
+            projection_is_eligible_for_dedupe,
+            projection_hashes,
+            children,
+        })
+    }
+}
+
+/// See `TransitiveSet::projection_hash`. The node's identity is in it because traversal dedups
+/// nodes by identity: two sets with equal content but different sharing can render differently.
+fn hash_projections<'fv>(
+    key: &TransitiveSetKey,
+    definition: &FrozenTransitiveSetDefinition<'fv>,
+    node: Option<&Node<'fv>>,
+    children: &Deferred<ThinBoxSliceValue<'fv>>,
+) -> buck2_error::Result<MiniBoxSlice<StrongHash128>> {
+    let children: Vec<&TransitiveSet<'fv>> = children
+        .read()?
+        .iter()
+        .map(|child| {
+            TransitiveSet::from_value(child.to_value())
+                .internal_error("Invalid transitive set child")
+        })
+        .collect::<buck2_error::Result<_>>()?;
+    let def: &dyn TransitiveSetDefinitionLike = definition;
+    def.operations()
+        .projections
+        .values()
+        .enumerate()
+        .map(|(idx, spec)| {
+            let mut hasher = Blake3StrongHasher::new();
+            if let TransitiveSetProjectionKind::Args = spec.kind {
+                key.strong_hash(&mut hasher);
+                hasher.write_usize(children.len());
+                for child in &children {
+                    child
+                        .projection_hash(idx)
+                        .internal_error("A child was frozen without its projection hashes")?
+                        .strong_hash(&mut hasher);
+                }
+                match node {
+                    None => hasher.write_u8(0),
+                    Some(node) => {
+                        hasher.write_u8(1);
+                        let value = node
+                            .projections
+                            .get(idx)
+                            .internal_error("Invalid projection id")?;
+                        TransitiveSetArgsProjection::as_command_line(*value)?.add_to_command_line(
+                            &mut CommandLineBuilder::new_hashing(&mut hasher),
+                        )?;
+                    }
+                }
+            }
+            Ok(hasher.finalize128())
+        })
+        .collect()
 }
 
 starlark_complex_value!(pub TransitiveSet);
@@ -397,76 +527,83 @@ impl<'v> TransitiveSet<'v> {
             return Err(TransitiveSetError::TransitiveSetUsedBeforeAssignment.into());
         }
 
-        let children = children.into_iter().collect::<Box<[_]>>();
-        let children_sets = children.try_map(|v| match TransitiveSet::from_value(*v) {
-            Some(set) if set.matches_definition(definition) => Ok(set),
-            Some(set) => {
-                fn format_def(def: &FrozenTransitiveSetDefinition<'_>) -> String {
-                    format!("{:?}", def.as_debug())
+        let children = ThinBoxSliceValue::from_iter(children);
+        let children_sets = children
+            .iter()
+            .map(|v| match TransitiveSet::from_value(*v) {
+                Some(set) if set.matches_definition(definition) => Ok(set),
+                Some(set) => {
+                    fn format_def(def: &FrozenTransitiveSetDefinition<'_>) -> String {
+                        format!("{:?}", def.as_debug())
+                    }
+                    Err(TransitiveSetError::TransitiveValueIsOfWrongType {
+                        expected: format_def(&definition),
+                        got: format_def(&set.definition),
+                    })
                 }
-                Err(TransitiveSetError::TransitiveValueIsOfWrongType {
-                    expected: format_def(&definition),
-                    got: format_def(&set.definition),
-                })
-            }
-            None => {
-                Err(TransitiveSetError::TransitiveValueIsNotTransitiveSet { got: v.to_string() })
-            }
-        })?;
+                None => Err(TransitiveSetError::TransitiveValueIsNotTransitiveSet {
+                    got: v.to_string(),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let node = value.try_map(|value| {
-            let projections = def
-                .operations()
-                .projections
+        let node = value
+            .map(|value| {
+                let projections = def
+                    .operations()
+                    .projections
+                    .iter()
+                    .map(|(name, spec)| {
+                        let projected_value = eval
+                            .eval_function(spec.projection.get(), &[value], &[])
+                            .map_err(|error| TransitiveSetError::ProjectionError {
+                                error: error.into(),
+                                name: name.clone(),
+                            })?;
+                        match spec.kind {
+                            TransitiveSetProjectionKind::Args => {
+                                TransitiveSetArgsProjection::as_command_line(projected_value)?;
+                            }
+                            TransitiveSetProjectionKind::Json => {
+                                validate_json(JsonUnpack::unpack_value_err(projected_value)?)?;
+                            }
+                        }
+                        buck2_error::Ok(projected_value)
+                    })
+                    .collect::<Result<MiniBoxSlice<_>, _>>()?;
+
+                buck2_error::Ok(Node { value, projections })
+            })
+            .transpose()?;
+
+        let reductions =
+            def.operations()
+                .reductions
                 .iter()
-                .map(|(name, spec)| {
-                    let projected_value = eval
-                        .eval_function(spec.projection.get(), &[value], &[])
-                        .map_err(|error| TransitiveSetError::ProjectionError {
+                .enumerate()
+                .map(|(idx, (name, reduce))| {
+                    let children_values = children_sets
+                        .iter()
+                        .map(|c| {
+                            c.reductions.get(idx).copied().with_internal_error(|| {
+                                format!("Child {c} is missing reduction {idx}")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let children_values = eval.heap().alloc(AllocList(children_values));
+
+                    let value = value.unwrap_or_else(Value::new_none);
+
+                    let reduced = eval
+                        .eval_function(reduce.get(), &[children_values, value], &[])
+                        .map_err(|error| TransitiveSetError::ReductionError {
                             error: error.into(),
                             name: name.clone(),
                         })?;
-                    match spec.kind {
-                        TransitiveSetProjectionKind::Args => {
-                            TransitiveSetArgsProjection::as_command_line(projected_value)?;
-                        }
-                        TransitiveSetProjectionKind::Json => {
-                            validate_json(JsonUnpack::unpack_value_err(projected_value)?)?;
-                        }
-                    }
-                    buck2_error::Ok(projected_value)
+
+                    buck2_error::Ok(reduced)
                 })
-                .collect::<Result<Box<[_]>, _>>()?;
-
-            buck2_error::Ok(Node { value, projections })
-        })?;
-
-        let reductions = def
-            .operations()
-            .reductions
-            .iter()
-            .enumerate()
-            .map(|(idx, (name, reduce))| {
-                let children_values = children_sets.try_map(|c| {
-                    c.reductions
-                        .get(idx)
-                        .copied()
-                        .with_internal_error(|| format!("Child {c} is missing reduction {idx}"))
-                })?;
-                let children_values = eval.heap().alloc(AllocList(children_values));
-
-                let value = value.unwrap_or_else(Value::new_none);
-
-                let reduced = eval
-                    .eval_function(reduce.get(), &[children_values, value], &[])
-                    .map_err(|error| TransitiveSetError::ReductionError {
-                        error: error.into(),
-                        name: name.clone(),
-                    })?;
-
-                buck2_error::Ok(reduced)
-            })
-            .collect::<Result<Box<[_]>, _>>()?;
+                .collect::<Result<MiniBoxSlice<_>, _>>()?;
 
         let target_platform =
             if let BaseDeferredKey::TargetLabel(configured_label) = key.holder_key().owner() {
@@ -492,7 +629,12 @@ impl<'v> TransitiveSet<'v> {
         }
 
         impl<'a, 'v> CommandLineArtifactVisitor<'v> for InputVisitor<'a> {
-            fn visit_input(&mut self, input: ArtifactGroup, _tags: Vec<&ArtifactTag>) {
+            fn visit_input(
+                &mut self,
+                input: ArtifactGroup,
+                _props: InputProperties,
+                _tags: Vec<&ArtifactTag>,
+            ) {
                 if input.path_resolution_may_require_artifact_value() {
                     self.path_resolution_may_require_artifact_value = true;
                 }
@@ -600,8 +742,18 @@ impl<'v> TransitiveSet<'v> {
             reductions,
             projection_path_resolution_may_require_artifact_value,
             projection_is_eligible_for_dedupe,
-            children,
+            projection_hashes: Default::default(),
+            children: Deferred::new(children),
         })
+    }
+
+    /// What `TransitiveSetArgsProjection::add_to_command_line` renders for args projection
+    /// `projection` of this set, as a hash: every reachable node's identity and its projection's
+    /// `CommandLineBuilder::new_hashing` hash, in the structure that any traversal order is a
+    /// function of. Computed when the set is frozen; `None` before that, and for json
+    /// projections unspecified.
+    pub(crate) fn projection_hash(&self, projection: usize) -> Option<StrongHash128> {
+        self.projection_hashes.get(projection).copied()
     }
 
     pub fn new_from_values(
@@ -624,46 +776,46 @@ impl<'v> TransitiveSet<'v> {
 #[starlark_module]
 fn transitive_set_methods(builder: &mut MethodsBuilder) {
     fn project_as_json<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         projection: &str,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetJsonProjection<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = def
             .operations()
             .get_index_of_projection(TransitiveSetProjectionKind::Json, projection)?;
 
         Ok(TransitiveSetJsonProjection {
-            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.value),
+            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.to_value()),
             projection: index,
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     fn project_as_args<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         projection: &str,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetArgsProjection<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = def
             .operations()
             .get_index_of_projection(TransitiveSetProjectionKind::Args, projection)?;
 
         Ok(TransitiveSetArgsProjection {
-            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.value),
+            transitive_set: ValueOfUnchecked::<TransitiveSet<'static>>::new(this.to_value()),
             projection: index,
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     fn reduce<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         reduction: &str,
     ) -> starlark::Result<Value<'v>> {
-        let def = this.typed.definition;
+        let def = this.definition;
 
         let index = match def.operations().reductions.get_index_of(reduction) {
             Some(index) => index,
@@ -684,7 +836,6 @@ fn transitive_set_methods(builder: &mut MethodsBuilder) {
         };
 
         Ok(this
-            .typed
             .reductions
             .get(index)
             .copied()
@@ -692,31 +843,31 @@ fn transitive_set_methods(builder: &mut MethodsBuilder) {
     }
 
     fn traverse<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
         #[starlark(require = named, default = "preorder")] ordering: &str,
     ) -> starlark::Result<TransitiveSetTraversal<'v>> {
         Ok(TransitiveSetTraversal {
-            inner: this.value,
+            inner: this.to_value(),
             ordering: TransitiveSetOrdering::parse(ordering)?,
         })
     }
 
     #[starlark(attribute)]
     fn definition<'v>(
-        this: ValueOf<'v, &'v TransitiveSet<'v>>,
+        this: ValueTyped<'v, TransitiveSet<'v>>,
     ) -> starlark::Result<FrozenValueTyped<'v, FrozenTransitiveSetDefinition<'v>>> {
-        Ok(this.typed.definition())
+        Ok(this.definition())
     }
 
     #[starlark(attribute)]
-    fn value<'v>(this: ValueOf<'v, &'v TransitiveSet<'v>>) -> starlark::Result<Value<'v>> {
-        Ok(match this.typed.node.as_ref() {
+    fn value<'v>(this: ValueTyped<'v, TransitiveSet<'v>>) -> starlark::Result<Value<'v>> {
+        Ok(match this.node.as_ref() {
             Some(node) => node.value,
             None => Value::new_none(),
         })
     }
     #[starlark(attribute)]
-    fn children<'v>(this: ValueOf<'v, &'v TransitiveSet<'v>>) -> starlark::Result<Vec<Value<'v>>> {
-        Ok(this.typed.children.to_vec())
+    fn children<'v>(this: ValueTyped<'v, TransitiveSet<'v>>) -> starlark::Result<Vec<Value<'v>>> {
+        Ok(this.children.read()?.to_vec())
     }
 }

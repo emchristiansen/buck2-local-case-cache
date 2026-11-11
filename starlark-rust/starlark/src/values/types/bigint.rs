@@ -21,7 +21,6 @@ mod convert;
 
 use std::cmp::Ordering;
 use std::hash::Hash;
-use std::str::FromStr;
 
 use allocative::Allocative;
 use num_bigint::BigInt;
@@ -34,7 +33,9 @@ use starlark_derive::starlark_value;
 
 use crate as starlark;
 use crate::any::ProvidesStaticType;
+use crate::collections::StarlarkHashValue;
 use crate::collections::StarlarkHasher;
+use crate::private::Private;
 use crate::typing::Ty;
 use crate::typing::TyBasic;
 use crate::typing::TypingBinOp;
@@ -145,10 +146,12 @@ impl Serialize for StarlarkBigInt {
         } else if let Some(u) = self.value.to_u64() {
             serializer.serialize_u64(u)
         } else {
-            let number_str = self.value.to_string();
-            let number = serde_json::Number::from_str(&number_str).map_err(|e| {
-                serde::ser::Error::custom(format!("Failed to create JSON number: {}", e))
-            })?;
+            // `serde_json::Number` cannot hold an integer wider than 64 bits and would
+            // round it to the nearest `f64`, so write the exact digits as a raw JSON number.
+            let number =
+                serde_json::value::RawValue::from_string(self.value.to_string()).map_err(|e| {
+                    serde::ser::Error::custom(format!("Failed to create JSON number: {}", e))
+                })?;
             number.serialize(serializer)
         }
     }
@@ -225,22 +228,26 @@ impl<'v> StarlarkValue<'v> for StarlarkBigInt {
     }
 
     fn add(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
-        Some(Ok(heap.alloc(
-            NumRef::Int(StarlarkIntRef::Big(self)) + rhs.unpack_num()?,
-        )))
+        Some(
+            (NumRef::Int(StarlarkIntRef::Big(self)) + rhs.unpack_num()?)
+                .map(|x| heap.alloc(x))
+                .map_err(Into::into),
+        )
     }
 
     fn sub(&self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match other.unpack_num() {
-            Some(other) => Ok(heap.alloc(NumRef::Int(StarlarkIntRef::Big(self)) - other)),
+            Some(other) => Ok(heap.alloc((NumRef::Int(StarlarkIntRef::Big(self)) - other)?)),
             None => ValueError::unsupported_with(self, "-", other),
         }
     }
 
     fn mul(&self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
-        Some(Ok(heap.alloc(
-            NumRef::Int(StarlarkIntRef::Big(self)) * other.unpack_num()?,
-        )))
+        Some(
+            (NumRef::Int(StarlarkIntRef::Big(self)) * other.unpack_num()?)
+                .map(|x| heap.alloc(x))
+                .map_err(Into::into),
+        )
     }
 
     fn div(&self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
@@ -315,6 +322,10 @@ impl<'v> StarlarkValue<'v> for StarlarkBigInt {
             .get_hash_64()
             .hash(hasher);
         Ok(())
+    }
+
+    fn get_hash(&self, _private: Private) -> crate::Result<StarlarkHashValue> {
+        Ok(NumRef::Int(StarlarkIntRef::Big(self)).get_hash())
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
@@ -742,5 +753,11 @@ mod tests {
     #[test]
     fn test_int_type_matches_bigint() {
         assert::is_true("isinstance(1 << 100, int)");
+    }
+
+    #[test]
+    fn test_dictionary_key_big_int() {
+        assert::is_true("noop(2147483648.0) in {2147483648: 1}");
+        assert::is_true("{noop(1e20): 1}.get(100000000000000000000) == 1");
     }
 }

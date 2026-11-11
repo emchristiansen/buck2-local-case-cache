@@ -9,7 +9,7 @@
 load("@prelude//android:android_toolchain.bzl", "AidlToolchainInfo", "AndroidPlatformInfo", "AndroidToolchainInfo")
 load("@prelude//csharp:toolchain.bzl", "CSharpToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
-load("@prelude//go_bootstrap:go_bootstrap.bzl", "GoBootstrapToolchainInfo")
+load("@prelude//go_bootstrap:toolchain.bzl", "GoBootstrapToolchainInfo")
 load("@prelude//haskell:toolchain.bzl", "HaskellPlatformInfo", "HaskellToolchainInfo")
 load("@prelude//java:dex_toolchain.bzl", "DexToolchainInfo")
 load(
@@ -23,10 +23,11 @@ load(
     "@prelude//kotlin:kotlin_toolchain.bzl",
     "KotlinToolchainInfo",
 )
+load("@prelude//nodejs:nodejs_toolchain.bzl", "NodejsToolchainInfo")
 load("@prelude//python:python_wheel_toolchain.bzl", "PythonWheelToolchainInfo")
 load("@prelude//python:toolchain.bzl", "PythonPlatformInfo", "PythonToolchainInfo")
 load("@prelude//python/cython:cython_toolchain.bzl", "CythonToolchainInfo")
-load("@prelude//python_bootstrap:python_bootstrap.bzl", "PythonBootstrapToolchainInfo")
+load("@prelude//python_bootstrap:toolchain.bzl", "PythonBootstrapToolchainInfo")
 load("@prelude//rust:rust_toolchain.bzl", "RustToolchainInfo")
 load("@prelude//tests:remote_test_execution_toolchain.bzl", "RemoteTestExecutionToolchainInfo")
 load("@prelude//tests:test_listing.bzl", "TestListingInfo")
@@ -93,6 +94,9 @@ def _kotlin_toolchain():
 def _kotlin_for_android_toolchain():
     return _toolchain("kotlin_for_android", [KotlinToolchainInfo])
 
+def _nodejs_toolchain():
+    return _toolchain("nodejs", [NodejsToolchainInfo])
+
 def _prebuilt_jar_toolchain():
     # Override is allowed for bootstrapping prebuilt jar toolchains
     return _toolchain("prebuilt_jar", [PrebuiltJarToolchainInfo])
@@ -135,6 +139,7 @@ toolchains_common = struct(
     java_test = _java_test_toolchain,
     kotlin = _kotlin_toolchain,
     kotlin_for_android = _kotlin_for_android_toolchain,
+    nodejs = _nodejs_toolchain,
     prebuilt_jar = _prebuilt_jar_toolchain,
     python = _python_toolchain,
     python_bootstrap = _python_bootstrap_toolchain,

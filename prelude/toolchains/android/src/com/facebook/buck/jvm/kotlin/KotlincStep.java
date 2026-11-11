@@ -19,6 +19,7 @@ import com.facebook.buck.core.filesystems.RelPath;
 import com.facebook.buck.core.util.log.Logger;
 import com.facebook.buck.jvm.cd.command.kotlin.LanguageVersion;
 import com.facebook.buck.jvm.core.BuildTargetValue;
+import com.facebook.buck.jvm.java.CompilerClassToSourceMap;
 import com.facebook.buck.jvm.java.CompilerOutputPaths;
 import com.facebook.buck.jvm.kotlin.cd.analytics.KotlinCDAnalytics;
 import com.facebook.buck.jvm.kotlin.cd.analytics.KotlinCDLoggingContext;
@@ -84,6 +85,8 @@ public class KotlincStep implements IsolatedStep {
   private final KotlinCDAnalytics kotlinCDAnalytics;
   private final LanguageVersion languageVersion;
   private final boolean shouldKosabiJvmAbiGenUseK2;
+  private final boolean shouldKosabiUseShallowClassUsage;
+  private final String kosabiAbiValidationMode;
 
   private static final String COMPOSE_PLUGIN_PATH_FRAGMENT = "compose-compiler-plugin";
 
@@ -111,7 +114,9 @@ public class KotlincStep implements IsolatedStep {
       KotlincMode kotlincMode,
       KotlinCDAnalytics kotlinCDAnalytics,
       LanguageVersion languageVersion,
-      boolean shouldKosabiJvmAbiGenUseK2) {
+      boolean shouldKosabiJvmAbiGenUseK2,
+      boolean shouldKosabiUseShallowClassUsage,
+      String kosabiAbiValidationMode) {
     this.invokingRule = invokingRule;
     this.outputDirectory = outputDirectory;
     this.sourceFilePaths = sourceFilePaths;
@@ -136,11 +141,17 @@ public class KotlincStep implements IsolatedStep {
     this.kotlinCDAnalytics = kotlinCDAnalytics;
     this.languageVersion = languageVersion;
     this.shouldKosabiJvmAbiGenUseK2 = shouldKosabiJvmAbiGenUseK2;
+    this.shouldKosabiUseShallowClassUsage = shouldKosabiUseShallowClassUsage;
+    this.kosabiAbiValidationMode = kosabiAbiValidationMode;
   }
 
   @Override
   public String getShortName() {
     return getKotlinc().getShortName();
+  }
+
+  protected boolean emitsClassToSourceMap() {
+    return true;
   }
 
   @Override
@@ -168,7 +179,15 @@ public class KotlincStep implements IsolatedStep {
               Optional.of(outputPaths.getWorkingDirectory().getPath()),
               context.getRuleCellRoot(),
               kotlincMode,
-              loggingContext);
+              loggingContext,
+              context.getRuleCellRoot().resolve(outputDirectory),
+              emitsClassToSourceMap() && outputPaths.getCompilerClassToSourceMap() != null
+                  ? context
+                      .getRuleCellRoot()
+                      .resolve(outputPaths.getWorkingDirectory())
+                      .getPath()
+                      .resolve(CompilerClassToSourceMap.KOTLIN_FILE_NAME)
+                  : null);
 
       Instant compilationEnd = Instant.now();
       Duration compilationDuration = Duration.between(compilationStart, compilationEnd);
@@ -421,6 +440,15 @@ public class KotlincStep implements IsolatedStep {
       if (shouldEnableComposeAbiEmulation()) {
         builder.add(PLUGIN);
         builder.add("plugin:com.facebook.k2.jvm.abi.gen:enableComposeAbiEmulation=true");
+      }
+      if (shouldKosabiUseShallowClassUsage) {
+        builder.add(PLUGIN);
+        builder.add("plugin:com.facebook.k2.jvm.abi.gen:shallowClassUsage=true");
+      }
+      if (!kosabiAbiValidationMode.isEmpty() && !kosabiAbiValidationMode.equals("off")) {
+        builder.add(PLUGIN);
+        builder.add(
+            "plugin:com.facebook.k2.jvm.abi.gen:abiValidationMode=" + kosabiAbiValidationMode);
       }
     }
 

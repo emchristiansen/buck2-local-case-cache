@@ -3,23 +3,8 @@ description: Setup Windows environment for building and testing
 runs:
   using: composite
   steps:
-  - name: Write Visual Studio path
-    run: |-
-      $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath
-      Join-Path $vsPath "VC\Tools\Llvm\x64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-    shell: pwsh
-  - name: Create python3 symlink
-    run: |
-      New-Item -ItemType SymbolicLink -Path C:\ProgramData\chocolatey\bin\python3.exe -Target $(Get-Command python).Source
-    shell: pwsh
-  - uses: SebRollen/toml-action@v1.2.0
-    id: read_rust_toolchain
+  - uses: ./.github/actions/setup_cargo_env
     with:
-      file: rust-toolchain.toml
-      field: toolchain.channel
-  - uses: dtolnay/rust-toolchain@v1
-    with:
-      toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
       components: clippy
   - uses: actions/setup-go@v5
     with:

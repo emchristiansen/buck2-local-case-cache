@@ -14,8 +14,8 @@ use std::iter;
 
 use allocative::Allocative;
 use buck2_query_parser::spanned::Spanned;
-use gazebo::variants::VariantName;
 use itertools::Either;
+use variant_name::VariantName;
 
 use crate::query::environment::QueryTarget;
 use crate::query::syntax::simple::eval::error::QueryError;
@@ -125,6 +125,14 @@ pub enum QueryEvaluationValue<T: QueryTarget> {
 }
 
 impl<T: QueryTarget> QueryEvaluationValue<T> {
+    /// What the value holds, for error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            QueryEvaluationValue::TargetSet(_) => "a set of targets",
+            QueryEvaluationValue::FileSet(_) => "a set of files",
+        }
+    }
+
     pub fn try_into_targets(self) -> buck2_error::Result<TargetSet<T>> {
         match self {
             QueryEvaluationValue::TargetSet(targets) => Ok(targets),

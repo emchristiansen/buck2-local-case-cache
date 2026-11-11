@@ -26,19 +26,18 @@ buck2_interpreter.workspace = true
 buck2_node.workspace = true
 buck2_query.workspace = true
 buck2_server_ctx.workspace = true
+buck2_settings.workspace = true
 buck2_util.workspace = true
 derive_more.workspace = true
 dice.workspace = true
 dupe.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 indent_write.workspace = true
 itertools.workspace = true
 ref-cast.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-starlark_map.workspace = true
 
 [lints]
 workspace = true

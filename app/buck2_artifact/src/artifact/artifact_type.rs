@@ -25,9 +25,6 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
-use buck2_execute::execute::request::OutputType;
-use buck2_execute::path::artifact_path::ArtifactPath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_util::arc_str::ThinArcS;
 use buck2_util::size_assert;
@@ -36,7 +33,6 @@ use derive_more::Display;
 use derive_more::From;
 use dupe::Dupe;
 use either::Either;
-use gazebo::cell::ARef;
 use pagable::Pagable;
 use starlark::StarlarkPagablePanic;
 use starlark::values::Heap;
@@ -47,7 +43,11 @@ use starlark::values::any_complex::StarlarkAnyComplex;
 use starlark_map::Hashed;
 
 use crate::actions::key::ActionKey;
+use crate::artifact::artifact_dyn::ArtifactDyn;
+use crate::artifact::artifact_path::ArtifactPath;
+use crate::artifact::artifact_path::BuildArtifactPathRef;
 use crate::artifact::build_artifact::BuildArtifact;
+use crate::artifact::output_type::OutputType;
 use crate::artifact::source_artifact::SourceArtifact;
 
 /// An 'Artifact' that can be materialized at its path. The underlying data is not very large here,
@@ -178,7 +178,7 @@ impl Artifact {
         let (base, projected_path) = self.as_parts();
 
         let base_path = match base {
-            BaseArtifactKind::Build(b) => Either::Left(ARef::new_ptr(b.get_path())),
+            BaseArtifactKind::Build(b) => Either::Left(BuildArtifactPathRef::Direct(b.get_path())),
             BaseArtifactKind::Source(s) => Either::Right(s.get_path()),
         };
 
@@ -353,7 +353,7 @@ impl BoundBuildArtifact {
 
     pub fn get_path(&self) -> ArtifactPath<'_> {
         ArtifactPath {
-            base_path: Either::Left(ARef::new_ptr(self.artifact.get_path())),
+            base_path: Either::Left(BuildArtifactPathRef::Direct(self.artifact.get_path())),
             projected_path: &self.projected_path,
             hidden_components_count: self.hidden_components_count,
         }
@@ -435,7 +435,7 @@ impl<'v> DeclaredArtifact<'v> {
         });
 
         ArtifactPath {
-            base_path: Either::Left(ARef::new_ref(base_path)),
+            base_path: Either::Left(BuildArtifactPathRef::RefCell(base_path)),
             projected_path,
             hidden_components_count: self.hidden_components_count,
         }
@@ -627,7 +627,6 @@ pub mod testing {
     use buck2_core::fs::buck_out_path::BuckOutPathKind;
     use buck2_core::fs::buck_out_path::BuildArtifactPath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-    use buck2_execute::execute::request::OutputType;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
     use dupe::Dupe;
 
@@ -636,6 +635,7 @@ pub mod testing {
     use crate::artifact::artifact_type::DeclaredArtifact;
     use crate::artifact::artifact_type::DeclaredArtifactKind;
     use crate::artifact::build_artifact::BuildArtifact;
+    use crate::artifact::output_type::OutputType;
 
     pub trait ArtifactTestingExt {
         fn testing_is_bound(&self) -> bool;
@@ -716,7 +716,6 @@ mod tests {
     use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
     use buck2_core::package::source_path::SourcePath;
     use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
-    use buck2_execute::execute::request::OutputType;
     use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
@@ -732,6 +731,7 @@ mod tests {
     use crate::artifact::artifact_type::DeclaredArtifactKind;
     use crate::artifact::artifact_type::testing::BuildArtifactTestingExt;
     use crate::artifact::build_artifact::BuildArtifact;
+    use crate::artifact::output_type::OutputType;
     use crate::artifact::source_artifact::SourceArtifact;
 
     #[test]

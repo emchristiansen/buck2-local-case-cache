@@ -50,6 +50,8 @@ enum ArgExpansionError {
     },
     #[error("Python mode file `{path}` output is not UTF-8")]
     PythonOutputNotUtf8 { path: String },
+    #[error("Flag file `{path}` includes itself")]
+    CyclicInclusion { path: String },
     #[error("No flag file path after @ symbol in argfile argument")]
     MissingFlagFilePathInArgfile,
     #[error("Python argfile at `{path}` exited with non-zero status, stderr: {err:?}")]
@@ -133,7 +135,6 @@ fn expand_argfiles_with_context(
                         return Err(ArgExpansionError::MissingFlagFilePath.into());
                     }
                 };
-                // TODO: We want to detect cyclic inclusion
                 resolve_and_expand_argfile(expanded_args, &flagfile, context, cwd)?;
             }
             next_arg if next_arg.starts_with('@') => {
@@ -141,7 +142,6 @@ fn expand_argfiles_with_context(
                 if flagfile.is_empty() {
                     return Err(ArgExpansionError::MissingFlagFilePathInArgfile.into());
                 }
-                // TODO: We want to detect cyclic inclusion
                 resolve_and_expand_argfile(expanded_args, flagfile, context, cwd)?;
             }
             comment if comment.starts_with("--#") => {}
@@ -162,6 +162,12 @@ fn resolve_and_expand_argfile(
 ) -> buck2_error::Result<()> {
     let flagfile = resolve_flagfile(path, context, cwd)
         .with_buck_error_context(|| format!("Error resolving flagfile `{path}`"))?;
+    if expanded.is_expanding(&flagfile) {
+        return Err(ArgExpansionError::CyclicInclusion {
+            path: flagfile.to_string(),
+        }
+        .into());
+    }
     let flagfile_lines = expand_argfile_contents(context, &flagfile)?;
     expanded.argfile_scope(flagfile, |expanded| {
         expand_argfiles_with_context(expanded, flagfile_lines, context, cwd)
@@ -173,7 +179,7 @@ fn argfile_abs_path(
     path: &ArgFilePath,
 ) -> buck2_error::Result<AbsNormPathBuf> {
     match path {
-        ArgFilePath::Project(path) => context.resolve_project_path(path.as_ref()),
+        ArgFilePath::Project(path) => context.resolve_project_path(*path),
         ArgFilePath::External(path) => Ok(path.clone()),
     }
 }
@@ -272,7 +278,7 @@ fn resolve_flagfile(
             .into_abs_path_buf(),
         None => {
             let p = Path::new(path_part);
-            match AbsPath::new(path) {
+            match AbsPath::new(path_part) {
                 Ok(abs_path) => {
                     // FIXME(JakobDegen): Checks for normalization for historical reasons, not sure
                     // why we'd want that
@@ -526,5 +532,64 @@ mod tests {
                 "--inline2 inline".to_owned()
             ]
         )
+    }
+
+    /// `path#flavor` resolves for a relative and for an absolute Python argfile.
+    #[test]
+    fn test_absolute_python_argfile_with_flavor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::new(tempdir.path().canonicalize().unwrap()).unwrap();
+        fs_util::write(root.join("m.py"), "print('--x')").unwrap();
+        let cwd = AbsWorkingDir::unchecked_new(AbsNormPathBuf::new(root.to_path_buf()).unwrap());
+
+        let mut context = ImmediateConfigContext::new(&cwd);
+        let kind = resolve_flagfile("m.py#o", &mut context, &cwd).unwrap();
+        assert!(
+            matches!(&kind, ArgFileKind::PythonExecutable(_, Some(f)) if f == "o"),
+            "{kind:?}"
+        );
+
+        let abs = format!("{}#o", root.join("m.py").as_path().display());
+        let mut context = ImmediateConfigContext::new(&cwd);
+        let kind = resolve_flagfile(&abs, &mut context, &cwd).unwrap();
+        assert!(
+            matches!(&kind, ArgFileKind::PythonExecutable(_, Some(f)) if f == "o"),
+            "{kind:?}"
+        );
+    }
+
+    /// An argfile that includes itself, directly or through another argfile, is an error.
+    #[test]
+    fn test_cyclic_argfile_is_rejected() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = AbsPathBuf::new(tempdir.path().canonicalize().unwrap()).unwrap();
+        fs_util::write(root.join("self.txt"), "@self.txt").unwrap();
+        fs_util::write(root.join("a.txt"), "--a\n@b.txt").unwrap();
+        fs_util::write(root.join("b.txt"), "@a.txt").unwrap();
+        let cwd = AbsWorkingDir::unchecked_new(AbsNormPathBuf::new(root.to_path_buf()).unwrap());
+
+        let mut context = ImmediateConfigContext::new(&cwd);
+        let err = expand_argv(None, vec!["@self.txt".to_owned()], &mut context, &cwd)
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("includes itself"), "{err:#}");
+
+        let mut context = ImmediateConfigContext::new(&cwd);
+        let err = expand_argv(None, vec!["@a.txt".to_owned()], &mut context, &cwd)
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("includes itself"), "{err:#}");
+
+        // The same file twice in a row is not a cycle.
+        fs_util::write(root.join("c.txt"), "--c").unwrap();
+        let mut context = ImmediateConfigContext::new(&cwd);
+        let argv = expand_argv(
+            None,
+            vec!["@c.txt".to_owned(), "@c.txt".to_owned()],
+            &mut context,
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(argv.args().collect::<Vec<_>>(), vec!["--c", "--c"]);
     }
 }

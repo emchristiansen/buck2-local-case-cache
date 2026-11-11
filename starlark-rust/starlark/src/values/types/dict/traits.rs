@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::hash::Hash;
 
 use either::Either;
+use mini_map::MiniMutInsertionMap;
 
 use crate::collections::SmallMap;
 use crate::typing::Ty;
@@ -32,6 +33,41 @@ use crate::values::dict::AllocDict;
 use crate::values::dict::DictRef;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::types::dict::dict_type::DictType;
+
+// MiniMutInsertionMap: the map behind `SmallMap`, for callers that name it directly.
+
+impl<'v, K: AllocValue<'v>, V: AllocValue<'v>> AllocValue<'v> for MiniMutInsertionMap<K, V> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
+        AllocDict(self).alloc_value(heap)
+    }
+}
+
+impl<'fv, K: AllocFrozenValue<'fv>, V: AllocFrozenValue<'fv>> AllocFrozenValue<'fv>
+    for MiniMutInsertionMap<K, V>
+{
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
+        AllocDict(self).alloc_frozen_value(heap)
+    }
+}
+
+impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for MiniMutInsertionMap<K, V> {
+    type Canonical = <DictType<K, V> as StarlarkTypeRepr>::Canonical;
+
+    fn starlark_type_repr() -> Ty {
+        DictType::<K, V>::starlark_type_repr()
+    }
+}
+
+impl<'v, K: UnpackValue<'v> + Hash + Eq, V: UnpackValue<'v>> UnpackValue<'v>
+    for MiniMutInsertionMap<K, V>
+{
+    type Error = Either<K::Error, V::Error>;
+    const UNCHECKED: bool = K::UNCHECKED || V::UNCHECKED;
+
+    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
+        SmallMap::unpack_value_impl(value).map(|r| r.map(SmallMap::into_inner))
+    }
+}
 
 // SmallMap
 
@@ -89,6 +125,7 @@ impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for SmallMap<K, 
 
 impl<'v, K: UnpackValue<'v> + Hash + Eq, V: UnpackValue<'v>> UnpackValue<'v> for SmallMap<K, V> {
     type Error = Either<K::Error, V::Error>;
+    const UNCHECKED: bool = K::UNCHECKED || V::UNCHECKED;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
         let Some(dict) = DictRef::from_value(value) else {
@@ -166,6 +203,7 @@ impl<K: StarlarkTypeRepr, V: StarlarkTypeRepr> StarlarkTypeRepr for BTreeMap<K, 
 
 impl<'v, K: UnpackValue<'v> + Ord, V: UnpackValue<'v>> UnpackValue<'v> for BTreeMap<K, V> {
     type Error = Either<K::Error, V::Error>;
+    const UNCHECKED: bool = K::UNCHECKED || V::UNCHECKED;
 
     fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
         let Some(dict) = DictRef::from_value(value) else {

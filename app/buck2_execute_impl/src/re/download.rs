@@ -57,7 +57,7 @@ use buck2_execute::re::remote_action_result::RemoteActionResult;
 use buck2_execute::re::ttl::re_expiration_from_ttl;
 use buck2_fs::paths::RelativePathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
-use buck2_hash::BuckIndexMap;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutSet;
 use buck2_util::time_span::TimeSpan;
 use buck2_util::time_span::TimeSpanBuilder;
@@ -65,7 +65,6 @@ use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::future;
-use gazebo::prelude::*;
 use jiff::Timestamp;
 use remote_execution as RE;
 
@@ -115,11 +114,12 @@ pub async fn download_action_results<'a>(
         let std_streams = std_streams.await;
         return DownloadResult::Result(manager.failure(
             response.execution_kind(details),
-            BuckIndexMap::default(),
+            BuckMutInsertionMap::default(),
             CommandStdStreams::Remote(std_streams),
             Some(action_exit_code),
             CommandExecutionMetadata::from_re_timing(response.timing(), TimeSpan::empty_now()),
             additional_message,
+            false,
         ));
     }
     let downloader = CasDownloader {
@@ -218,6 +218,7 @@ pub async fn download_action_results<'a>(
                     execution_time.end_now(),
                 ),
                 additional_message,
+                false,
             )
         }
     };
@@ -229,7 +230,7 @@ async fn materialize_failed_build_outputs(
     artifact_fs: &ArtifactFs,
     materializer: &dyn Materializer,
     request: &CommandExecutionRequest,
-    available_outputs: &BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+    available_outputs: &BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
     materialize_failed_re_action_outputs: bool,
     re_use_case: RemoteExecutorUseCase,
 ) -> buck2_error::Result<Vec<ProjectRelativePathBuf>> {
@@ -285,9 +286,9 @@ async fn materialize_failed_build_outputs(
         for result in response.results {
             result?;
         }
-        // FIXME(materializer): The error handler reads these after this returns, outside any
-        // lease. Materializing belongs where the handler runs, so it can hold one. A human
-        // reading them after the command is what final outputs are for and needs none.
+        // These are read after the command, by a human or by whatever reads the paths the event
+        // names, which no lease can cover; the error handler reads its outputs under one of its
+        // own (`materialize_outputs_for_error_handler`).
         drop(response.lease);
     }
 
@@ -318,7 +319,7 @@ impl CasDownloader<'_> {
         DownloadResult,
         (
             CommandExecutionManagerWithClaim,
-            BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+            BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
         ),
     > {
         let manager = manager.with_execution_kind(output_spec.execution_kind(details.clone()));
@@ -478,7 +479,9 @@ impl CasDownloader<'_> {
                     Some(identity),
                     output_spec
                         .output_directories()
-                        .map(|x| x.tree_digest.clone()),
+                        .iter()
+                        .map(|x| x.tree_digest.clone())
+                        .collect::<Vec<_>>(),
                     info,
                 )
                 .boxed()
@@ -501,7 +504,7 @@ impl CasDownloader<'_> {
         }
 
         let mut to_declare = Vec::with_capacity(output_paths.len());
-        let mut mapped_outputs = BuckIndexMap::with_capacity(output_paths.len());
+        let mut mapped_outputs = BuckMutInsertionMap::with_capacity(output_paths.len());
 
         for (requested, (path, _)) in requested_outputs.into_iter().zip(output_paths.iter()) {
             let value = extract_artifact_value(&input_dir, path, self.digest_config)?;
@@ -535,7 +538,7 @@ impl CasDownloader<'_> {
         &self,
         artifacts: ExtractedArtifacts,
         info: CasDownloadInfo,
-    ) -> buck2_error::Result<BuckIndexMap<CommandExecutionOutput, ArtifactValue>> {
+    ) -> buck2_error::Result<BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>> {
         // Declare the outputs to the materializer
         self.materializer
             .declare_cas_many(Arc::new(info), artifacts.to_declare)
@@ -558,7 +561,7 @@ fn re_forward_path(re_path: &str) -> buck2_error::Result<&ForwardRelativePath> {
 
 struct ExtractedArtifacts {
     to_declare: Vec<DeclareArtifactPayload>,
-    mapped_outputs: BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
+    mapped_outputs: BuckMutInsertionMap<CommandExecutionOutput, ArtifactValue>,
 }
 
 /// Did this download work out?

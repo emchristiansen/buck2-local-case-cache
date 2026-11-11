@@ -134,11 +134,15 @@ CxxSrcCompileCommand = record(
     error_handler = field([typing.Callable, None], None),
     # Whether to set expect_eligible_for_dedupe on compile actions.
     expect_eligible_for_dedupe = field(bool, False),
+    # Local executor slots the compile action takes.
+    weight = field(int),
 )
 
 CxxSrcPrecompileCommand = record(
-    # Source file to compile.
+    # Generated umbrella header used as the precompile input.
     src = field(Artifact),
+    # Preserve the include tree for PCM output and action naming.
+    include_dir = field(Artifact),
     # The CxxCompileCommand to use to compile this file.
     cxx_compile_cmd = field(CxxCompileCommand),
     # Arguments specific to the source file.

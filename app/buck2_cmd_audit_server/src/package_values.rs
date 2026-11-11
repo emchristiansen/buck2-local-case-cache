@@ -16,14 +16,13 @@ use buck2_common::dice::cells::HasCellResolver;
 use buck2_core::package::PackageLabel;
 use buck2_core::pattern::parse_package::parse_package;
 use buck2_events::dispatch::console_message;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_node::package_values_calculation::PACKAGE_VALUES_CALCULATION;
 use buck2_node::package_values_calculation::PackageValues;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use dupe::Dupe;
-use gazebo::prelude::SliceExt;
-use starlark_map::small_map::SmallMap;
 
 use crate::ServerAuditSubcommand;
 
@@ -48,7 +47,9 @@ impl ServerAuditSubcommand for PackageValuesCommand {
 
                 let packages = self
                     .packages
-                    .try_map(|package| parse_package(package.dupe(), &cell_alias_resolver))?;
+                    .iter()
+                    .map(|package| parse_package(package.dupe(), &cell_alias_resolver))
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 let package_values_by_package = dice_ctx
                     .ctx()
@@ -60,7 +61,7 @@ impl ServerAuditSubcommand for PackageValuesCommand {
                         buck2_error::Ok((package, package_values))
                     })
                     .await?;
-                let package_values_by_package: SmallMap<PackageLabel, PackageValues> =
+                let package_values_by_package: BuckMutInsertionMap<PackageLabel, PackageValues> =
                     package_values_by_package.into_iter().collect();
 
                 let mut stdout = stdout.as_writer();

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_error::BuckErrorContext;
+use buck2_hash::BuckFixedSortedMap;
 use buck2_test_api::data::ArgValue;
 use buck2_test_api::data::ArgValueContent;
 use buck2_test_api::data::ConfiguredTargetHandle;
@@ -39,7 +40,6 @@ use buck2_test_api::protocol::TestOrchestrator;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use host_sharing::HostSharingRequirements;
-use sorted_vector_map::SortedVectorMap;
 
 use crate::local_result_cache::ConfirmedPass;
 use crate::local_result_cache::DiscoveryIdentity;
@@ -60,7 +60,7 @@ pub(crate) trait InternalTestOrchestrator: TestOrchestrator {
         stage: TestStage,
         test_target: ConfiguredTargetHandle,
         cmd: Vec<ArgValue>,
-        env: SortedVectorMap<String, ArgValue>,
+        env: BuckFixedSortedMap<String, ArgValue>,
         timeout: Duration,
         required_local_resources: RequiredLocalResources,
         disable_test_execution_caching: bool,
@@ -565,9 +565,7 @@ fn build_command_from_spec(spec: &ExternalRunnerSpec) -> Vec<ArgValue> {
         .collect()
 }
 
-fn build_env_from_spec(
-    spec: &ExternalRunnerSpec,
-) -> sorted_vector_map::SortedVectorMap<String, ArgValue> {
+fn build_env_from_spec(spec: &ExternalRunnerSpec) -> BuckFixedSortedMap<String, ArgValue> {
     spec.env
         .iter()
         .map(|(k, v)| {

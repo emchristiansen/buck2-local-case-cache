@@ -69,7 +69,9 @@ when to discard values. We discuss this in Appendix A.
 immutable name of the state reached after a particular chain of commits. A **branch** is a line of
 versions extended by commits at its latest version, its **head**; `fork` starts a new branch from a
 version of an existing one, so versions form a forest. A version is written `(b, s)` — branch and
-seq — where seqs order the commits of one branch and carry no cross-branch meaning.
+seq — where seqs order the commits of one branch and carry no cross-branch meaning. Branch ids are
+minted in creation order and a branch is younger than the one it was forked from, so along any
+chain `(b, s)` increases lexicographically; versions of different chains have no order.
 
 **Untracked inputs.** Computes can read things the dep graph does not track — a file-content key
 reads the disk. To make this common case convenient, the interface gives every key k an implicit
@@ -113,6 +115,7 @@ semantics reads it as the set (Appendix B).
 ```
 commit(b: BranchId, assertions: Map<Key, Revision>, dirties: Set<Key>) → Seq
 fork(v: Version) → BranchId
+new_root() → BranchId
 lookup(k: Key, v: Version) → Valid(Revision)
                            | Unknown { candidate: Option<Cert>, epsilon: Revision }
 write(cert: Cert)
@@ -129,6 +132,10 @@ asserting a freshly minted revision on that key's untracked input. Assertions ar
 judgment — the structure's ground truth is *defined* by them.
 
 **`fork`** creates a branch whose world is v's and whose subsequent commits diverge from it.
+
+**`new_root`** creates a branch with no parent. Nothing resolves at its initial version except
+certificates whose premises hold there, which at first is only those without premises; its world
+is what its commits assert.
 
 **`lookup`** is the operation the soundness theorem is about. `Valid(r)` claims that r is justified
 for k at v in the sense of §3 — that is the entire contract. `Unknown` claims nothing and is
@@ -156,10 +163,9 @@ ways.
 
 In addition to the semantic operations above, an implementation of this API is likely to want to
 provide some operations for resource management, for example reporting a branch to no longer be in
-use. The implementation and semantics of these are straightforward, so we omit discussion here. One
-constraint they all share: forgetting claims and values is always sound (§3.3), but they must still
-take care to not accidentally reset the revision counter and cause reuse of revision numbers (or
-similar bugs).
+use; ours is `delete`, §5.5. One constraint they all share: forgetting claims and values is always
+sound (§3.3), but they must still take care to not accidentally reset the revision counter and
+cause reuse of revision numbers (or similar bugs).
 
 ## 3. Semantics
 
@@ -648,6 +654,31 @@ algorithm's map construction, but instead of treating all closed-window resolver
 the precise algorithm's worklist with exactly those keys as the candidate set — the match's ground
 arm then covers everything resolving through open windows, inheritance, and histories. This is the
 algorithm we implement.
+
+### 5.5 `delete(b)`
+
+Deletion forgets b's claims, edges and histories, so that the values only b referenced can be
+released (§2.3). Since a child resolves through its parent (§4.4), b's children are first given
+what they resolved through b, and then handed to b's parent, or made roots if b has none.
+Resolution at every version of every surviving branch is thereby unchanged, so S holds without
+further argument. For a child c forked at (b, s):
+
+- Every key K with a claim at b and none at c gets a claim at c with the same certificate. If b's
+  window covered s, c resolved `Valid` through it at every seq of c (delegation is total across
+  c's timeline, §4.4), so the new window is open; c was attached, and by Invariant 3 c's own
+  `RdepMap` already holds the certificate's edges, so Invariants 2 and 3 carry over as they stood.
+  Otherwise c resolved `Unknown` with that certificate as its candidate, and an empty window keeps
+  it so.
+- For every history at b, of an injected key or of an untracked input, the entry in force at s, if
+  there is one, is copied to c at c's first seq, unless c's own history already starts there. c's
+  history then answers, with the same revision, for the seqs c used to resolve through b.
+
+A key c has a claim of, and a history c owned from its first seq on, delegated nothing to b and
+need nothing. Descendants of c resolve through c and are unaffected.
+
+The price is duplication. A claim that b's children shared through inheritance becomes one copy
+per child, and a write that would have reached them through one installation at b is instead
+cascaded into each child's own claim. What resolves where does not change.
 
 ## 6. Completeness
 

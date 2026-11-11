@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
-use buck2_common::file_ops::dice::FileChangeTracker;
-use buck2_common::ignores::ignore_set::IgnoreSet;
+use buck2_common::file_ops::baseline::FileSystemBaseline;
+use buck2_common::file_ops::baseline::SetFileSystemBaseline;
+use buck2_common::file_ops::io::FileChangeTracker;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
-use buck2_core::cells::CellResolver;
-use buck2_core::cells::name::CellName;
+use buck2_core::fs::i_project_rel_path::IProjectRelativePath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::soft_error;
@@ -35,8 +35,8 @@ use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckMutSet;
-use buck2_hash::StdBuckHashMap;
 use dice::DiceTransactionUpdater;
+use dupe::Dupe;
 use edenfs::ChangeNotification;
 use edenfs::ChangesSinceV2Params;
 use edenfs::Dtype;
@@ -45,8 +45,6 @@ use edenfs::LargeChangeNotification;
 use edenfs::SmallChangeNotification;
 use fbinit::FacebookInit;
 use tokio::sync::RwLock;
-use tracing::debug;
-use tracing::info;
 
 use crate::dep_files::DepFileCache;
 use crate::edenfs::sapling::MergebaseDetails;
@@ -59,6 +57,8 @@ use crate::edenfs::utils::bytes_to_string_or_unknown;
 use crate::edenfs::utils::dtype_into_file_watcher_kind;
 use crate::edenfs::utils::find_first_valid_parent;
 use crate::file_watcher::FileWatcher;
+use crate::file_watcher::SyncOutcome;
+use crate::ignores::FileWatcherIgnores;
 use crate::mergebase::Mergebase;
 use crate::stats::FileWatcherStats;
 
@@ -87,17 +87,23 @@ struct EdenFsEvent {
     path: String,
 }
 
+/// What DICE has been told of: Eden's journal up to `position`, as changes relative to `baseline`.
+#[derive(Clone)]
+struct Checkpoint {
+    position: JournalPosition,
+    baseline: FileSystemBaseline,
+}
+
 #[derive(Allocative)]
 pub(crate) struct EdenFsFileWatcher {
     manager: EdenConnectionManager,
     mount_point: Vec<u8>,
     eden_root: AbsNormPathBuf,
     #[allocative(skip)]
-    position: RwLock<JournalPosition>,
-    cells: CellResolver,
+    checkpoint: RwLock<Checkpoint>,
     // The project root, relative to the eden mount point
     project_root: ForwardRelativePathBuf,
-    ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+    ignores: FileWatcherIgnores,
     mergebase: RwLock<Option<MergebaseDetails>>,
     last_mergebase: RwLock<Option<MergebaseDetails>>,
     mergebase_with: Option<String>,
@@ -111,14 +117,13 @@ impl EdenFsFileWatcher {
         fb: FacebookInit,
         project_root: &ProjectRoot,
         root_config: &LegacyBuckConfig,
-        cells: CellResolver,
-        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+        ignores: FileWatcherIgnores,
         dep_file_cache: Arc<dyn DepFileCache>,
     ) -> buck2_error::Result<Self> {
         let manager = EdenConnectionManager::new(
             fb,
             project_root,
-            Some(semaphore::buck2_default()),
+            Some(semaphore::buck2_default()?),
         )
         .map_err(EdenFsWatcherError::EdenConnectionError)?
         .ok_or(EdenFsWatcherError::EdenConnectionError(
@@ -148,10 +153,12 @@ impl EdenFsFileWatcher {
             manager,
             mount_point,
             eden_root,
-            position: RwLock::new(JournalPosition::default()),
-            cells,
+            checkpoint: RwLock::new(Checkpoint {
+                position: JournalPosition::default(),
+                baseline: FileSystemBaseline::unique(),
+            }),
             project_root,
-            ignore_specs,
+            ignores,
             mergebase: RwLock::new(None),
             last_mergebase: RwLock::new(None),
             mergebase_with,
@@ -165,7 +172,10 @@ impl EdenFsFileWatcher {
         &self,
         dice: DiceTransactionUpdater,
     ) -> buck2_error::Result<(buck2_data::FileWatcherStats, DiceTransactionUpdater)> {
-        let position = self.position.read().await.clone();
+        let Checkpoint {
+            position,
+            mut baseline,
+        } = self.checkpoint.read().await.clone();
         let changes_since_v2_params = ChangesSinceV2Params {
             mountPoint: self.mount_point.clone(),
             fromPosition: position,
@@ -210,18 +220,23 @@ impl EdenFsFileWatcher {
 
         let mut dice = dice;
         if large_or_unknown_change {
-            (stats, file_change_tracker, dice) = self
+            (stats, file_change_tracker, baseline, dice) = self
                 .on_large_or_unknown_change(dice)
                 .await
                 .buck_error_context("Failed to handle large or unknown change.")?;
         }
 
-        // The journal position isn't updated until we have successfully written the changes to DICE.
-        // Writing it before that's the case risks DICE's state not matching the filesystem's if we
-        // return early due to an error above. This way, at worst we re-invalidate DICE keys, but we
-        // still ensure that it remains in sync with the repository state.
+        // The checkpoint isn't advanced until the changes, and the baseline they are relative to,
+        // have been written to DICE. Advancing it before that risks DICE's state not matching the
+        // filesystem's if we return early due to an error above. This way, at worst we
+        // re-invalidate DICE keys, but we still ensure that it remains in sync with the repository
+        // state.
         file_change_tracker.write_to_dice(&mut dice)?;
-        *self.position.write().await = new_position;
+        dice.set_file_system_baseline(baseline.dupe())?;
+        *self.checkpoint.write().await = Checkpoint {
+            position: new_position,
+            baseline,
+        };
         Ok((stats.finish(), dice))
     }
 
@@ -268,7 +283,7 @@ impl EdenFsFileWatcher {
                                 bytes_to_string_or_unknown(&renamed.from),
                                 bytes_to_string_or_unknown(&renamed.to)
                             )
-                        )?;
+                        );
                     } else {
                         let kind = dtype_into_file_watcher_kind(renamed.fileType);
                         self.process_file_watcher_event(
@@ -351,7 +366,7 @@ impl EdenFsFileWatcher {
                              EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                             small_change
                         )
-                    )?;
+                    );
                     ProcessChangeStatus::LargeOrUnknown
                 }
             },
@@ -402,7 +417,7 @@ impl EdenFsFileWatcher {
                              EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                             large_change
                         )
-                    )?;
+                    );
                     ProcessChangeStatus::LargeOrUnknown
                 }
             },
@@ -419,7 +434,7 @@ impl EdenFsFileWatcher {
                          EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                         change
                     )
-                )?;
+                );
                 ProcessChangeStatus::LargeOrUnknown
             }
         };
@@ -482,52 +497,35 @@ impl EdenFsFileWatcher {
             // we ignore any changes that are not relative to the project root
             Err(_) => return Ok(()),
         };
+        let project_rel_path = IProjectRelativePath::intern_directly(project_rel_path);
 
         // Watchman cookie files are synchronization markers, not real source changes.
-        if crate::is_watchman_cookie(project_rel_path) {
+        if crate::is_watchman_cookie(&project_rel_path) {
             stats.add_ignored(1);
             return Ok(());
         }
 
-        let cell_path = self.cells.get_cell_path(project_rel_path);
-
-        let ignore = self
-            .ignore_specs
-            .get(&cell_path.cell())
-            // This shouldn't ever really happen. However, because of the bugs caused by just
-            // storing the `CellResolver` in the watcher permanently, sometimes it can, so we just
-            // default to not ignoring the file in that case
-            .is_some_and(|ignore| ignore.is_match(cell_path.path()));
-
-        info!("EdenFS: {:?} (ignore = {})", cell_path, ignore);
+        let ignore = self.ignores.is_ignored(project_rel_path);
 
         if ignore {
             stats.add_ignored(1);
         } else if processed_changes.insert(EdenFsEvent {
             event_type: event,
             event_kind: kind,
-            path: cell_path.to_string(),
+            path: project_rel_path.to_string(),
         }) {
-            stats.add(cell_path.to_string(), event, kind);
+            stats.add(project_rel_path, event, kind);
 
             match (event, kind) {
-                (Type::Create, Kind::Directory) => tracker.dir_added_or_removed(cell_path),
-                (Type::Create, _) => {
-                    if kind == Kind::Symlink {
-                        debug!(
-                            "New symlink detected (source symlinks are not supported): {}",
-                            cell_path
-                        );
-                    }
-                    tracker.file_added_or_removed(cell_path)
-                }
+                (Type::Create, Kind::Directory) => tracker.dir_added_or_removed(project_rel_path),
+                (Type::Create, _) => tracker.file_added_or_removed(project_rel_path),
                 (Type::Modify, Kind::Directory) => {
                     // FIXME(JakobDegen): This should not be needed
-                    tracker.dir_entries_changed_force_invalidate(cell_path)
+                    tracker.dir_entries_changed_force_invalidate(project_rel_path)
                 }
-                (Type::Modify, _) => tracker.file_contents_changed(cell_path),
-                (Type::Delete, Kind::Directory) => tracker.dir_added_or_removed(cell_path),
-                (Type::Delete, _) => tracker.file_added_or_removed(cell_path),
+                (Type::Modify, _) => tracker.file_contents_changed(project_rel_path),
+                (Type::Delete, Kind::Directory) => tracker.dir_added_or_removed(project_rel_path),
+                (Type::Delete, _) => tracker.file_added_or_removed(project_rel_path),
             };
         }
 
@@ -713,7 +711,12 @@ impl EdenFsFileWatcher {
     async fn on_large_or_unknown_change(
         &self,
         dice: DiceTransactionUpdater,
-    ) -> buck2_error::Result<(FileWatcherStats, FileChangeTracker, DiceTransactionUpdater)> {
+    ) -> buck2_error::Result<(
+        FileWatcherStats,
+        FileChangeTracker,
+        FileSystemBaseline,
+        DiceTransactionUpdater,
+    )> {
         // A large change is one that affects numerous files or is otherwise unbounded in nature.
         // For example:
         // - A commit transition (e.g. a rebase, checkout, etc.).
@@ -730,13 +733,9 @@ impl EdenFsFileWatcher {
         // of the related files, in which case we will need to use Sapling to obtain.
         //
 
-        // Invalidate everything - including the dep files - and recompute everything.
+        // The dep files are cleared here. DICE is not: the fresh instance reported below has the
+        // daemon start it over.
         self.dep_file_cache.clear_non_local();
-
-        // Dropping the entire DICE map can be somewhat computationally expensive as there
-        // are a lot of destructors to run. On the other hand, we don't have to wait for
-        // it. So, we just send it off to its own thread.
-        let dice = dice.unstable_take();
 
         // Get mergebase state
         let last_mergebase_info = self.last_mergebase.read().await.clone();
@@ -758,20 +757,27 @@ impl EdenFsFileWatcher {
             let mut tracker = FileChangeTracker::new();
             let mut stats = FileWatcherStats::new(base_stats, 0);
             let mut processed_changes: BuckMutSet<EdenFsEvent> = BuckMutSet::default();
-            self.process_source_control_changes(
-                &mut tracker,
-                &mut stats,
-                &mergebase,
-                None,
-                &mut processed_changes,
-            )
-            .await?;
-            Ok((stats, tracker, dice))
+            let status = self
+                .process_source_control_changes(
+                    &mut tracker,
+                    &mut stats,
+                    &mergebase,
+                    None,
+                    &mut processed_changes,
+                )
+                .await?;
+            let baseline = if status == ProcessChangeStatus::Processed {
+                FileSystemBaseline::Revision(mergebase.into())
+            } else {
+                FileSystemBaseline::unique()
+            };
+            Ok((stats, tracker, baseline, dice))
         } else {
             base_stats.incomplete_events_reason = Some("Large or Unknown change".to_owned());
             Ok((
                 FileWatcherStats::new(base_stats, 0),
                 FileChangeTracker::new(),
+                FileSystemBaseline::unique(),
                 dice,
             ))
         }
@@ -832,7 +838,7 @@ impl FileWatcher for EdenFsFileWatcher {
     async fn sync(
         &self,
         dice: DiceTransactionUpdater,
-    ) -> buck2_error::Result<(DiceTransactionUpdater, Mergebase)> {
+    ) -> buck2_error::Result<(DiceTransactionUpdater, Mergebase, SyncOutcome)> {
         span_async(
             buck2_data::FileWatcherStart {
                 provider: buck2_data::FileWatcherProvider::EdenFs as i32,
@@ -841,7 +847,8 @@ impl FileWatcher for EdenFsFileWatcher {
                 let (stats, res) = match self.update(dice).await {
                     Ok((stats, dice)) => {
                         let mergebase = Mergebase(Arc::new(stats.branched_from_revision.clone()));
-                        ((Some(stats)), Ok((dice, mergebase)))
+                        let outcome = SyncOutcome::reported_by(&stats);
+                        ((Some(stats)), Ok((dice, mergebase, outcome)))
                     }
                     Err(e) => (None, Err(e)),
                 };

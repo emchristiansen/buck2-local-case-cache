@@ -379,6 +379,17 @@ mod tests {
     use crate::assert;
     use crate::assert::Assert;
 
+    /// `D.update(pairs)` with `D` itself among the pairs: iterating the receiver while
+    /// `update` holds it mutably borrowed is a Starlark error, not a panic.
+    #[test]
+    fn test_update_with_self_among_pairs() {
+        assert::fail("d = {'a': 1, 'b': 2}\nd.update([d])", "mutates an iterable");
+        assert::fail(
+            "d = {'a': 1}\nd.update([('k', 'v'), d])",
+            "mutates an iterable",
+        );
+    }
+
     #[test]
     fn test_error_codes() {
         assert::fail(r#"x = {"one": 1}; x.pop("four")"#, "not found");

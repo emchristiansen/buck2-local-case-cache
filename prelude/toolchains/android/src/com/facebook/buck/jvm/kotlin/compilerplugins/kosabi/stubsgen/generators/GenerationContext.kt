@@ -14,6 +14,7 @@ import com.facebook.kotlin.compilerplugins.kosabi.common.FullTypeQualifier
 import com.facebook.kotlin.compilerplugins.kosabi.common.parseClasspathFileClassesAndPackages
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.stub.container.StubsContainer
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.stub.container.StubsContainerImpl
+import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.JavaSourceInfo
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.calculateQualifierList
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.declaredTypes
 import com.facebook.kotlin.compilerplugins.kosabi.stubsgen.util.toImportedClass
@@ -52,11 +53,28 @@ class GenerationContext {
   val importedTypes: Set<FullTypeQualifier>
 
   /**
+   * Explicit Java imports, creation-only: stub generators may create stubs from them, but they must
+   * never resolve a Kotlin usage or suppress same-package fabrication — a Java-only import would
+   * otherwise claim a Kotlin simple name the Kotlin file never imported. Hence only
+   * [PrimitiveStubsGenerator] and the import-driven half of [InnerClassStubsGenerator] read this.
+   */
+  val javaImportedTypes: Set<FullTypeQualifier>
+
+  /** Java fully-qualified usages; creation-only, like [javaImportedTypes]. */
+  val javaFullQualifierTypes: Set<FullTypeQualifier>
+
+  /**
    * [importedTypes] split by the file that wrote the import. A usage must be attributed against its
    * own file's imports: the pooled set resolves a simple name to whichever file imported it first,
    * which is the wrong type as soon as two files import different types of the same name.
    */
   val importedTypesByFile: Map<KtFile, Set<FullTypeQualifier>>
+
+  /**
+   * [isCompanionCallableImport], precomputed: probing per candidate would rescan every file's
+   * imports.
+   */
+  val companionCallableImports: Set<FullTypeQualifier>
 
   /**
    * This contains external types outside from the local source codes, etc: classpath, code
@@ -71,6 +89,12 @@ class GenerationContext {
   val annotationEntries: List<KtAnnotationEntry>
   val declaredTypes: Set<FullTypeQualifier>
   val fullQualifierTypes: Set<FullTypeQualifier>
+
+  /**
+   * [fullQualifierTypes] split by the file that wrote the qualifier. Same-package fabrication must
+   * land in the using file's own package: the module's files can span packages.
+   */
+  val fullQualifierTypesByFile: Map<KtFile, Set<FullTypeQualifier>>
   val importAlias: Set<String>
 
   /**
@@ -91,6 +115,7 @@ class GenerationContext {
       classpath: List<File>,
       knownGeneratedTypes: Set<FullTypeQualifier> = emptySet(),
       lightweight: Boolean = true,
+      javaSources: Collection<JavaSourceInfo> = emptyList(),
   ) {
     this.projectFiles = projectFiles
     this.stubsContainer = StubsContainerImpl()
@@ -101,7 +126,10 @@ class GenerationContext {
       this.pkgsInClasspath = emptySet()
       this.importedDeclarations = emptySet()
       this.importedTypes = emptySet()
+      this.javaImportedTypes = emptySet()
+      this.javaFullQualifierTypes = emptySet()
       this.importedTypesByFile = emptyMap()
+      this.companionCallableImports = emptySet()
       this.interfaceTypes = emptyList()
       this.multiBoundGroups = emptyList()
       this.annotationEntries = emptyList()
@@ -110,6 +138,7 @@ class GenerationContext {
       this.importAlias = emptySet()
       this.importAliasQualifiers = emptyMap()
       this.fullQualifierTypes = emptySet()
+      this.fullQualifierTypesByFile = emptyMap()
       this.usedUserTypes = emptySet()
       this.typeAliasSymbol = emptySet()
       this.parameterNames = emptySet()
@@ -135,7 +164,14 @@ class GenerationContext {
 
       // declaredTypes is a structural getChildrenOfType recursion (it intentionally excludes
       // local/anonymous classes in function bodies), so it stays out of the single-pass DFS below.
-      this.declaredTypes = projectFiles.flatMap { it.declaredTypes() }.toSet()
+      // Java-declared types join so imports of same-module Java classes are not stubbed.
+      this.declaredTypes =
+          projectFiles.flatMap { it.declaredTypes() }.toSet() +
+              javaSources.flatMap { it.declaredTypes }.toSet()
+      this.javaImportedTypes =
+          javaSources.flatMap { it.imports }.filterNot { it.isTopLevelDeclaration() }.toSet()
+      this.javaFullQualifierTypes =
+          javaSources.flatMap { it.fullQualifierTypes }.filterNot { it.isSdkQualifier() }.toSet()
 
       // Single-pass PSI traversal: one DFS per file collects everything the generators need,
       // replacing 9 separate whole-tree collectDescendantsOfType walks. Semantics are preserved
@@ -145,7 +181,7 @@ class GenerationContext {
       val aliasNames = mutableSetOf<String>()
       val paramNames = mutableSetOf<String>()
       val usedTypes = mutableSetOf<KtUserType>()
-      val multiSegQualifiers = mutableListOf<List<String>>()
+      val multiSegByFile = mutableMapOf<KtFile, MutableList<List<String>>>()
       val interfaceUserTypes = mutableListOf<KtUserType>()
       val multiBoundUserTypes = mutableListOf<List<KtUserType>>()
       val typeValueArgPairs = mutableListOf<Pair<String, Int>>()
@@ -171,7 +207,7 @@ class GenerationContext {
                 if (element is KtTypeReference) {
                   element.userTypeForQualifier()?.calculateQualifierList()?.let { qualifier ->
                     if (qualifier.size >= 2) {
-                      multiSegQualifiers.add(qualifier)
+                      multiSegByFile.getOrPut(ktFile) { mutableListOf() }.add(qualifier)
                     }
                   }
                 }
@@ -209,12 +245,14 @@ class GenerationContext {
       this.usedUserTypes = usedTypes
       this.interfaceTypes = interfaceUserTypes
       this.multiBoundGroups = multiBoundUserTypes
-      this.fullQualifierTypes =
-          multiSegQualifiers
+      fun qualifiersOf(quals: List<List<String>>): Set<FullTypeQualifier> =
+          quals
               .distinct()
-              .map { FullTypeQualifier(it) }
+              .map { FullTypeQualifier(it).withMemberAsNestedName() }
               .filterNot { it.isSdkQualifier() }
               .toSet()
+      this.fullQualifierTypesByFile = multiSegByFile.mapValues { (_, quals) -> qualifiersOf(quals) }
+      this.fullQualifierTypes = fullQualifierTypesByFile.values.flatten().toSet()
       // An all-caps simple name (`IABJSOTA`, `OTA`, `URI`) parses as a static-const member, so
       // its import carries no class name and drops out of the raw type sets above. A member used
       // in type position is really a class: promote those imports, module-wide and per file, so
@@ -225,6 +263,16 @@ class GenerationContext {
         val quals = imports.mapNotNull { it.toImportedClass() }
         quals.filterNot { it.isTopLevelDeclaration() }.toSet() + promoteProvenClassImports(quals)
       }
+      this.companionCallableImports =
+          importedTypesByFile.values.flatMapTo(mutableSetOf()) { imports ->
+            val classNames =
+                imports.mapNotNullTo(mutableSetOf()) { other ->
+                  other.names.lastOrNull()?.takeUnless { other.isThroughCompanion() }
+                }
+            imports.filter { imp ->
+              imp.isThroughCompanion() && imp.names.lastOrNull() in classNames
+            }
+          }
       // TODO: We might have multiple ctors for each type.
       // For now we're just skipping to have one (the default)
       this.typeValueArgs = typeValueArgPairs.toMap()
@@ -373,6 +421,27 @@ class GenerationContext {
     return usedUserTypes.any { it.referencedName == name }
   }
 
+  /**
+   * A lowercase trailing segment parses as a static-method member, so the import carries no nested
+   * name until type-position usage proves it.
+   */
+  fun isProvenNestedClassImport(imp: FullTypeQualifier): Boolean {
+    val member = imp.member ?: return false
+    if (imp.names.isEmpty() || !member.first().isLowerCase()) return false
+    return usedUserTypes.any { it.referencedName == member }
+  }
+
+  /**
+   * A companion-path import (`import a.Outer.Companion.X`) colliding with a non-companion import of
+   * the same simple name in the same file names the callable: a factory fun and a class share the
+   * name in separate namespaces, and the type usages resolve to the other import.
+   */
+  fun isCompanionCallableImport(imp: FullTypeQualifier): Boolean {
+    // The set matches by segments, but the probe always inspected the candidate's own names: a
+    // rebuilt qualifier can share an import's segments while parsing its names differently.
+    return imp.isThroughCompanion() && imp in companionCallableImports
+  }
+
   private fun promoteProvenClassImports(
       quals: Collection<FullTypeQualifier>,
   ): Set<FullTypeQualifier> =
@@ -420,4 +489,21 @@ class GenerationContext {
         .filter { it -> it.isNotEmpty() }
         .firstOrNull()
   }
+
+  /**
+   * Package segments a same-package stub for a usage in [file] belongs to: the file's own package,
+   * falling back to the module's first package for default-package files.
+   */
+  fun packageSegmentsOf(file: KtFile): List<String> {
+    val own = file.packageFqName.asString()
+    if (own.isNotEmpty()) return own.split(".")
+    return packageName()?.split(".").orEmpty()
+  }
+}
+
+private fun FullTypeQualifier.isThroughCompanion(): Boolean {
+  for (i in 0 until names.size - 1) {
+    if (names[i] == "Companion") return true
+  }
+  return false
 }

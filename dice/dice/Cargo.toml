@@ -24,7 +24,6 @@ dice_error.workspace = true
 dice_futures.workspace = true
 dupe.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 itertools.workspace = true
 lock_free_hashtable.workspace = true
 lock_free_vec.workspace = true
@@ -41,6 +40,7 @@ static_assertions.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+variant_name.workspace = true
 
 [dev-dependencies]
 assert_matches.workspace = true

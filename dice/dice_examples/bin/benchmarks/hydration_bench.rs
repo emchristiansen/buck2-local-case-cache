@@ -35,7 +35,6 @@ use pagable::PagableDeserialize;
 use pagable::PagableDeserializer;
 use pagable::PagableSerialize;
 use pagable::PagableSerializer;
-use pagable::PageInState;
 use pagable::StorageState;
 use pagable::pagable_typetag;
 
@@ -105,11 +104,6 @@ struct BenchStorageState;
 
 impl StorageState for BenchStorageState {}
 
-#[derive(Default)]
-struct BenchPageInState;
-
-impl PageInState for BenchPageInState {}
-
 impl PagableSerialize for BenchValue {
     fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> pagable::Result<()> {
         for _ in 0..self.state_lookups {
@@ -133,8 +127,8 @@ impl<'de> PagableDeserialize<'de> for BenchValue {
         for _ in 0..state_lookups {
             black_box(
                 deserializer
-                    .page_in_scope()
-                    .get_or_init(BenchPageInState::default),
+                    .storage_context()
+                    .get_or_init(BenchStorageState::default),
             );
         }
         Ok(Self {
@@ -277,10 +271,11 @@ async fn main() -> anyhow::Result<()> {
         builder.set_pagable_storage(storage);
     }
     let dice = builder.build(DetectCycles::Disabled);
+    let root = dice.new_root().await;
     let heap_dump = cli.heap_dump.as_deref();
 
     {
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(ValueSizeKey, cli.value_size)])?;
         updater.changed_to(vec![(NumDepsKey, cli.num_deps)])?;
         if cli.state_lookups_per_value != 0 {
@@ -288,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
         }
         updater.commit().await;
     }
-    let ctx = dice.updater().commit().await;
+    let ctx = dice.updater(root).commit().await;
 
     let compute_start = Instant::now();
     if cli.state_lookups_per_value == 0 {

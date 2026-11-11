@@ -37,6 +37,8 @@ struct Stats {
     total_bytes_uploaded: u64,
     total_bytes_re_downloaded: u64,
     total_bytes_http_downloaded: u64,
+    initial_re_download_bytes: Option<u64>,
+    initial_http_download_bytes: Option<u64>,
     total_files_materialized: u64,
     total_bytes_materialized: u64,
     total_local_actions: u64,
@@ -74,7 +76,10 @@ impl Stats {
                 Some(buck2_data::span_end_event::Data::ActionExecution(data)) => {
                     match ActionExecutionKind::try_from(data.execution_kind) {
                         Ok(ActionExecutionKind::Local) => self.total_local_actions += 1,
-                        Ok(ActionExecutionKind::Remote) => self.total_remote_actions += 1,
+                        Ok(ActionExecutionKind::Remote)
+                        | Ok(ActionExecutionKind::RemoteDeduplicated) => {
+                            self.total_remote_actions += 1
+                        }
                         Ok(ActionExecutionKind::ActionCache) => self.total_cached_actions += 1,
                         Ok(ActionExecutionKind::LocalTestResultCache) => {
                             self.total_local_test_result_cache_hits += 1;
@@ -106,9 +111,18 @@ impl Stats {
                             self.peak_used_disk_space_bytes,
                             snapshot.used_disk_space_bytes,
                         );
-                        // snapshot.re_download_bytes/http_download_bytes fields are cumulative counters from the start of the build.
-                        self.total_bytes_re_downloaded = snapshot.re_download_bytes;
-                        self.total_bytes_http_downloaded = snapshot.http_download_bytes;
+                        // Download counters are cumulative across invocations of the daemon.
+                        self.total_bytes_re_downloaded = snapshot.re_download_bytes.saturating_sub(
+                            *self
+                                .initial_re_download_bytes
+                                .get_or_insert(snapshot.re_download_bytes),
+                        );
+                        self.total_bytes_http_downloaded =
+                            snapshot.http_download_bytes.saturating_sub(
+                                *self
+                                    .initial_http_download_bytes
+                                    .get_or_insert(snapshot.http_download_bytes),
+                            );
 
                         if let Some(ts) = get_event_timestamp(event) {
                             self.re_avg_download_speed

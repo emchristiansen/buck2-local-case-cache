@@ -43,7 +43,6 @@ use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::unconfigured::TargetNodeRef;
 use buck2_node::super_package::SuperPackage;
 use buck2_util::indent::indent;
-use gazebo::prelude::SliceExt;
 use regex::RegexSet;
 
 use crate::configured_target_hash::ConfiguredTargetHash;
@@ -323,7 +322,12 @@ impl TargetFormatter for JsonFormat {
             buffer,
             &mut first,
             "buck.imports",
-            QuotedJson::list(imports.map(|d| QuotedJson::quote_display(d.path()))),
+            QuotedJson::list(
+                imports
+                    .iter()
+                    .map(|d| QuotedJson::quote_display(d.path()))
+                    .collect::<Vec<_>>(),
+            ),
         );
         self.writer.entry_end(buffer, first);
     }
@@ -391,7 +395,9 @@ impl ConfiguredTargetFormatter for JsonFormat {
             QuotedJson::list(
                 target_node
                     .deps()
-                    .map(|n| QuotedJson::quote_display(n.label())),
+                    .iter()
+                    .map(|n| QuotedJson::quote_display(n.label()))
+                    .collect::<Vec<_>>(),
             )
         });
 
@@ -493,6 +499,7 @@ impl Stats {
         self.errors += stats.errors;
         self.success += stats.success;
         self.targets += stats.targets;
+        self.error_tags.extend(stats.error_tags.iter().copied());
     }
 
     pub(crate) fn add_error(&mut self, e: &buck2_error::Error) {
@@ -797,5 +804,34 @@ pub fn create_configured_formatter(
                 target_call_stacks,
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_error::ErrorTag;
+
+    use super::Stats;
+
+    /// `Stats::merge` carries the error tags of the merged stats, so the error built by the
+    /// streaming command keeps the tags of the package failures.
+    #[test]
+    fn test_stats_merge_error_tags() {
+        let e = buck2_error::buck2_error!(ErrorTag::Tier0, "package failed");
+        let mut package = Stats::default();
+        package.add_error(&e);
+        assert!(
+            package
+                .to_error()
+                .unwrap()
+                .tags()
+                .contains(&ErrorTag::Tier0)
+        );
+
+        let mut total = Stats::default();
+        total.merge(&package);
+        let err = total.to_error().unwrap();
+        assert!(err.tags().contains(&ErrorTag::Tier0));
+        assert!(err.tags().contains(&ErrorTag::Input));
     }
 }

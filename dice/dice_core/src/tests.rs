@@ -28,10 +28,12 @@ use crate::ids::BranchId;
 mod cascade;
 mod commit;
 mod cycles;
+mod delete;
 mod epsilon;
 mod fork;
 mod resolution;
 mod retention;
+mod roots;
 mod write;
 
 pub(crate) struct TestEnv;
@@ -72,23 +74,18 @@ pub(crate) fn cert(
 }
 
 pub(crate) trait StateExt {
-    fn root_v(&self, seq: u32) -> Version;
     fn assert_at(&mut self, b: BranchId, key: Key, revision: Revision) -> Version;
     fn dirty_at(&mut self, b: BranchId, key: Key) -> Version;
     fn commit_checked(&mut self, b: BranchId, changes: Vec<Change<()>>) -> Version;
     fn write_checked(&mut self, cert: &TestCert) -> WriteOutcome;
     fn fork_checked(&mut self, from: Version) -> BranchId;
-    fn take_checked(&mut self) -> Version;
+    fn delete_checked(&mut self, b: BranchId) -> Vec<Key>;
     fn valid_at(&self, key: Key, v: Version) -> Option<Revision>;
     fn candidate_at(&self, key: Key, v: Version) -> Option<Revision>;
     fn is_unknown_at(&self, key: Key, v: Version) -> bool;
 }
 
 impl StateExt for State {
-    fn root_v(&self, seq: u32) -> Version {
-        v(self.root(), seq)
-    }
-
     fn assert_at(&mut self, b: BranchId, key: Key, revision: Revision) -> Version {
         self.commit_checked(
             b,
@@ -122,10 +119,11 @@ impl StateExt for State {
         b
     }
 
-    fn take_checked(&mut self) -> Version {
-        let v = self.take();
+    fn delete_checked(&mut self, b: BranchId) -> Vec<Key> {
+        let mut affected = self.delete_branch(b);
         self.check_invariants();
-        v
+        affected.sort();
+        affected
     }
 
     fn valid_at(&self, key: Key, v: Version) -> Option<Revision> {
@@ -143,11 +141,11 @@ impl StateExt for State {
 
 /// A root state with injected key `k(0)` at `r(1)` (version 2) and computed key `k(1)` attached
 /// at the head with a certificate over it.
-pub(crate) fn leaf_and_dependent() -> (State, TestCert) {
+pub(crate) fn leaf_and_dependent() -> (State, BranchId, TestCert) {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     let c = cert(k(1), r(1), &[(k(0), r(1))], EpsilonToken::INITIAL);
     s.write_checked(&c);
-    (s, c)
+    (s, root, c)
 }

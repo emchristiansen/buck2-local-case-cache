@@ -84,9 +84,14 @@ prepare(ExecutionDir, Tests, ArtifactAnnotationFunction) ->
     with_artifact_dir(
         fun(_ArtifactDir) ->
             link_tar_ball(ExecutionDir),
-            link_to_artifact_dir(
-                join_paths(ExecutionDir, "result_exec.json"), ExecutionDir, ArtifactAnnotationFunction
-            ),
+            case os:getenv("TEST_RESULTS_OUTPUT_FILE") of
+                false ->
+                    ok;
+                OutputFile ->
+                    link_to_artifact_dir(
+                        OutputFile, filename:dirname(OutputFile), fun artifact_annotations:default_annotation/1
+                    )
+            end,
             case coverage_tmp_dir() of
                 undefined ->
                     ok;

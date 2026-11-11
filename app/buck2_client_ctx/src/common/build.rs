@@ -13,7 +13,6 @@ use buck2_core::buck2_env_name;
 use buck2_error::conversion::clap::buck_error_clap_parser;
 use clap::ArgGroup;
 use clap::builder::FalseyValueParser;
-use tracing::warn;
 
 use crate::common::PrintOutputsFormat;
 
@@ -52,12 +51,10 @@ fn parse_build_report_option(s: &str) -> buck2_error::Result<BuildReportOption> 
         exclude_action_error_diagnostics = true;
     } else if s.to_lowercase() == "truncate-error-content" {
         truncate_error_content = true;
-    } else {
-        warn!(
-            "Incorrect syntax for build report option. Got: `{}` but expected one of `fill-out-failures, package-project-relative-paths, include-artifact-hash-information, exclude-action-error-diagnostics, truncate-error-content`",
-            s.to_owned()
-        )
     }
+    // Unknown options are ignored: tooling passes options without being able to tell which buck2
+    // it is talking to, and checking the version first is inconvenient.
+    // FIXME(JakobDegen): Find a way to support that without silently accepting typos.
     Ok(BuildReportOption {
         fill_out_failures,
         include_package_project_relative_paths,
@@ -108,8 +105,10 @@ pub struct CommonBuildOptions {
 
     /// Stream intermediary build reports to a file in json lines format.
     ///
-    /// Each output materialization will trigger a new build report which
-    /// will be written to the file as a single line json.
+    /// A line is written each time a requested output is materialized, and
+    /// each time a requested target or one of its configurations finishes
+    /// building. Each line carries one target. Entries that have not finished
+    /// building read `IN_PROGRESS` instead of `SUCCESS`.
     #[clap(long = "streaming-build-report", value_name = "PATH")]
     streaming_build_report: Option<String>,
 

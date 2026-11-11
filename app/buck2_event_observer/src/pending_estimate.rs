@@ -20,7 +20,7 @@ pub fn pending_estimate<T: SpanTrackable>(roots: &Roots<T>, dice: &DiceState) ->
         let from_dice = dice
             .key_states()
             .get(*k)
-            .map_or(0, |v| v.started - v.finished);
+            .map_or(0, |v| v.started.saturating_sub(v.finished));
 
         let from_roots = roots.dice_counts().get(k).copied().unwrap_or(0);
 
@@ -60,6 +60,7 @@ mod tests {
 
     use crate::dice_state::DiceState;
     use crate::pending_estimate::estimate_completion_percentage;
+    use crate::pending_estimate::pending_estimate;
     use crate::span_tracker::BuckEventSpanTracker;
 
     fn setup_roots(tracker: &mut BuckEventSpanTracker) {
@@ -166,6 +167,17 @@ mod tests {
         setup_dice_state(&mut dice, 10, 0);
         assert_eq!(estimate_completion_percentage(tracker.roots(), &dice), 0);
         Ok(())
+    }
+
+    /// A snapshot with more finished than started keys counts as nothing pending, as the
+    /// percentage estimate next to it already assumes.
+    #[test]
+    fn test_pending_estimate_invalid_dice_state() {
+        let mut dice = DiceState::new();
+        let tracker = BuckEventSpanTracker::new();
+
+        setup_dice_state(&mut dice, 10, 0);
+        assert_eq!(0, pending_estimate(tracker.roots(), &dice));
     }
 
     #[test]

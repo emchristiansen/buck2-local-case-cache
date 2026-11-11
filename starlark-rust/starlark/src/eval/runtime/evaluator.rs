@@ -786,7 +786,10 @@ impl<'v, 'a, 'e: 'a> Evaluator<'v, 'a, 'e> {
         self.time_flame_profile
             .record_call_enter(const_frozen_string!("trace/walk").at().to_value());
         self.module_env.trace(tracer);
-        self.current_frame.trace(tracer);
+        // Between evaluations no frame is active, so there is nothing to trace.
+        if self.current_frame.is_inititalized() {
+            self.current_frame.trace(tracer);
+        }
         for frame in &mut self.frame_stack {
             if frame.is_inititalized() {
                 frame.trace(tracer);
@@ -1313,5 +1316,56 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    /// The body of `test_garbage_collect_between_evaluations`, run in a child process because
+    /// the failure under test aborts the process.
+    fn gc_between_evaluations() {
+        let globals = Globals::standard();
+        Module::with_temp_heap(|module| {
+            let ast = AstModule::parse("test.bzl", "x = [1, 2, 3]".to_owned(), &Dialect::Standard)
+                .unwrap();
+            Evaluator::new(&module).eval_module(ast, &globals).unwrap();
+
+            let mut eval = Evaluator::new(&module);
+            unsafe { eval.garbage_collect() };
+            drop(eval);
+            assert_eq!(module.get("x").unwrap().to_repr(), "[1, 2, 3]");
+            eprintln!("STARLARK_GC_CHILD_COMPLETED");
+        });
+    }
+
+    /// Re-runs this test binary on `test_garbage_collect_between_evaluations` alone, with the
+    /// marker that makes it run `gc_between_evaluations` in place of spawning again.
+    fn run_gc_child() -> (bool, String) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "eval::runtime::evaluator::tests::test_garbage_collect_between_evaluations",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("STARLARK_GC_CHILD", "1")
+            .output()
+            .unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), output)
+    }
+
+    /// `garbage_collect` between two evaluations, when no frame is active, completes and keeps
+    /// the module's values.
+    #[test]
+    fn test_garbage_collect_between_evaluations() {
+        if std::env::var_os("STARLARK_GC_CHILD").is_some() {
+            gc_between_evaluations();
+            return;
+        }
+        let (success, output) = run_gc_child();
+        assert!(success, "{output}");
+        assert!(output.contains("STARLARK_GC_CHILD_COMPLETED"), "{output}");
     }
 }

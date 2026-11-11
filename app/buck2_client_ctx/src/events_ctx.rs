@@ -16,6 +16,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use buck2_agent_interactive::Decision;
 use buck2_cli_proto::CommandResult;
 use buck2_cli_proto::command_result;
 use buck2_error::BuckErrorContext;
@@ -32,7 +33,6 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::FuturesUnordered;
-use gazebo::prelude::VecExt;
 use tokio::runtime::Runtime;
 
 use crate::client_cpu_tracker::ClientCpuTracker;
@@ -427,10 +427,9 @@ impl<'a> DaemonEventsCtx<'a> {
 // impl<'a> Drop for DaemonEventsCtx<'a> {
 //     fn drop(&mut self) {
 //         if self.tailers.stream.is_some() {
-//             let _unused = soft_error!(
+//             soft_error!(
 //                 "daemon_tailers_not_flushed",
 //                 internal_error!("DaemonEventsCtx should have been flushed before being dropped"),
-//                 quiet: true,
 //             );
 //         }
 //     }
@@ -535,6 +534,32 @@ impl EventsCtx {
         .await
     }
 
+    /// Records advice through the invocation's subscribers and rejects blocked operations.
+    pub async fn handle_agent_advice(
+        &mut self,
+        trace_id: TraceId,
+        decision: Decision,
+    ) -> buck2_error::Result<()> {
+        if let Some(tag) = decision.tag() {
+            self.instant_event(
+                trace_id,
+                buck2_data::TagEvent {
+                    tags: vec![tag.to_owned()],
+                },
+            )
+            .await?;
+        }
+        match decision {
+            Decision::Inactive | Decision::Acknowledged(_) => Ok(()),
+            Decision::Block(advice) => Err(buck2_error::buck2_error!(
+                ErrorTag::AgentAdviceBlocked,
+                "Buck advice [{}]\n{}",
+                advice.id(),
+                advice.message(),
+            )),
+        }
+    }
+
     /// Records and displays a client event through the same subscribers as daemon events.
     pub async fn instant_event(
         &mut self,
@@ -553,32 +578,35 @@ impl EventsCtx {
         events: Vec<BuckEvent>,
         shutdown: &mut Option<buck2_data::DaemonShutdown>,
     ) -> buck2_error::Result<()> {
-        let events = events.into_map(|mut event| {
-            let timestamp = event.timestamp();
-            if let buck2_data::buck_event::Data::Instant(instant_event) = event.data_mut() {
-                match &mut instant_event.data {
-                    Some(buck2_data::instant_event::Data::Snapshot(snapshot)) => {
-                        let now = SystemTime::now();
-                        // `None` on overflow.
-                        let this_event_client_delay_ms = match now.duration_since(timestamp) {
-                            Ok(duration) => i64::try_from(duration.as_millis()).ok(),
-                            Err(e) => i64::try_from(e.duration().as_millis())
-                                .ok()
-                                .and_then(|x| x.checked_neg()),
-                        };
-                        snapshot.this_event_client_delay_ms = this_event_client_delay_ms;
+        let events = events
+            .into_iter()
+            .map(|mut event| {
+                let timestamp = event.timestamp();
+                if let buck2_data::buck_event::Data::Instant(instant_event) = event.data_mut() {
+                    match &mut instant_event.data {
+                        Some(buck2_data::instant_event::Data::Snapshot(snapshot)) => {
+                            let now = SystemTime::now();
+                            // `None` on overflow.
+                            let this_event_client_delay_ms = match now.duration_since(timestamp) {
+                                Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+                                Err(e) => i64::try_from(e.duration().as_millis())
+                                    .ok()
+                                    .and_then(|x| x.checked_neg()),
+                            };
+                            snapshot.this_event_client_delay_ms = this_event_client_delay_ms;
 
-                        snapshot.client_cpu_percents =
-                            self.client_cpu_tracker.tick_cpu_time_percents();
-                    }
-                    Some(buck2_data::instant_event::Data::DaemonShutdown(msg)) => {
-                        *shutdown = Some(msg.clone());
-                    }
-                    _ => {}
-                };
-            }
-            Arc::new(event)
-        });
+                            snapshot.client_cpu_percents =
+                                self.client_cpu_tracker.tick_cpu_time_percents();
+                        }
+                        Some(buck2_data::instant_event::Data::DaemonShutdown(msg)) => {
+                            *shutdown = Some(msg.clone());
+                        }
+                        _ => {}
+                    };
+                }
+                Arc::new(event)
+            })
+            .collect::<Vec<_>>();
         self.try_for_each_subscriber(|subscriber| subscriber.handle_events(&events))
             .await
     }
@@ -699,11 +727,7 @@ impl EventsCtx {
             let name = subscriber.name().to_owned();
             let res = subscriber.finalize().await;
             let elapsed = Instant::now() - start;
-            if elapsed > Duration::from_millis(1000) {
-                tracing::warn!("Finalizing \'{}\' took {:?}", name, elapsed);
-            } else {
-                tracing::info!("Finalizing \'{}\' took {:?}", name, elapsed);
-            };
+            tracing::info!("Finalizing \'{}\' took {:?}", name, elapsed);
 
             if let Err(e) = res {
                 errors.push(format!(

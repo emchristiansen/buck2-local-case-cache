@@ -32,8 +32,8 @@ use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::ValueOf;
 use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueTyped;
 use starlark::values::list::ListRef;
 use starlark::values::starlark_value;
 use starlark::values::type_repr::StarlarkTypeRepr;
@@ -45,6 +45,7 @@ use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::CommandLineBuilder;
+use crate::interpreter::rule_defs::cmd_args::InputProperties;
 use crate::interpreter::rule_defs::cmd_args::WriteToFileMacroVisitor;
 use crate::interpreter::rule_defs::cmd_args::command_line_arg_like_type::command_line_arg_like_impl;
 use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
@@ -233,7 +234,15 @@ impl<'v> CommandLineArgLike<'v> for TransitiveSetArgsProjection<'v> {
         let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
             .internal_error("Invalid transitive_set")?;
 
-        for node in set.iter(self.ordering).values() {
+        if fmt.is_hashing() {
+            if let Some(hash) = set.projection_hash(self.projection) {
+                return fmt.push_transitive_set_projection(hash, self.projection, self.ordering);
+            }
+        }
+
+        set.prefetch_children()?;
+        for node in set.iter(self.ordering)?.values() {
+            let node = node?;
             let projection = node
                 .projections
                 .get(self.projection)
@@ -262,6 +271,7 @@ impl<'v> CommandLineArgLike<'v> for TransitiveSetArgsProjection<'v> {
                     .get(self.projection)?,
                 set.projection_is_eligible_for_dedupe.get(self.projection)?,
             ))),
+            InputProperties::default(),
             vec![],
         );
 
@@ -289,28 +299,28 @@ impl<'v> CommandLineArgLike<'v> for TransitiveSetArgsProjection<'v> {
 #[starlark_module]
 fn transitive_set_args_projection_methods(builder: &mut MethodsBuilder) {
     fn traverse<'v>(
-        this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetArgsProjection<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<Value<'v>> {
         Ok(heap.alloc(TransitiveSetProjectionTraversal {
-            transitive_set: this.typed.transitive_set,
-            projection: this.typed.projection,
-            ordering: this.typed.ordering,
+            transitive_set: this.transitive_set,
+            projection: this.projection,
+            ordering: this.ordering,
         }))
     }
 
     #[starlark(attribute)]
     fn projection_name<'v>(
-        this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetArgsProjection<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<StringValue<'v>> {
-        Ok(heap.alloc_str(this.typed.projection_name()?))
+        Ok(heap.alloc_str(this.projection_name()?))
     }
 
     #[starlark(attribute)]
     fn transitive_set<'v>(
-        this: ValueOf<'v, &'v TransitiveSetArgsProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetArgsProjection<'v>>,
     ) -> starlark::Result<ValueOfUnchecked<'v, TransitiveSet<'static>>> {
-        Ok(this.typed.transitive_set)
+        Ok(this.transitive_set)
     }
 }

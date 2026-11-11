@@ -51,13 +51,14 @@ use buck2_interpreter::prelude_path::PreludePath;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
 use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
 use buck2_interpreter::starlark_profiler::data::StarlarkProfileDataAndStats;
+use buck2_node::modifiers::ModifierLabelParser;
 use buck2_node::nodes::eval_result::EvaluationResult;
 use buck2_node::nodes::eval_result::EvaluationResultWithStats;
 use buck2_node::super_package::SuperPackage;
+use buck2_settings::PackageVisibilityDefaultIntersection;
 use buck2_util::per_thread_instruction_counter::PerThreadInstructionCounter;
 use dice::CancellationContext;
 use dupe::Dupe;
-use gazebo::prelude::*;
 use pagable::Pagable;
 use starlark::codemap::FileSpan;
 use starlark::environment::FrozenModule;
@@ -108,7 +109,10 @@ impl ParseData {
         implicit_imports: Vec<OwnedStarlarkModulePath>,
         resolver: &dyn LoadResolver,
     ) -> buck2_error::Result<Self> {
-        let mut loads = implicit_imports.into_map(|x| (None, x));
+        let mut loads = implicit_imports
+            .into_iter()
+            .map(|x| (None, x))
+            .collect::<Vec<_>>();
         for x in ast.loads() {
             let path = resolver
                 .resolve_load(x.module_id, Some(&x.span))
@@ -217,11 +221,7 @@ impl LoadResolver for InterpreterLoadResolver {
 
         // If you load the same .bzl file twice via different aliases (e.g. fbcode//buck2/prelude/foo.bzl and prelude.bzl)
         // then anything doing pointer equality (t-sets, provider identities) will go wrong.
-        let project_path = self
-            .config
-            .global_state
-            .cell_resolver
-            .resolve_path(path.as_ref())?;
+        let project_path = self.config.global_state.cell_resolver.resolve_path(path)?;
         let reformed_path = self
             .config
             .global_state
@@ -360,7 +360,6 @@ impl InterpreterForDir {
         build_file: &BuildFilePath,
         package_listing: &PackageListing,
         super_package: SuperPackage,
-        package_boundary_exception: bool,
         loaded_modules: &LoadedModules,
     ) -> buck2_error::Result<(BuckStarlarkModule<'v>, ModuleInternals)> {
         let internals = self.global_state.configuror.new_extra_context(
@@ -368,7 +367,6 @@ impl InterpreterForDir {
             build_file.clone(),
             package_listing.dupe(),
             super_package,
-            package_boundary_exception,
             loaded_modules,
             self.package_import(build_file),
             self.current_dir_with_allowed_relative_dirs
@@ -450,7 +448,7 @@ impl InterpreterForDir {
         let project_relative_path = self
             .global_state
             .cell_resolver
-            .resolve_path(import.path().as_ref().as_ref())?;
+            .resolve_path(*import.path())?;
 
         let disable_starlark_types = self.global_state.disable_starlark_types;
         let ast = match AstModule::parse(
@@ -622,6 +620,7 @@ impl InterpreterForDir {
         loaded_modules: LoadedModules,
         eval_provider: StarlarkEvaluatorProvider,
         cancellation: &CancellationContext,
+        package_visibility_default_intersection: PackageVisibilityDefaultIntersection,
     ) -> buck2_error::Result<SuperPackage> {
         BuckStarlarkModule::with_profiling(|env| {
             let env = self.create_env(
@@ -637,6 +636,7 @@ impl InterpreterForDir {
                 test_config_unification_rollout: RefCell::new(None),
                 enforces_visibility_intersection: RefCell::new(false),
                 enforces_within_view_intersection: RefCell::new(false),
+                package_visibility_default_intersection,
             });
 
             let (finished_eval, eval_result) = self.eval(
@@ -668,7 +668,11 @@ impl InterpreterForDir {
 
             let package_file_eval_ctx = per_file_context.into_package_file()?;
 
-            Ok((token, package_file_eval_ctx.build_super_package(extra)?))
+            let modifier_labels = ModifierLabelParser::new(&self.global_state.cell_resolver);
+            Ok((
+                token,
+                package_file_eval_ctx.build_super_package(extra, &modifier_labels)?,
+            ))
         })
     }
 
@@ -681,7 +685,6 @@ impl InterpreterForDir {
         buckconfigs: &mut dyn BuckConfigsViewForStarlark,
         listing: PackageListing,
         super_package: SuperPackage,
-        package_boundary_exception: bool,
         ast: AstModule,
         loaded_modules: LoadedModules,
         eval_provider: StarlarkEvaluatorProvider,
@@ -692,14 +695,8 @@ impl InterpreterForDir {
         EvaluationResultWithStats,
     )> {
         BuckStarlarkModule::with_profiling(|env| {
-            let (env, internals) = self.create_build_env(
-                env,
-                build_file,
-                &listing,
-                super_package,
-                package_boundary_exception,
-                &loaded_modules,
-            )?;
+            let (env, internals) =
+                self.create_build_env(env, build_file, &listing, super_package, &loaded_modules)?;
             let buckconfig_key = BuckconfigKeyRef {
                 section: "buck2",
                 property: "check_starlark_peak_memory",

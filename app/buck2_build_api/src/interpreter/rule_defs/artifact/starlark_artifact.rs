@@ -11,10 +11,10 @@
 use std::fmt::Display;
 
 use allocative::Allocative;
+use buck2_artifact::artifact::artifact_path::ArtifactPath;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
-use buck2_execute::path::artifact_path::ArtifactPath;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use dupe::Dupe;
@@ -47,6 +47,7 @@ use crate::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
 use crate::interpreter::rule_defs::cmd_args::CommandLineBuilder;
+use crate::interpreter::rule_defs::cmd_args::InputProperties;
 use crate::interpreter::rule_defs::cmd_args::WriteToFileMacroVisitor;
 use crate::interpreter::rule_defs::cmd_args::command_line_arg_like_type::command_line_arg_like_impl;
 
@@ -259,10 +260,16 @@ impl<'v> CommandLineArgLike<'v> for StarlarkArtifact {
         &self,
         visitor: &mut dyn CommandLineArtifactVisitor<'v>,
     ) -> buck2_error::Result<()> {
-        visitor.visit_input(ArtifactGroup::Artifact(self.artifact.dupe()), vec![]);
-        self.associated_artifacts
-            .iter()
-            .for_each(|ag| visitor.visit_input(ag.dupe(), vec![]));
+        visitor.visit_input(
+            ArtifactGroup::Artifact(self.artifact.dupe()),
+            InputProperties::default(),
+            vec![],
+        );
+        if !visitor.inputs_for_path_resolution() {
+            self.associated_artifacts
+                .iter()
+                .for_each(|ag| visitor.visit_input(ag.dupe(), InputProperties::default(), vec![]));
+        }
         Ok(())
     }
 

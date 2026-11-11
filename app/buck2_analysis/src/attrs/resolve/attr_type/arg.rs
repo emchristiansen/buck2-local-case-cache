@@ -24,7 +24,6 @@ use buck2_node::attrs::attr_type::arg::ConfiguredMacro;
 use buck2_node::attrs::attr_type::arg::ConfiguredStringWithMacros;
 use buck2_node::attrs::attr_type::arg::ConfiguredStringWithMacrosPart;
 use buck2_node::attrs::attr_type::arg::StringWithMacros;
-use buck2_node::attrs::attr_type::arg::UnrecognizedMacro;
 use dupe::Dupe;
 use either::Either;
 use starlark::values::FrozenValueTyped;
@@ -56,8 +55,6 @@ enum ResolveMacroError {
     UnkeyedPlaceholderUnresolved(String),
     #[error("Expected a RunInfo provider from target `{0}`.")]
     ExpectedRunInfo(String),
-    #[error("Can't expand unrecognized macros (`{0}`).")]
-    UnrecognizedMacroUnimplemented(String),
 }
 
 pub trait ConfiguredStringWithMacrosExt {
@@ -99,7 +96,7 @@ impl ConfiguredStringWithMacrosExt for ConfiguredStringWithMacros {
             }
         };
 
-        let configured_macros = if self.anon_target_compatible {
+        let configured_macros = if self.anon_target_compatible() {
             Some(self)
         } else {
             None
@@ -131,7 +128,7 @@ fn resolve_configured_macro<'v>(
         ConfiguredMacro::Exe { label, .. } => {
             // Don't need to consider exec_dep as it already was applied when configuring the label.
             let providers = ctx.get_dep(label)?;
-            let run_info = match providers.get_provider_raw(RunInfoCallable::provider_id()) {
+            let run_info = match providers.get_provider_raw(RunInfoCallable::provider_id())? {
                 Some(value) => value,
                 None => {
                     return Err(ResolveMacroError::ExpectedRunInfo(label.to_string()).into());
@@ -140,6 +137,7 @@ fn resolve_configured_macro<'v>(
             // A RunInfo is an arg-like value.
             Ok(ResolvedMacro::ArgLike(CommandLineArg::new(run_info)?))
         }
+        ConfiguredMacro::InGroup(box (inner, _)) => resolve_configured_macro(inner, ctx, pkg),
         ConfiguredMacro::Source(p) => {
             let buck_path = SourcePath::new(pkg.dupe(), p.path().dupe());
             Ok(ResolvedMacro::Source(SourceArtifact::new(buck_path).into()))
@@ -153,7 +151,7 @@ fn resolve_configured_macro<'v>(
         ConfiguredMacro::UserKeyedPlaceholder(box (name, label, arg)) => {
             let providers = ctx.get_dep(label)?;
             let placeholder_info = providers
-                .builtin_provider::<TemplatePlaceholderInfo>()
+                .builtin_provider::<TemplatePlaceholderInfo>()?
                 .ok_or_else(|| {
                     ResolveMacroError::KeyedPlaceholderInfoMissing(
                         (**name).to_owned(),
@@ -193,11 +191,5 @@ fn resolve_configured_macro<'v>(
             Ok(ResolvedMacro::ArgLike(value))
         }
         ConfiguredMacro::Query(query) => Ok(ResolvedMacro::Query(query.resolve(ctx)?)),
-        ConfiguredMacro::UnrecognizedMacro(box UnrecognizedMacro {
-            macro_type,
-            args: _,
-        }) => {
-            Err(ResolveMacroError::UnrecognizedMacroUnimplemented((**macro_type).to_owned()).into())
-        }
     }
 }

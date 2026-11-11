@@ -13,11 +13,12 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use allocative::Allocative;
-use buck2_build_api::interpreter::rule_defs::provider::builtin::platform_info::PlatformInfo;
+use buck2_configuration_providers::platform_info::PlatformInfo;
 use buck2_core::bzl::ImportPath;
 use buck2_core::configuration::transition::id::TransitionId;
 use buck2_core::provider::label::ProvidersLabel;
 use buck2_error::BuckErrorContext;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::build_context::starlark_path_from_build_context;
 use buck2_interpreter::coerce::COERCE_PROVIDERS_LABEL_FOR_BZL;
@@ -27,11 +28,9 @@ use buck2_interpreter::types::transition::TransitionValue;
 use derive_more::Display;
 use dupe::Dupe;
 use either::Either;
-use gazebo::prelude::*;
 use pagable::PagableDeserialize;
 use pagable::PagableSerialize;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::pagable::StarlarkDeserialize;
@@ -92,7 +91,7 @@ pub(crate) struct Transition<'v> {
     path: ImportPath,
     implementation: Value<'v>,
     /// Providers needed for the transition function. A map by target label.
-    refs: SmallMap<StringValue<'v>, ProvidersLabelTrace>,
+    refs: BuckMutInsertionMap<StringValue<'v>, ProvidersLabelTrace>,
     /// Transition function accesses theses attributes.
     attrs: Option<Vec<StringValue<'v>>>,
     /// Is this split transition? I. e. transition to multiple configurations.
@@ -113,13 +112,13 @@ pub(crate) struct FrozenTransition<'v> {
     id: Arc<TransitionId>,
     pub(crate) implementation: Value<'v>,
     // Mixed: keys are starlark, `ProvidersLabel` is pagable-only (`buck2_core`
-    // cannot depend on `starlark`) — so the generic `SmallMap<K, V>:
+    // cannot depend on `starlark`) — so the generic `BuckMutInsertionMap<K, V>:
     // StarlarkSerialize` blanket doesn't apply. Bridge here.
     #[starlark_pagable(
         serialize_with = "serialize_refs",
         deserialize_with = "deserialize_refs"
     )]
-    pub(crate) refs: SmallMap<StringValue<'v>, ProvidersLabel>,
+    pub(crate) refs: BuckMutInsertionMap<StringValue<'v>, ProvidersLabel>,
     pub(crate) attrs_names: Option<Vec<StringValue<'v>>>,
     #[starlark_pagable(pagable)]
     pub(crate) split: bool,
@@ -129,7 +128,7 @@ pub(crate) struct FrozenTransition<'v> {
 pub(crate) type OwnedTransition = OwnedFrozen<ValueTyped<'static, FrozenTransition<'static>>>;
 
 fn serialize_refs<'v>(
-    field: &SmallMap<StringValue<'v>, ProvidersLabel>,
+    field: &BuckMutInsertionMap<StringValue<'v>, ProvidersLabel>,
     ctx: &mut dyn StarlarkSerializeContext,
 ) -> starlark::Result<()> {
     PagableSerialize::pagable_serialize(&field.len(), ctx.pagable())?;
@@ -142,9 +141,9 @@ fn serialize_refs<'v>(
 
 fn deserialize_refs<'v>(
     ctx: &mut dyn StarlarkDeserializeContext<'_, 'v>,
-) -> starlark::Result<SmallMap<StringValue<'v>, ProvidersLabel>> {
+) -> starlark::Result<BuckMutInsertionMap<StringValue<'v>, ProvidersLabel>> {
     let len = usize::pagable_deserialize(ctx.pagable())?;
-    let mut map = SmallMap::with_capacity(len);
+    let mut map = BuckMutInsertionMap::with_capacity(len);
     for _ in 0..len {
         let k = StringValue::starlark_deserialize(ctx)?;
         let v = <ProvidersLabel as PagableDeserialize>::pagable_deserialize(ctx.pagable())?;
@@ -201,13 +200,17 @@ impl<'v> Freeze<'v> for Transition<'v> {
         ))?;
         // N.B. collect::<Result<_>> sets the lower bound to zero,
         // which can cause over-allocations in frozen containers.
-        let mut refs = SmallMap::with_capacity(self.refs.len());
+        let mut refs = BuckMutInsertionMap::with_capacity(self.refs.len());
         for (k, v) in self.refs {
             refs.insert(k.freeze(freezer)?, v.0);
         }
         let attrs = self
             .attrs
-            .map(|a| a.into_try_map(|a| a.freeze(freezer)))
+            .map(|a| {
+                a.into_iter()
+                    .map(|a| a.freeze(freezer))
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .transpose()?;
         let split = self.split;
         Ok(FrozenTransition {
@@ -342,10 +345,10 @@ fn register_transition_function(builder: &mut GlobalsBuilder) {
             })
             .collect::<buck2_error::Result<_>>()?;
 
-        let path: ImportPath = (*starlark_path_from_build_context(eval)?
+        let path: ImportPath = starlark_path_from_build_context(eval)?
             .unpack_load_file()
-            .ok_or(buck2_error::Error::from(TransitionError::OnlyBzl))?)
-        .clone();
+            .ok_or(buck2_error::Error::from(TransitionError::OnlyBzl))?
+            .clone();
 
         if let Some(attrs) = &attrs {
             let attrs_set: BuckMutSet<StringValue> = attrs.items.iter().copied().collect();

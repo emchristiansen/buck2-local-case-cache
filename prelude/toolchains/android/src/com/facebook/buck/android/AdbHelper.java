@@ -14,6 +14,7 @@ import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator
 
 import com.facebook.buck.android.apex.ApexManifestProto.ApexManifest;
 import com.facebook.buck.android.device.TargetDeviceOptions;
+import com.facebook.buck.android.exopackage.AdbCommandFailedException;
 import com.facebook.buck.android.exopackage.AdbUtils;
 import com.facebook.buck.android.exopackage.AndroidDevice;
 import com.facebook.buck.android.exopackage.AndroidDeviceInfo;
@@ -316,7 +317,8 @@ public class AdbHelper implements AndroidDevicesHelper {
       boolean installViaSd,
       boolean quiet,
       String fullyQualifiedName,
-      String packageName)
+      String packageName,
+      boolean restartApp)
       throws InterruptedException {
     Optional<String> buck2BuildUuid =
         Optional.ofNullable(EnvVariablesProvider.getSystemEnv().get("BUCK2_UUID"));
@@ -326,7 +328,13 @@ public class AdbHelper implements AndroidDevicesHelper {
     if (optionalIsolatedExopackageInfo.isPresent()) {
       IsolatedExopackageInfo isolatedExopackageInfo = optionalIsolatedExopackageInfo.get();
       installApkExopackageWithRetries(
-          rootPath, isolatedExopackageInfo, isolatedApkInfo, packageName, quiet, buck2BuildUuid);
+          rootPath,
+          isolatedExopackageInfo,
+          isolatedApkInfo,
+          packageName,
+          quiet,
+          buck2BuildUuid,
+          restartApp);
     } else {
       installApkDirectly(
           installViaSd,
@@ -335,7 +343,8 @@ public class AdbHelper implements AndroidDevicesHelper {
           fullyQualifiedName,
           packageName,
           setDebugAppMode,
-          buck2BuildUuid);
+          buck2BuildUuid,
+          restartApp);
     }
     success.set(true);
   }
@@ -359,7 +368,7 @@ public class AdbHelper implements AndroidDevicesHelper {
             String buildFingerprint = device.getProperty("ro.build.fingerprint");
             String dpi = getDeviceDpi(device);
             String sdk = device.getProperty("ro.build.version.sdk");
-            List<String> diskSpace = device.getDiskSpace(/* humanReadable= */ true);
+            List<String> diskSpace = device.getDiskSpace();
             LOG.info(
                 "Device disk size: %s, used: %s, available: %s",
                 diskSpace.get(0), diskSpace.get(1), diskSpace.get(2));
@@ -825,13 +834,20 @@ public class AdbHelper implements AndroidDevicesHelper {
       IsolatedApkInfo isolatedApkInfo,
       String packageName,
       boolean quiet,
-      Optional<String> buck2BuildUuid)
+      Optional<String> buck2BuildUuid,
+      boolean restartApp)
       throws InterruptedException {
     int attempt = 1;
     while (true) {
       try {
         installApkExopackage(
-            rootPath, isolatedExopackageInfo, isolatedApkInfo, packageName, quiet, buck2BuildUuid);
+            rootPath,
+            isolatedExopackageInfo,
+            isolatedApkInfo,
+            packageName,
+            quiet,
+            buck2BuildUuid,
+            restartApp);
         LOG.info("Installing the APK using exopackage succeeded on attempt %d", attempt);
         return;
       } catch (RuntimeException e) {
@@ -883,7 +899,8 @@ public class AdbHelper implements AndroidDevicesHelper {
       IsolatedApkInfo isolatedApkInfo,
       String packageName,
       boolean quiet,
-      Optional<String> buck2BuildUuid)
+      Optional<String> buck2BuildUuid,
+      boolean restartApp)
       throws InterruptedException {
     adbCall(
         "install exopackage apk",
@@ -896,7 +913,7 @@ public class AdbHelper implements AndroidDevicesHelper {
                   device,
                   buck2BuildUuid,
                   timings)
-              .doInstall(isolatedApkInfo, setDebugAppMode);
+              .doInstall(isolatedApkInfo, setDebugAppMode, restartApp);
           return true;
         },
         quiet);
@@ -909,7 +926,8 @@ public class AdbHelper implements AndroidDevicesHelper {
       String buildTarget,
       String packageName,
       SetDebugAppMode setDebugAppMode,
-      Optional<String> buck2BuildUuid)
+      Optional<String> buck2BuildUuid,
+      boolean restartApp)
       throws InterruptedException {
     File apk = isolatedApkInfo.getApkPath().toFile();
     if (setDebugAppMode == SetDebugAppMode.SET) {
@@ -929,6 +947,12 @@ public class AdbHelper implements AndroidDevicesHelper {
               restart = isApexFileSupportsRebootlessUpdate(apk);
             }
             return device.installApexOnDevice(apk, quiet, restart, options.getWaitForDeviceReady());
+          } else if (!options.isStagedInstallModeEnabled()
+              && !shouldAppBeInstalled(device, packageName, apk, androidPrinter)) {
+            if (restartApp) {
+              device.stopPackage(packageName);
+            }
+            return true;
           } else {
             return device.installApkOnDevice(
                 apk, installViaSd, quiet, options.isStagedInstallModeEnabled(), packageName);
@@ -943,6 +967,30 @@ public class AdbHelper implements AndroidDevicesHelper {
               device.installBuildUuidFile(
                   BUILD_METADATA_INSTALL_ROOT, packageName, buck2BuildUuid.get()),
           true);
+    }
+  }
+
+  /** Whether {@code device} lacks {@code apk} as the installed apk of {@code packageName}. */
+  public static boolean shouldAppBeInstalled(
+      AndroidDevice device, String packageName, File apk, AndroidInstallPrinter androidPrinter)
+      throws Exception {
+    AndroidDevice.InstalledApk installed;
+    try {
+      installed = device.compareInstalledApk(packageName, apk, /* exact= */ false);
+    } catch (AdbCommandFailedException e) {
+      LOG.info("Could not read the installed APK.  Must re-install: %s", e.getMessage());
+      return true;
+    }
+    switch (installed) {
+      case ABSENT:
+        androidPrinter.printMessage("App not installed.  Installing now.");
+        return true;
+      case DIFFERENT:
+        LOG.info("Installed APK differs.  Must re-install.");
+        return true;
+      default:
+        LOG.info("Installed APK matches.  No need to install.");
+        return false;
     }
   }
 

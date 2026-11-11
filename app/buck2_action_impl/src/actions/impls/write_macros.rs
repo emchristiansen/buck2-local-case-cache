@@ -18,7 +18,6 @@ use buck2_build_api::actions::Action;
 use buck2_build_api::actions::ActionExecutionCtx;
 use buck2_build_api::actions::UnregisteredAction;
 use buck2_build_api::actions::errors::execute_error::ExecuteError;
-use buck2_build_api::actions::execute::action_executor::ActionExecutionKind;
 use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::artifact_groups::ArtifactGroup;
@@ -37,14 +36,17 @@ use buck2_error::BuckErrorOptionContext;
 use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::WriteRequest;
-use buck2_hash::BuckIndexSet;
+use buck2_hash::BuckMutInsertionSet;
+use buck2_hash::BuckMutMap;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use starlark::values::OwnedFrozen;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 
+use crate::actions::impls::declare_writes::declare_writes;
 use crate::actions::impls::run::DepFilesPlaceholderArtifactPathMapper;
 use crate::actions::impls::write::CommandLineContentBasedInputVisitor;
 
@@ -69,7 +71,7 @@ impl UnregisteredWriteMacrosToFileAction {
 impl UnregisteredAction for UnregisteredWriteMacrosToFileAction {
     fn register(
         self: Box<Self>,
-        outputs: BuckIndexSet<BuildArtifact>,
+        outputs: BuckMutInsertionSet<BuildArtifact>,
         starlark_data: Option<OwnedFrozen<Value<'static>>>,
         _error_handler: Option<OwnedFrozen<Value<'static>>>,
     ) -> buck2_error::Result<Box<dyn Action>> {
@@ -97,14 +99,14 @@ enum WriteMacrosActionValidationError {
 #[derive(Debug, Allocative, Pagable)]
 struct WriteMacrosToFileAction {
     contents: OwnedFrozen<Value<'static>>, // StarlarkCmdArgs
-    outputs: Box<[BuildArtifact]>,
+    outputs: MiniBoxSlice<BuildArtifact>,
     inner: UnregisteredWriteMacrosToFileAction,
 }
 
 impl WriteMacrosToFileAction {
     fn new(
         contents: OwnedFrozen<Value<'static>>,
-        outputs: BuckIndexSet<BuildArtifact>,
+        outputs: BuckMutInsertionSet<BuildArtifact>,
         inner: UnregisteredWriteMacrosToFileAction,
     ) -> buck2_error::Result<Self> {
         let is_command_line = contents.by_ref(|v| -> buck2_error::Result<bool> {
@@ -146,7 +148,7 @@ impl Action for WriteMacrosToFileAction {
             ValueAsCommandLineLike::unpack_value(*v)?
                 .unwrap()
                 .0
-                .visit_artifacts(&mut visitor)
+                .visit_write_to_file_macros(&mut visitor, &BuckMutMap::default())
         })?;
         Ok(Cow::Owned(
             visitor.content_based_inputs.into_iter().collect(),
@@ -177,9 +179,9 @@ impl Action for WriteMacrosToFileAction {
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         let mut execution_start = None;
 
-        let values = ctx
-            .materializer()
-            .declare_write(Box::new(|| {
+        let (values, execution_kind) = declare_writes(
+            ctx,
+            Box::new(|| {
                 execution_start = Some(Instant::now());
 
                 let fs = ctx.executor_fs();
@@ -232,8 +234,9 @@ impl Action for WriteMacrosToFileAction {
                         })
                     })
                     .collect::<buck2_error::Result<_>>()
-            }))
-            .await?;
+            }),
+        )
+        .await?;
 
         let wall_time = Instant::now()
             - execution_start.internal_error("Action did not set execution_start")?;
@@ -246,12 +249,28 @@ impl Action for WriteMacrosToFileAction {
             ActionOutputs::new(output_values),
             ActionExecutionMetadata {
                 dep_file_db_writes_queued: 0,
-                execution_kind: ActionExecutionKind::Simple,
+                execution_kind,
                 timing: ActionExecutionTimingData { wall_time },
                 input_files_bytes: None,
                 waiting_data,
             },
         ))
+    }
+}
+
+impl WriteToFileMacroVisitor for CommandLineContentBasedInputVisitor {
+    fn visit_write_to_file_macro(
+        &mut self,
+        resolved_macro: &ResolvedMacro,
+        _artifact_path_mapping: &dyn ArtifactPathMapper,
+    ) -> buck2_error::Result<()> {
+        resolved_macro.visit_artifacts(self)
+    }
+
+    fn set_current_relative_to_path(&mut self, _p: ProjectRelativePathBuf) {}
+
+    fn fs(&self) -> Option<&ExecutorFs<'_>> {
+        None
     }
 }
 

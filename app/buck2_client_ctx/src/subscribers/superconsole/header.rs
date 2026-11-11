@@ -704,6 +704,8 @@ mod tests {
             fallback_actions: 0,
             remote_dep_file_cached_actions: 0,
             local_test_result_cached_actions: 0,
+            remote_served_from_cache_actions: 0,
+            remote_deduplicated_actions: 0,
             excess_cache_misses: 0,
         }
     }
@@ -916,6 +918,8 @@ mod tests {
             fallback_actions: 0,
             remote_dep_file_cached_actions: 0,
             local_test_result_cached_actions: 0,
+            remote_served_from_cache_actions: 0,
+            remote_deduplicated_actions: 0,
             excess_cache_misses: 0,
         };
         let output = SimpleHeader::new_for_data(HeaderData {
@@ -948,6 +952,8 @@ mod tests {
             fallback_actions: 0,
             remote_dep_file_cached_actions: 0,
             local_test_result_cached_actions: 0,
+            remote_served_from_cache_actions: 0,
+            remote_deduplicated_actions: 0,
             excess_cache_misses: 0,
         };
         let output = SimpleHeader::new_for_data(HeaderData {
@@ -981,6 +987,8 @@ mod tests {
             fallback_actions: 0,
             remote_dep_file_cached_actions: 0,
             local_test_result_cached_actions: 0,
+            remote_served_from_cache_actions: 0,
+            remote_deduplicated_actions: 0,
             excess_cache_misses: 0,
         };
         let output = SimpleHeader::new_for_data(HeaderData {
@@ -1015,6 +1023,8 @@ mod tests {
             fallback_actions: 0,
             remote_dep_file_cached_actions: 0,
             local_test_result_cached_actions: 0,
+            remote_served_from_cache_actions: 0,
+            remote_deduplicated_actions: 0,
             excess_cache_misses: 0,
         };
         let output = SimpleHeader::new_for_data(HeaderData {

@@ -12,6 +12,7 @@ allocative.workspace = true
 async-trait.workspace = true
 buck2_build_api.workspace = true
 buck2_build_api_derive.workspace = true
+buck2_configuration_providers.workspace = true
 buck2_core.workspace = true
 buck2_error.workspace = true
 buck2_events.workspace = true
@@ -24,12 +25,10 @@ dice_futures.workspace = true
 dupe.workspace = true
 either.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 itertools.workspace = true
 pagable.workspace = true
 ref-cast.workspace = true
 starlark.workspace = true
-starlark_map.workspace = true
 
 [lints]
 workspace = true

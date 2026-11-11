@@ -64,6 +64,7 @@ load(
     "generate_xcode_data",
 )
 load("@prelude//linking:add_elf_sections.bzl", "PRE_ADD_ELF_SECTIONS_SUFFIX", "get_elf_sections")
+load("@prelude//linking:execution_preference.bzl", "LinkExecutionPreference")
 load(
     "@prelude//linking:generated_build_info.bzl",
     "compile_generated_build_info",
@@ -81,9 +82,9 @@ load(
     "LinkArgs",
     "LinkCommandDebugOutput",
     "LinkInfo",
-    "LinkOrdering",  # @unused Used as a type
+    "LinkOrdering",
     "LinkStrategy",
-    "LinkedObject",  # @unused Used as a type
+    "LinkedObject",
     "ObjectsLinkable",
     "get_lib_output_style",
     "make_link_command_debug_output",
@@ -94,25 +95,26 @@ load(
 )
 load(
     "@prelude//linking:linkable_graph.bzl",
-    "LinkableGraph",  # @unused Used as a type
+    "LinkableGraph",
     "create_linkable_graph",
     "get_linkable_graph_node_map_func",
     "reduce_linkable_graph",
 )
 load(
     "@prelude//linking:linkables.bzl",
-    "LinkableProviders",  # @unused Used as a type
+    "LinkableProviders",
     "linkables",
 )
 load(
     "@prelude//linking:shared_libraries.bzl",
-    "SharedLibrary",  # @unused Used as a type
-    "SharedLibraryInfo",  # @unused Used as a type
+    "SharedLibrary",
+    "SharedLibraryInfo",
     "merge_shared_libraries",
     "traverse_shared_library_info",
 )
 load("@prelude//linking:stamp_build_info.bzl", "PRE_STAMPED_SUFFIX", "cxx_stamp_build_info")
-load("@prelude//utils:arglike.bzl", "ArgLike")  # @unused Used as a type
+load("@prelude//linking:types.bzl", "LinkPreference")
+load("@prelude//utils:arglike.bzl", "ArgLike")
 load(
     "@prelude//utils:build_graph_pattern.bzl",
     "new_build_graph_info",
@@ -136,7 +138,7 @@ load(
 )
 load(
     ":comp_db.bzl",
-    "CxxCompilationDbInfo",  # @unused Used as a type
+    "CxxCompilationDbInfo",
     "create_compilation_database",
     "make_compilation_db_info",
 )
@@ -168,11 +170,7 @@ load(
     ":cxx_link_utility.bzl",
     "executable_shared_lib_arguments",
 )
-load(
-    ":cxx_types.bzl",
-    "CxxRuleConstructorParams",  # @unused Used as a type
-    "LinkPreference",
-)
+load(":cxx_types.bzl", "CxxRuleConstructorParams")
 load(":diagnostics.bzl", "check_sub_target")
 load(":gcno.bzl", "GcnoFilesInfo")
 load(":groups.bzl", "get_dedupped_roots_from_groups")
@@ -188,6 +186,7 @@ load(
     ":link_groups.bzl",
     "BuildLinkGroupsContext",
     "FinalLabelsToLinks",
+    "LINK_GROUPS_INFO_SUB_TARGET",
     "LINK_GROUP_MAPPINGS_FILENAME_SUFFIX",
     "LINK_GROUP_MAPPINGS_SUB_TARGET",
     "LINK_GROUP_MAP_DATABASE_SUB_TARGET",
@@ -408,7 +407,12 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
     sub_targets["full-compilation-database"] = [comp_db]
 
     # comp_db_compile_cmds can include header files being compiled as C++ which should not be exposed in the [compilation-database] subtarget
-    comp_db_info = make_compilation_db_info(compile_cmd_output.comp_db_compile_cmds, get_cxx_toolchain_info(ctx), get_cxx_platform_info(ctx))
+    comp_db_info = make_compilation_db_info(
+        src_compile_cmds = compile_cmd_output.comp_db_compile_cmds,
+        precompile_cmds = [],
+        toolchain_info = get_cxx_toolchain_info(ctx),
+        platform_info = get_cxx_platform_info(ctx),
+    )
 
     # Index Stores created by cxx compile
     index_stores = [out.index_store for out in cxx_outs if out.index_store]
@@ -479,7 +483,11 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
         # We cannot support deriving link execution preference off the included links, as we've already
         # lost the information on what is in the link.
         # TODO(T152860998): Derive link_execution_preference based upon the included links
-        link_execution_preference = get_resolved_cxx_binary_link_execution_preference(ctx, [], impl_params.force_full_hybrid_if_capable)
+        link_execution_preference = (
+            LinkExecutionPreference("remote")
+            if impl_params.force_remote_link_if_capable
+            else get_resolved_cxx_binary_link_execution_preference(ctx, [], impl_params.force_full_hybrid_if_capable)
+        )
 
         dep_links = apple_build_link_args_with_deduped_flags(
             ctx,
@@ -526,6 +534,7 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
                 other_roots = link_group_extra_link_roots,
                 prefer_stripped_objects = impl_params.prefer_stripped_objects,
                 anonymous = ctx.attrs.anonymous_link_groups,
+                debug_linkable_extras = impl_params.generate_sub_targets.xcode_data,
                 allow_cache_upload = impl_params.exe_allow_cache_upload,
                 public_nodes = public_link_group_nodes,
                 transformation_spec_context = transformation_spec_context,
@@ -596,7 +605,7 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
         )
 
         link_groups_binary_debug_info = LinkGroupsDebugLinkableItem(
-            ordered_linkables = create_debug_linkable_entries(labels_to_links.map, root = None),
+            ordered_linkables = create_debug_linkable_entries(labels_to_links.map, root = None, with_extras = impl_params.generate_sub_targets.xcode_data),
         )
         link_groups_debug_info = LinkGroupsDebugLinkInfo(
             binary = link_groups_binary_debug_info,
@@ -613,7 +622,7 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
                     ),
                 ),
             ]
-        sub_targets["link-groups-info"] = [
+        sub_targets[LINK_GROUPS_INFO_SUB_TARGET] = [
             DefaultInfo(
                 default_output = ctx.actions.write_json(
                     ctx.label.name + ".link-groups-info.json",
@@ -670,7 +679,11 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
         filtered_links = get_filtered_links(labels_to_links.map, set(public_nodes))
         filtered_targets = get_filtered_targets(labels_to_links.map)
 
-        link_execution_preference = get_resolved_cxx_binary_link_execution_preference(ctx, labels_to_links.map.keys(), impl_params.force_full_hybrid_if_capable)
+        link_execution_preference = (
+            LinkExecutionPreference("remote")
+            if impl_params.force_remote_link_if_capable
+            else get_resolved_cxx_binary_link_execution_preference(ctx, labels_to_links.map.keys(), impl_params.force_full_hybrid_if_capable)
+        )
 
         # Unfortunately, link_groups does not use MergedLinkInfo to represent the args
         # for the resolved nodes in the graph.
@@ -894,7 +907,11 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
 
     shared_libraries_sub_targets = {}
     for soname, shlib in str_soname_shlibs.items():
-        targets = {"dwp": [DefaultInfo(default_output = shlib.lib.dwp)]} if shlib.lib.dwp else {}
+        targets = {}
+        if shlib.lib.dwp:
+            targets["dwp"] = [DefaultInfo(default_output = shlib.lib.dwp)]
+        if shlib.lib.pdb:
+            targets[PDB_SUB_TARGET] = get_pdb_providers(pdb = shlib.lib.pdb, binary = shlib.lib.output)
 
         group = soname_to_group_mappings.get(soname)
         if group in readable_mappings:
@@ -928,6 +945,11 @@ def cxx_executable(ctx: AnalysisContext, impl_params: CxxRuleConstructorParams, 
                         "{}:{}[shared-libraries][{}][dwp]".format(ctx.label.path, ctx.label.name, soname)
                         for soname, shlib in str_soname_shlibs.items()
                         if shlib.lib.dwp
+                    ],
+                    "librariespdb": [
+                        "{}:{}[shared-libraries][{}][pdb]".format(ctx.label.path, ctx.label.name, soname)
+                        for soname, shlib in str_soname_shlibs.items()
+                        if shlib.lib.pdb
                     ],
                     "rpathtree": ["{}:{}[rpath-tree]".format(ctx.label.path, ctx.label.name)] if shared_libs_symlink_tree else [],
                 },

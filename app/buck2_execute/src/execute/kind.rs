@@ -14,14 +14,34 @@ use allocative::Allocative;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_data::RePlatform;
+use buck2_hash::BuckFixedSortedMap;
 use derive_more::Display;
-use gazebo::prelude::SliceExt;
+use dupe::Dupe;
 use remote_execution as RE;
-use sorted_vector_map::SortedVectorMap;
 
 use crate::execute::action_digest::ActionDigest;
 use crate::execute::dep_file_digest::DepFileDigest;
 use crate::re::convert::platform_to_proto;
+
+/// How the remote execution service produced the result of a command submitted for execution.
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Allocative)]
+pub enum RemoteExecutionOrigin {
+    Executed,
+    /// Served from the service's own action cache instead of running.
+    ServedFromCache,
+    /// Deduplicated against an identical execution already in flight instead of running.
+    Deduplicated,
+}
+
+impl From<RemoteExecutionOrigin> for buck2_data::RemoteCommandOrigin {
+    fn from(origin: RemoteExecutionOrigin) -> Self {
+        match origin {
+            RemoteExecutionOrigin::Executed => Self::Executed,
+            RemoteExecutionOrigin::ServedFromCache => Self::ReServedFromCache,
+            RemoteExecutionOrigin::Deduplicated => Self::ReDeduplicated,
+        }
+    }
+}
 
 #[derive(Debug, Display, Clone, Allocative)]
 pub enum CommandExecutionKind {
@@ -32,9 +52,9 @@ pub enum CommandExecutionKind {
         // it.
         digest: ActionDigest,
         command: Vec<String>,
-        env: SortedVectorMap<String, String>,
+        env: BuckFixedSortedMap<String, String>,
     },
-    /// This action was executed via a remote executor.
+    /// This action was submitted to a remote executor.
     #[display("remote")]
     Remote {
         details: RemoteCommandExecutionDetails,
@@ -48,6 +68,7 @@ pub enum CommandExecutionKind {
         /// Local paths to the materialized outputs for failed actions, if `--unstable-materialize-failed-action-outputs`
         /// was passed to build options
         materialized_outputs_for_failed_actions: Option<Vec<ProjectRelativePathBuf>>,
+        origin: RemoteExecutionOrigin,
     },
     /// This action was served by the action cache and not executed.
     #[display("action_cache")]
@@ -73,14 +94,14 @@ pub enum CommandExecutionKind {
     #[display("worker_init")]
     LocalWorkerInit {
         command: Vec<String>,
-        env: SortedVectorMap<String, String>,
+        env: BuckFixedSortedMap<String, String>,
     },
     /// This action was executed via a local worker.
     #[display("worker")]
     LocalWorker {
         digest: ActionDigest,
         command: Vec<String>,
-        env: SortedVectorMap<String, String>,
+        env: BuckFixedSortedMap<String, String>,
         fallback_exe: Vec<String>,
     },
 }
@@ -92,10 +113,22 @@ impl CommandExecutionKind {
             Self::LocalWorker { .. } | Self::LocalWorkerInit { .. } => {
                 buck2_data::ActionExecutionKind::LocalWorker
             }
-            Self::Remote { details, .. } => match details.persistent_worker {
+            Self::Remote {
+                details,
+                origin: RemoteExecutionOrigin::Executed,
+                ..
+            } => match details.persistent_worker {
                 false => buck2_data::ActionExecutionKind::Remote,
                 true => buck2_data::ActionExecutionKind::RemoteWorker,
             },
+            Self::Remote {
+                origin: RemoteExecutionOrigin::ServedFromCache,
+                ..
+            } => buck2_data::ActionExecutionKind::RemoteServedFromCache,
+            Self::Remote {
+                origin: RemoteExecutionOrigin::Deduplicated,
+                ..
+            } => buck2_data::ActionExecutionKind::RemoteDeduplicated,
             Self::ActionCache { .. } => buck2_data::ActionExecutionKind::ActionCache,
             Self::RemoteDepFileCache { .. } => buck2_data::ActionExecutionKind::RemoteDepFileCache,
             Self::LocalTestResultCache { .. } => {
@@ -143,6 +176,7 @@ impl CommandExecutionKind {
                                 value: value.clone(),
                             })
                             .collect(),
+                        ..Default::default()
                     })
                 }
             }
@@ -151,38 +185,53 @@ impl CommandExecutionKind {
                 queue_time,
                 materialized_inputs_for_failed,
                 materialized_outputs_for_failed_actions,
+                origin,
             } => Command::RemoteCommand(buck2_data::RemoteCommand {
                 action_digest: details.action_digest.to_string(),
                 cache_hit: false,
-                cache_hit_type: buck2_data::CacheHitType::Executed.into(),
+                cache_hit_type: buck2_data::RemoteCommandOrigin::from(*origin).into(),
                 remote_dep_file_key: None,
                 queue_time: (*queue_time).try_into().ok(),
                 details: details.to_proto(omit_details),
                 materialized_inputs_for_failed: materialized_inputs_for_failed
                     .as_ref()
-                    .map(|paths| paths.clone().map(|p| format!("{p}")))
+                    .map(|paths| {
+                        paths
+                            .clone()
+                            .iter()
+                            .map(|p| format!("{p}"))
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default(),
                 materialized_outputs_for_failed_actions: materialized_outputs_for_failed_actions
                     .as_ref()
-                    .map(|paths| paths.clone().map(|p| format!("{p}")))
+                    .map(|paths| {
+                        paths
+                            .clone()
+                            .iter()
+                            .map(|p| format!("{p}"))
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default(),
+                re_worker: None,
             }),
             Self::ActionCache { details } => Command::RemoteCommand(buck2_data::RemoteCommand {
                 action_digest: details.action_digest.to_string(),
                 cache_hit: true,
-                cache_hit_type: buck2_data::CacheHitType::ActionCache.into(),
+                cache_hit_type: buck2_data::RemoteCommandOrigin::ActionCache.into(),
                 queue_time: None,
                 details: details.to_proto(omit_details),
                 remote_dep_file_key: None,
                 materialized_inputs_for_failed: Vec::new(),
                 materialized_outputs_for_failed_actions: Vec::new(),
+                re_worker: None,
             }),
 
             Self::RemoteDepFileCache { details } => {
                 Command::RemoteCommand(buck2_data::RemoteCommand {
                     action_digest: details.action_digest.to_string(),
                     cache_hit: true,
-                    cache_hit_type: buck2_data::CacheHitType::RemoteDepFileCache.into(),
+                    cache_hit_type: buck2_data::RemoteCommandOrigin::RemoteDepFileCache.into(),
                     queue_time: None,
                     details: details.to_proto(omit_details),
                     remote_dep_file_key: details
@@ -191,6 +240,7 @@ impl CommandExecutionKind {
                         .map(|k| k.to_string()),
                     materialized_inputs_for_failed: Vec::new(),
                     materialized_outputs_for_failed_actions: Vec::new(),
+                    re_worker: None,
                 })
             }
 

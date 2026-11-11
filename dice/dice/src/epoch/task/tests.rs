@@ -9,22 +9,23 @@
  */
 
 use std::hash::Hash;
+use std::sync::Barrier as ThreadBarrier;
 use std::task::Poll;
+use std::thread;
 
 use allocative::Allocative;
 use assert_matches::assert_matches;
 use async_trait::async_trait;
 use derive_more::Display;
 use dice_futures::cancellation::CancellationContext;
-use dice_futures::spawner::Spawner;
 use dice_futures::spawner::TokioSpawner;
 use dupe::Dupe;
 use futures::FutureExt;
-use futures::future::BoxFuture;
 use futures::pin_mut;
 use futures::poll;
 use pagable::Pagable;
 use pagable::pagable_typetag;
+use tokio::runtime::Builder;
 use tokio::sync::Barrier;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -37,18 +38,17 @@ use crate::api::key::NoValueSerialize;
 use crate::api::key::ValueSerialize;
 use crate::arc::Arc;
 use crate::core::graph::revision::Revision;
-use crate::epoch::cache::TransactionResult;
 use crate::epoch::task::dice::DiceTask;
 use crate::epoch::task::dice::DiceTaskDependedOnByResult;
 use crate::epoch::task::dice::spawn_prepared_task;
-use crate::epoch::task::handle::DiceTaskHandle;
-use crate::epoch::task::promise::DicePromise;
+use crate::epoch::task::spawn_dice_task;
 use crate::key::DiceKey;
 use crate::key::ParentKey;
-use crate::value::DiceComputedValue;
 use crate::value::DiceKeyValue;
 use crate::value::DiceValidValue;
+use crate::value::MaybeResidentComputedValue;
 use crate::value::MaybeValidDiceValue;
+use crate::value::ResidentComputedValue;
 use crate::value::TrackedInvalidationPaths;
 
 #[derive(Allocative, Clone, Dupe, Debug, Display, Eq, PartialEq, Hash, Pagable)]
@@ -76,18 +76,6 @@ impl Key for K {
     }
 }
 
-fn spawn_dice_task<S>(
-    key: DiceKey,
-    spawner: &dyn Spawner<S>,
-    ctx: &S,
-    f: impl for<'a> FnOnce(&'a mut DiceTaskHandle) -> BoxFuture<'a, ()> + Send,
-) -> (DiceTask, DicePromise<'static>) {
-    let prepared_task = DiceTask::prepare_testing(key);
-    let task = prepared_task.task().clone_arc();
-    let promise = spawn_prepared_task(prepared_task, spawner, ctx, f);
-    (task, promise)
-}
-
 #[tokio::test]
 async fn simple_task() -> anyhow::Result<()> {
     let lock = Arc::new(Mutex::new(()));
@@ -101,13 +89,13 @@ async fn simple_task() -> anyhow::Result<()> {
                 // wait for the lock too
                 let _lock = lock.lock().await;
 
-                handle.finished(Ok(TransactionResult::ok(DiceComputedValue::new_resident(
+                handle.finished(Ok(MaybeResidentComputedValue::new_resident(
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(2),
                     )),
                     TrackedInvalidationPaths::clean(),
                     Revision::FIRST,
-                ))));
+                )));
             }
             .boxed()
         });
@@ -138,17 +126,55 @@ async fn simple_task() -> anyhow::Result<()> {
 
     // now await on the task, and see that we wake up and complete
 
-    let v = promise.await;
+    let v = promise.await?;
     assert!(
-        v.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
 
     assert!(!task.is_pending());
 
     Ok(())
+}
+
+#[tokio::test]
+async fn waiting_keys_are_the_dependents_that_polled_while_pending() {
+    let (task, _initial_promise) =
+        spawn_dice_task(DiceKey { index: 10 }, &TokioSpawner, &(), |handle| {
+            async move {
+                let _handle = handle;
+                std::future::pending().await
+            }
+            .boxed()
+        });
+    let waiting = || {
+        let mut keys = Vec::new();
+        task.as_ref().for_each_waiting_key(|k| keys.push(k.index));
+        keys.sort();
+        keys
+    };
+
+    let mut p1 = Box::pin(
+        task.depended_on_by(ParentKey::Some(DiceKey { index: 1 }))
+            .unwrap(),
+    );
+    let mut p2 = Box::pin(
+        task.depended_on_by(ParentKey::Some(DiceKey { index: 2 }))
+            .unwrap(),
+    );
+    let _never_polled = task
+        .depended_on_by(ParentKey::Some(DiceKey { index: 3 }))
+        .unwrap();
+    let mut external = Box::pin(task.depended_on_by(ParentKey::None).unwrap());
+    assert_eq!(waiting(), Vec::<u32>::new(), "nothing has polled yet");
+
+    assert!(poll!(&mut p1).is_pending());
+    assert!(poll!(&mut p2).is_pending());
+    assert!(poll!(&mut external).is_pending());
+    assert_eq!(waiting(), vec![1, 2]);
+
+    drop(p1);
+    assert_eq!(waiting(), vec![2]);
 }
 
 #[tokio::test]
@@ -162,13 +188,13 @@ async fn not_ready_until_dropped() -> anyhow::Result<()> {
             let can_terminate = can_terminate.dupe();
             async move {
                 // wait for the lock too
-                handle.finished(Ok(TransactionResult::ok(DiceComputedValue::new_resident(
+                handle.finished(Ok(MaybeResidentComputedValue::new_resident(
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(1),
                     )),
                     TrackedInvalidationPaths::clean(),
                     Revision::FIRST,
-                ))));
+                )));
 
                 sent_finish.notify_one();
 
@@ -194,16 +220,14 @@ async fn not_ready_until_dropped() -> anyhow::Result<()> {
 
     can_terminate.notify_one();
 
-    let v = promise.await;
+    let v = promise.await?;
 
     assert!(task.is_ready());
     assert!(!task.is_cancelled());
     assert!(!task.is_pending());
 
     assert!(
-        v.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(1)))
     );
 
@@ -252,13 +276,13 @@ async fn multiple_promises_all_completes() -> anyhow::Result<()> {
         spawn_dice_task(DiceKey { index: 20 }, &TokioSpawner, &(), |handle| {
             async move {
                 // wait for the lock too
-                handle.finished(Ok(TransactionResult::ok(DiceComputedValue::new_resident(
+                handle.finished(Ok(MaybeResidentComputedValue::new_resident(
                     MaybeValidDiceValue::valid(DiceValidValue::testing_new(
                         DiceKeyValue::<K>::new(2),
                     )),
                     TrackedInvalidationPaths::clean(),
                     Revision::FIRST,
-                ))));
+                )));
             }
             .boxed()
         });
@@ -284,34 +308,25 @@ async fn multiple_promises_all_completes() -> anyhow::Result<()> {
 
     let (v1, v2, v3, v4, v5) =
         futures::future::join5(promise1, promise2, promise3, promise4, promise5).await;
+    let (v1, v2, v3, v4, v5) = (v1?, v2?, v3?, v4?, v5?);
     assert!(
-        v1.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v1.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
     assert!(
-        v2.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v2.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
     assert!(
-        v3.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v3.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
     assert!(
-        v4.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v4.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
     assert!(
-        v5.as_ref()
-            .into_dice_result()?
-            .testing_resident_value()
+        v5.testing_resident_value()
             .equality(&DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)))
     );
 
@@ -395,9 +410,7 @@ async fn task_that_already_cancelled_returns_cancelled() {
         |_handle| async move { futures::future::pending().await }.boxed()
     });
 
-    // Cancel the worker by dropping its only dependent. Note this is worker cancellation, not
-    // transaction cancellation: `cancel` would instead store a `TransactionCancelled` result, which
-    // reads back as `Finished` rather than triggering a restart.
+    // Cancel the worker by dropping its only dependent.
     drop(initial_promise);
     task.as_ref().await_termination().await;
 
@@ -453,4 +466,130 @@ async fn dropping_termination_observer_does_not_cancel_task() {
 
     drop(promise);
     drop(promise2);
+}
+
+#[tokio::test]
+async fn resident_task_shares_result_after_restart() -> anyhow::Result<()> {
+    let task = DiceTask::<ResidentComputedValue>::new_idle(DiceKey { index: 900 });
+    let DiceTaskDependedOnByResult::NeedsRestart(prepared, previous) =
+        task.depended_on_by(ParentKey::None)
+    else {
+        panic!("the first dependent must start the idle task");
+    };
+    assert!(
+        previous.await_termination().await.is_none(),
+        "generation zero has no worker or result"
+    );
+    let initial = spawn_prepared_task(prepared, &TokioSpawner, &(), |_handle| {
+        async { futures::future::pending().await }.boxed()
+    });
+    drop(initial);
+    task.as_ref().await_termination().await;
+
+    let DiceTaskDependedOnByResult::NeedsRestart(prepared, previous) =
+        task.depended_on_by(ParentKey::None)
+    else {
+        panic!("dropping the only dependent must allow a restart");
+    };
+    assert!(previous.await_termination().await.is_none());
+
+    let expected = DiceValidValue::testing_new(DiceKeyValue::<K>::new(2));
+    let value = ResidentComputedValue::new(
+        expected.dupe(),
+        TrackedInvalidationPaths::clean(),
+        Revision::FIRST,
+    );
+    let first = spawn_prepared_task(prepared, &TokioSpawner, &(), |handle| {
+        async move { handle.finished(Ok(value)) }.boxed()
+    });
+    let DiceTaskDependedOnByResult::Pending(second) = task.depended_on_by(ParentKey::None) else {
+        panic!("the restarted worker has not run yet");
+    };
+
+    let first: &ResidentComputedValue = first.await?;
+    let second: &ResidentComputedValue = second.await?;
+    assert!(
+        std::ptr::eq(first, second),
+        "dependents share the stored result"
+    );
+    let value = first.as_ref();
+    assert!(value.value().instance_equal(&expected));
+    assert_eq!(value.revision(), Some(Revision::FIRST));
+
+    let DiceTaskDependedOnByResult::Finished(finished) = task.depended_on_by(ParentKey::None)
+    else {
+        panic!("a completed resident task must remain ready");
+    };
+    assert!(std::ptr::eq(first, finished));
+    Ok(())
+}
+
+#[test]
+fn concurrent_dependents_start_one_idle_task() {
+    let task = DiceTask::<usize>::new_idle(DiceKey { index: 901 });
+    assert!(!task.is_pending(), "an idle task has no outstanding worker");
+    assert_eq!(task.waiters_count(), 0, "no dependent has registered yet");
+    assert_eq!(
+        task.as_ref().await_termination().now_or_never(),
+        Some(None),
+        "generation zero is already terminated without a result"
+    );
+
+    let barrier = ThreadBarrier::new(8);
+    let dependents = thread::scope(|scope| {
+        let threads = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    task.depended_on_by(ParentKey::None)
+                })
+            })
+            .collect::<Vec<_>>();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().expect("dependent thread should not panic"))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        task.waiters_count(),
+        8,
+        "every thread registered a dependent"
+    );
+
+    Builder::new_current_thread()
+        .build()
+        .expect("test runtime should build")
+        .block_on(async {
+            let mut starts = 0;
+            let promises = dependents
+                .into_iter()
+                .map(|dependent| match dependent {
+                    DiceTaskDependedOnByResult::NeedsRestart(prepared, previous) => {
+                        starts += 1;
+                        spawn_prepared_task(prepared, &TokioSpawner, &(), |handle| {
+                            async move {
+                                assert!(
+                                    previous.await_termination().await.is_none(),
+                                    "the first worker has no previous result to reuse"
+                                );
+                                handle.finished(Ok(42));
+                            }
+                            .boxed()
+                        })
+                    }
+                    DiceTaskDependedOnByResult::Pending(promise) => promise,
+                    DiceTaskDependedOnByResult::Finished(_) => panic!("no worker has started yet"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(starts, 1, "exactly one dependent starts the idle task");
+            for promise in promises {
+                assert_eq!(
+                    *promise.await.unwrap(),
+                    42,
+                    "all dependents share the worker result"
+                );
+            }
+        });
+    assert!(task.is_ready(), "the worker result remains available");
+    assert!(!task.is_pending(), "the only worker has terminated");
 }

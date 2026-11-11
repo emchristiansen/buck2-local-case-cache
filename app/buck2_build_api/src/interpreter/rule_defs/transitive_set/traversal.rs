@@ -22,6 +22,7 @@ use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueOfUnchecked;
 use starlark::values::starlark_value;
+use strong_hash::StrongHash;
 
 use crate::interpreter::rule_defs::transitive_set::TransitiveSet;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSetError;
@@ -35,7 +36,8 @@ use crate::interpreter::rule_defs::transitive_set::TransitiveSetError;
     Freeze,
     PartialEq,
     Allocative,
-    StarlarkPagable
+    StarlarkPagable,
+    StrongHash
 )]
 pub enum TransitiveSetOrdering {
     /// Preorder depth-first traversal, visiting parent node first, then children in an unspecified
@@ -98,7 +100,7 @@ impl<'v> StarlarkValue<'v> for TransitiveSetTraversal<'v> {
     fn iterate_collect(&self, _heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         let tset =
             TransitiveSet::from_value(self.inner.to_value()).internal_error("Invalid inner")?;
-        Ok(tset.iter_values(self.ordering)?.collect())
+        Ok(tset.collect_values(self.ordering)?)
     }
 }
 
@@ -130,8 +132,6 @@ impl<'v> StarlarkValue<'v> for TransitiveSetProjectionTraversal<'v> {
     fn iterate_collect(&self, _heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
             .internal_error("Invalid inner")?;
-        Ok(set
-            .iter_projection_values(self.ordering, self.projection)?
-            .collect())
+        Ok(set.collect_projection_values(self.ordering, self.projection)?)
     }
 }

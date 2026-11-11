@@ -6,8 +6,8 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# pyre-strict
 
+from __future__ import annotations
 
 import dataclasses
 import json

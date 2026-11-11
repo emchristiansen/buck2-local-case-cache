@@ -22,7 +22,6 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
 use futures::stream::FuturesUnordered;
-use gazebo::prelude::*;
 use tokio::sync::Semaphore;
 
 use crate::file_ops::trait_::DiceFileOps;
@@ -94,21 +93,17 @@ pub async fn collect_package_roots<E>(
 
     let list_dir = |path: CellPath| async move {
         let _permit = semaphore.acquire().await.unwrap();
-        let listing = file_ops.read_dir(path.as_ref()).await;
+        let listing = file_ops.read_dir(path).await;
         (path, listing)
     };
 
     for path in paths {
-        match file_ops
-            .is_ignored(path.as_ref())
-            .await
-            .map(|v| v.is_ignored())
-        {
+        match file_ops.is_ignored(path).await.map(|v| v.is_ignored()) {
             Ok(true) => {
                 // TODO(cjhopman): Ignoring this matches buck1 behavior, but we'd like this to be an error.
             }
             Ok(false) => {
-                if seen.insert(path.clone()) {
+                if seen.insert(path) {
                     queue.push(list_dir(path));
                 }
             }
@@ -138,16 +133,16 @@ pub async fn collect_package_roots<E>(
         };
 
         if find_buildfile(&buildfile_candidates, &listing).is_some() {
-            collector(PackageLabel::from_cell_path(path.as_ref()))?;
+            collector(PackageLabel::from_cell_path(path))?;
         }
 
         // The rev() call isn't necessary, it ends up causing us to slightly prefer running
         // things in order and we've encountered a specific case that benefits a lot from it
         // (due to having some huge things in an `apps/` dir).
-        for entry in listing.iter().rev() {
-            if entry.file_type.is_dir() {
-                let child = path.join(&entry.file_name);
-                if seen.insert(child.clone()) {
+        for (file_name, file_type) in listing.iter_with_tag().rev() {
+            if file_type.is_dir() {
+                let child = path.join(file_name);
+                if seen.insert(child) {
                     queue.push(list_dir(child));
                 }
             }
@@ -170,7 +165,7 @@ pub(crate) async fn find_package_roots(
         buck2_error::Ok(())
     })
     .await?;
-    let mut results: Vec<_> = results.into_try_map(|v| v)?;
+    let mut results = results.into_iter().collect::<Result<Vec<_>, _>>()?;
     results.sort();
     Ok(results)
 }

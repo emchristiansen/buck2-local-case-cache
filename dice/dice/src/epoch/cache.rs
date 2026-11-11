@@ -11,12 +11,14 @@
 //! Shared, concurrent dice task cache that is shared between computations at the same version
 
 use std::fmt;
+use std::sync::Arc as StdArc;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use allocative::Allocative;
-use dice_error::DiceError;
-use dice_error::DiceResult;
+use dashmap::DashMap;
 use dupe::Dupe;
 use lock_free_hashtable::sharded::ShardedLockFreeRawTable;
 
@@ -29,55 +31,36 @@ use crate::epoch::task::dice::PreparedDiceTask;
 use crate::epoch::task::projections::ProjectionTask;
 use crate::epoch::task::projections::ProjectionTaskCompletionHandle;
 use crate::key::DiceKey;
-use crate::value::DiceComputedValue;
+use crate::key::ParentKey;
+use crate::value::MaybeResidentComputedValue;
 
-#[derive(Debug, Copy, Clone, Dupe)]
-pub(crate) struct TransactionCancelled;
-
-/// A `Result`-like wrapper that also represents transaction cancellation.
-///
-/// This is newtyped because unlike other results, this should almost never be short-circuited. For
-/// almost all purposes, a `TransactionCancelled` is treated as a real computation result exactly
-/// like a "successful" one.
-#[derive(Debug, Clone, Dupe)]
-pub(crate) struct TransactionResult<T>(Result<T, TransactionCancelled>);
-
-impl<T> TransactionResult<T> {
-    pub(crate) fn ok(t: T) -> Self {
-        Self(Ok(t))
-    }
-
-    pub(crate) fn err(token: TransactionCancelled) -> Self {
-        Self(Err(token))
-    }
-
-    pub(crate) const fn make_cancelled() -> Self {
-        Self(Err(TransactionCancelled))
-    }
-
-    pub(crate) fn unpack(self) -> Result<T, TransactionCancelled> {
-        self.0
-    }
-
-    pub(crate) fn as_ref(&self) -> TransactionResult<&T> {
-        TransactionResult(self.0.as_ref().map_err(|e| *e))
-    }
-
-    pub(crate) fn into_dice_result(self) -> DiceResult<T> {
-        self.0.map_err(|_| DiceError::transaction_cancelled())
-    }
+/// A projection's result as a dependency check establishes it from the core state alone.
+#[derive(Clone, Dupe)]
+pub(crate) enum ProjectionValidation {
+    /// The projection's current result, matched or revalidated without its base's value.
+    Resolved(MaybeResidentComputedValue),
+    /// The projection must be recomputed, which needs its base's value.
+    NeedsRecompute,
 }
+
+pub(crate) type ProjectionValidationCell = StdArc<tokio::sync::OnceCell<ProjectionValidation>>;
 
 #[derive(Allocative)]
 struct Data {
     storage: ShardedLockFreeRawTable<Arc<DiceTaskInternal>, 64>,
     projection_storage: ShardedLockFreeRawTable<Arc<ProjectionTask>, 64>,
-    is_cancelled: AtomicBool,
+    /// Shares one validation of each projection among the dependency checks at this version.
+    #[allocative(skip)]
+    projection_validations: DashMap<DiceKey, ProjectionValidationCell>,
+    /// How many tasks have finished with a value, see `completed_tasks`.
+    completed_tasks: AtomicU64,
+    /// Whether the cycle detector for this cache has been started, see `claim_cycle_detector`.
+    cycle_detector_claimed: AtomicBool,
 }
 
 #[derive(Allocative, Clone, Dupe)]
 pub(crate) struct SharedCache {
-    data: Arc<Data>,
+    data: StdArc<Data>,
 }
 
 impl fmt::Debug for SharedCache {
@@ -86,8 +69,22 @@ impl fmt::Debug for SharedCache {
     }
 }
 
+/// A handle on a `SharedCache` that does not keep it alive. Every worker running in a cache
+/// holds the cache, so one that is only held weakly goes away with the last of its workers.
+pub(crate) struct WeakSharedCache(Weak<Data>);
+
+impl WeakSharedCache {
+    pub(crate) fn upgrade(&self) -> Option<SharedCache> {
+        self.0.upgrade().map(|data| SharedCache { data })
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+}
+
 pub(crate) enum SharedCacheLookup<'d, T> {
-    Finished(&'d TransactionResult<DiceComputedValue>),
+    Finished(&'d MaybeResidentComputedValue),
     InProgress(T),
     Vacant,
 }
@@ -95,14 +92,6 @@ pub(crate) enum SharedCacheLookup<'d, T> {
 pub(crate) enum SharedCacheInsert<T, N> {
     Occupied(T),
     Inserted(N),
-    TransactionCancelled(&'static TransactionResult<DiceComputedValue>),
-}
-
-impl<T, N> SharedCacheInsert<T, N> {
-    fn cancelled(_t: TransactionCancelled) -> Self {
-        static R: TransactionResult<DiceComputedValue> = TransactionResult::make_cancelled();
-        Self::TransactionCancelled(&R)
-    }
 }
 
 impl SharedCache {
@@ -147,15 +136,13 @@ impl SharedCache {
         }
     }
 
+    /// Inserts a task for `key` with `parent` as its first dependent, unless one exists.
     pub(crate) fn insert(
         &self,
         key: DiceKey,
+        parent: ParentKey,
     ) -> SharedCacheInsert<DiceTaskRef<'_>, PreparedDiceTask<'_>> {
-        if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
-        }
-
-        let maybe_prepared_task = DiceTask::prepare(key, |task| {
+        let maybe_prepared_task = DiceTask::prepare(key, parent, |task| {
             let (entry, not_inserted_value) = self.data.storage.insert(
                 Self::key_hash(key),
                 task.internal,
@@ -169,10 +156,6 @@ impl SharedCache {
             }
         });
 
-        if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
-        }
-
         match maybe_prepared_task {
             Ok(p) => SharedCacheInsert::Inserted(p),
             Err(t) => SharedCacheInsert::Occupied(t),
@@ -183,10 +166,6 @@ impl SharedCache {
         &self,
         key: DiceKey,
     ) -> SharedCacheInsert<ArcBorrow<'_, ProjectionTask>, ProjectionTaskCompletionHandle> {
-        if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
-        }
-
         let maybe_prepared_task = ProjectionTask::prepare(key, |task| {
             let (entry, not_inserted_value) = self.data.projection_storage.insert(
                 Self::key_hash(key),
@@ -201,18 +180,8 @@ impl SharedCache {
             }
         });
 
-        if self.data.is_cancelled.load(Ordering::Relaxed) {
-            return SharedCacheInsert::cancelled(TransactionCancelled);
-        }
-
         match maybe_prepared_task {
-            Ok(handle) => {
-                if self.data.is_cancelled.load(Ordering::Relaxed) {
-                    handle.cancel(TransactionCancelled);
-                    return SharedCacheInsert::cancelled(TransactionCancelled);
-                }
-                SharedCacheInsert::Inserted(handle)
-            }
+            Ok(handle) => SharedCacheInsert::Inserted(handle),
             Err(t) => SharedCacheInsert::Occupied(t),
         }
     }
@@ -228,59 +197,97 @@ impl SharedCache {
         assert!(not_inserted_value.is_none());
     }
 
+    pub(crate) fn projection_validation(&self, key: DiceKey) -> ProjectionValidationCell {
+        self.data
+            .projection_validations
+            .entry(key)
+            .or_default()
+            .dupe()
+    }
+
     pub(crate) fn new() -> Self {
         SharedCache {
-            data: Arc::new(Data {
+            data: StdArc::new(Data {
                 storage: ShardedLockFreeRawTable::new(),
                 projection_storage: ShardedLockFreeRawTable::new(),
-                is_cancelled: AtomicBool::new(false),
+                projection_validations: DashMap::new(),
+                completed_tasks: AtomicU64::new(0),
+                cycle_detector_claimed: AtomicBool::new(false),
             }),
         }
     }
 
-    /// This function gets the termination observer for all running tasks when transaction is
-    /// cancelled and prevents further tasks from being added
-    pub(crate) fn cancel_pending_tasks(self) -> Vec<DiceTask> {
-        self.data.is_cancelled.store(true, Ordering::Relaxed);
+    pub(crate) fn note_task_completed(&self) {
+        self.data.completed_tasks.fetch_add(1, Ordering::Relaxed);
+    }
 
-        // The pattern with the `is_cancelled` flag is exactly what this is for
-        self.data.storage.synchronize_with_inserts();
+    /// How many tasks have finished with a value so far. Only ever grows; two equal readings mean
+    /// that no task finished in between.
+    pub(crate) fn completed_tasks(&self) -> u64 {
+        self.data.completed_tasks.load(Ordering::Relaxed)
+    }
 
-        let regular = self
+    /// Whether the caller is the one to start this cache's cycle detector: true exactly once.
+    pub(crate) fn claim_cycle_detector(&self) -> bool {
+        !self
             .data
-            .storage
-            .iter()
-            .filter_map(|entry| {
-                let task = DiceTaskRef { internal: entry };
-                if task.cancel(TransactionCancelled) {
-                    Some(task.clone_arc())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Projection keys can't really be cancelled; however, our caller is going to await the
-        // tasks we return and rely on all ongoing `compute` calls having finished at that time, so
-        // we must do something - we take the simple approach of just awaiting all ongoing
-        // projections at this point. We know this can't take too long because the number of
-        // outstanding projections is bounded by the worker thread count (given their synchronous
-        // nature)
-        //
-        // We must only wait for the `compute`s though, not for the tasks' values: completing a
-        // projection task requires a response from the core state thread, which is typically the
-        // thread this is running on.
+            .cycle_detector_claimed
+            .swap(true, Ordering::Relaxed)
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakSharedCache {
+        WeakSharedCache(StdArc::downgrade(&self.data))
+    }
+
+    /// The tasks that may still be running: those whose latest generation has not terminated.
+    ///
+    /// Callers await the termination of the returned tasks and rely on no `compute` of this cache
+    /// running once they are done. Projections are computed synchronously and cannot be awaited,
+    /// so the ones in flight are waited for right here instead; there are at most as many as there
+    /// are worker threads. Only their `compute`s are waited for, not their values: completing a
+    /// projection task requires a response from the core state thread, which is typically the
+    /// thread this runs on.
+    pub(crate) fn pending_tasks(&self) -> Vec<DiceTask> {
+        let mut regular = Vec::new();
+        self.for_each_pending_task(|task| regular.push(task.clone_arc()));
         for t in self.data.projection_storage.iter() {
             t.wait_computed();
         }
-
         regular
+    }
+
+    /// Calls `f` with every task whose latest generation has not terminated, the recomputation
+    /// of a finished task's unreadable value included (see `PageInRecovery`).
+    pub(crate) fn for_each_pending_task(&self, mut f: impl FnMut(DiceTaskRef<'_>)) {
+        // A running task may be inserting a dependency right now; this orders the scan after
+        // every insert that has begun, so that the new task is seen along with the one that
+        // started it.
+        self.data.storage.synchronize_with_inserts();
+
+        for entry in self.data.storage.iter() {
+            let task = DiceTaskRef { internal: entry };
+            // Check the original task first: it may finish and publish a descriptor
+            // whose recovery starts while this scan is in progress.
+            if task.is_pending() {
+                f(task);
+            }
+            // The ordinary lookup can be finished while its demanded payload is still
+            // being recomputed, including while cancellation waits on a critical section.
+            if let Some(recovery) = task
+                .get_finished_value()
+                .and_then(MaybeResidentComputedValue::recovery)
+                && recovery.task.as_ref().is_pending()
+            {
+                f(recovery.task.as_ref());
+            }
+        }
     }
 }
 
 #[cfg(test)]
 impl SharedCache {
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.data, &other.data)
+        StdArc::ptr_eq(&self.data, &other.data)
     }
 }
 
@@ -293,10 +300,12 @@ pub(crate) mod introspection {
     impl SharedCache {
         pub(crate) fn iter_tasks(&self) -> impl Iterator<Item = (DiceKey, DiceTaskState)> {
             let regular = self.data.storage.iter().map(|entry| {
-                (
-                    entry.key,
-                    DiceTaskRef { internal: entry }.introspect_state(),
-                )
+                let task = DiceTaskRef { internal: entry };
+                let task = task
+                    .get_finished_value()
+                    .and_then(|value| value.recovery())
+                    .map_or(task, |recovery| recovery.task.as_ref());
+                (entry.key, task.introspect_state())
             });
             let projection = self
                 .data
@@ -315,7 +324,6 @@ mod tests {
     use derive_more::Display;
     use dice_futures::cancellation::CancellationContext;
     use dice_futures::spawner::TokioSpawner;
-    use dupe::Dupe;
     use futures::FutureExt;
     use pagable::Pagable;
     use pagable::pagable_typetag;
@@ -328,11 +336,12 @@ mod tests {
     use crate::epoch::cache::SharedCache;
     use crate::epoch::cache::SharedCacheInsert;
     use crate::epoch::cache::SharedCacheLookup;
-    use crate::epoch::cache::TransactionCancelled;
     use crate::epoch::task::dice::DiceTask;
     use crate::epoch::task::dice::testing_helpers::make_completed_task;
+    use crate::epoch::task::promise::DicePromise;
     use crate::epoch::task::spawn_dice_task;
     use crate::key::DiceKey;
+    use crate::key::ParentKey;
 
     #[derive(Allocative, Clone, Debug, Display, Eq, PartialEq, Hash, Pagable)]
     #[pagable_typetag(DiceKeyDyn)]
@@ -359,23 +368,22 @@ mod tests {
         }
     }
 
-    async fn make_finished_cancelling_task(key: DiceKey) -> DiceTask {
-        let finished_cancelling_tasks = spawn_dice_task(key, &TokioSpawner, &(), |handle| {
+    /// A task whose only dependent went away and whose cancellation has landed.
+    async fn make_cancelled_task(key: DiceKey) -> DiceTask {
+        let (task, promise) = spawn_dice_task(key, &TokioSpawner, &(), |handle| {
             async move {
                 let _handle = handle;
                 futures::future::pending().await
             }
             .boxed()
         });
-        finished_cancelling_tasks
-            .as_ref()
-            .cancel(TransactionCancelled);
-        finished_cancelling_tasks.as_ref().await_termination().await;
-
-        finished_cancelling_tasks
+        drop(promise);
+        task.as_ref().await_termination().await;
+        task
     }
 
-    fn make_never_finish_yet_to_cancel_task(key: DiceKey) -> DiceTask {
+    /// A task that runs for as long as the returned dependent is held.
+    fn make_running_task(key: DiceKey) -> (DiceTask, DicePromise<'static>) {
         spawn_dice_task(key, &TokioSpawner, &(), |handle| {
             async move {
                 let _handle = handle;
@@ -386,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_task() {
+    async fn pending_tasks_are_those_still_running() {
         let cache = SharedCache::new();
 
         let completed_key1 = DiceKey { index: 10 };
@@ -394,39 +402,38 @@ mod tests {
         let completed_task1 = make_completed_task::<K>(completed_key1, 1);
         let completed_task2 = make_completed_task::<K>(completed_key2, 2);
 
-        let finished_cancelling_key1 = DiceKey { index: 30 };
-        let finished_cancelling_key2 = DiceKey { index: 40 };
-        let finished_cancelling_tasks1 =
-            make_finished_cancelling_task(finished_cancelling_key1).await;
-        let finished_cancelling_tasks2 =
-            make_finished_cancelling_task(finished_cancelling_key2).await;
+        let cancelled_key1 = DiceKey { index: 30 };
+        let cancelled_key2 = DiceKey { index: 40 };
+        let cancelled_task1 = make_cancelled_task(cancelled_key1).await;
+        let cancelled_task2 = make_cancelled_task(cancelled_key2).await;
 
-        let pending_key1 = DiceKey { index: 50 };
-        let pending_key2 = DiceKey { index: 60 };
-        let pending_key3 = DiceKey { index: 70 };
-        let yet_to_cancel_tasks1 = make_never_finish_yet_to_cancel_task(pending_key1);
-        let yet_to_cancel_tasks2 = make_never_finish_yet_to_cancel_task(pending_key2);
-        let yet_to_cancel_tasks3 = make_never_finish_yet_to_cancel_task(pending_key3);
+        let running_key1 = DiceKey { index: 50 };
+        let running_key2 = DiceKey { index: 60 };
+        let running_key3 = DiceKey { index: 70 };
+        let (running_task1, _promise1) = make_running_task(running_key1);
+        let (running_task2, _promise2) = make_running_task(running_key2);
+        let (running_task3, _promise3) = make_running_task(running_key3);
 
         cache.testing_insert_task(completed_key1, completed_task1);
         cache.testing_insert_task(completed_key2, completed_task2);
-        cache.testing_insert_task(finished_cancelling_key1, finished_cancelling_tasks1);
-        cache.testing_insert_task(finished_cancelling_key2, finished_cancelling_tasks2);
-        cache.testing_insert_task(pending_key1, yet_to_cancel_tasks1);
-        cache.testing_insert_task(pending_key2, yet_to_cancel_tasks2);
-        cache.testing_insert_task(pending_key3, yet_to_cancel_tasks3);
+        cache.testing_insert_task(cancelled_key1, cancelled_task1);
+        cache.testing_insert_task(cancelled_key2, cancelled_task2);
+        cache.testing_insert_task(running_key1, running_task1);
+        cache.testing_insert_task(running_key2, running_task2);
+        cache.testing_insert_task(running_key3, running_task3);
 
         assert!(matches!(
             cache.get(completed_key1),
             SharedCacheLookup::Finished(_)
         ));
 
-        let pending_tasks = cache.dupe().cancel_pending_tasks();
+        let pending_tasks = cache.pending_tasks();
 
         assert_eq!(pending_tasks.len(), 3);
+        // Reporting pending tasks changes nothing about the cache: it keeps accepting work.
         assert!(matches!(
-            cache.insert(DiceKey { index: 999 }),
-            SharedCacheInsert::TransactionCancelled(_)
+            cache.insert(DiceKey { index: 999 }, ParentKey::None),
+            SharedCacheInsert::Inserted(_)
         ));
     }
 }

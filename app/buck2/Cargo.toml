@@ -32,6 +32,7 @@ buck2_cmd_debug_client.workspace = true
 buck2_cmd_docs_client.workspace = true
 buck2_cmd_docs_server.workspace = true
 buck2_cmd_log_client.workspace = true
+buck2_cmd_lsp_server.workspace = true
 buck2_cmd_query_server.workspace = true
 buck2_cmd_rage_client.workspace = true
 buck2_cmd_starlark_client.workspace = true
@@ -53,6 +54,7 @@ buck2_interpreter_for_build.workspace = true
 buck2_query_impls.workspace = true
 buck2_server.workspace = true
 buck2_server_commands.workspace = true
+buck2_settings.workspace = true
 buck2_test.workspace = true
 buck2_test_runner.workspace = true
 buck2_transition.workspace = true
@@ -217,3 +219,6 @@ unused_imports = { level = "warn" }
 unused_macros = { level = "warn" }
 unused_must_use = { level = "warn", priority = -2 }
 unused_variables = { level = "warn" }
+
+[lints.rustdoc]
+private_intra_doc_links = { level = "allow" }

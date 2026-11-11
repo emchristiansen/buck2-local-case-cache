@@ -12,11 +12,11 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use allocative::Allocative;
+use buck2_artifact::artifact::artifact_dyn::ArtifactDyn;
 use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
-use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact::group::artifact_group_values_dyn::ArtifactGroupValuesDyn;
 use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::digest_config::DigestConfig;
@@ -26,6 +26,7 @@ use buck2_execute::directory::LazyActionDirectoryBuilder;
 use buck2_execute::directory::insert_artifact_lazy;
 use buck2_hash::BuckMutSet;
 use dupe::Dupe;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use smallvec::SmallVec;
 use smallvec::smallvec;
@@ -80,7 +81,7 @@ impl ArtifactGroupValues {
 
         Ok(Self(Arc::new(ArtifactGroupValuesData {
             values,
-            children,
+            children: children.into(),
             directory: Some(directory),
         })))
     }
@@ -88,7 +89,7 @@ impl ArtifactGroupValues {
     pub fn from_artifact(artifact: Artifact, value: ArtifactValue) -> Self {
         Self(Arc::new(ArtifactGroupValuesData {
             values: smallvec![(artifact, value)],
-            children: Vec::new(),
+            children: MiniBoxSlice::new(),
             directory: None,
         }))
     }
@@ -144,7 +145,7 @@ impl ArtifactGroupValues {
 #[derive(Allocative, Pagable)]
 pub struct ArtifactGroupValuesData {
     pub(super) values: SmallVec<[(Artifact, ArtifactValue); 1]>,
-    pub(super) children: Vec<ArtifactGroupValues>,
+    pub(super) children: MiniBoxSlice<ArtifactGroupValues>,
     /// If set, a precomputed directory represented the union of all values in this
     /// ArtifactGroupValuesData.
     pub(super) directory: Option<ActionSharedDirectory>,
@@ -308,7 +309,9 @@ mod tests {
         }
 
         fn chain(mut self, child: &ArtifactGroupValues) -> Self {
-            self.children.push(child.dupe());
+            let mut children = std::mem::take(&mut self.children).into_vec();
+            children.push(child.dupe());
+            self.children = children.into();
             self
         }
 

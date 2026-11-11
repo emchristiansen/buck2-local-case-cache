@@ -70,3 +70,20 @@ fn test_as_avalue_dyn() {
     // `get_type` calls `as_avalue_dyn` internally.
     assert_eq!("int", Value::new_int(InlineInt::MINUS_ONE).get_type());
 }
+
+/// `int(s)` falls back to `BigInt::from_str_radix` when `s` does not fit an `i32`; that parser
+/// skips `_`, which is not part of Starlark integer syntax, so such strings are rejected first.
+#[test]
+fn test_int_from_str_rejects_underscores() {
+    assert::fail("int('1__0')", "Cannot parse");
+    assert::fail("int('7_')", "Cannot parse");
+    assert::fail("int('-1_0')", "Cannot parse");
+    assert::fail("int('1_000', 10)", "Cannot parse");
+    assert::fail("int('0x1_f', 0)", "Cannot parse");
+    assert::fail("int('1_0000000000_0')", "Cannot parse");
+    // The `i32` parser overflows before it reaches the underscore.
+    assert::fail("int('10000000000_0')", "Cannot parse");
+    assert::fail("int('_1')", "Cannot parse");
+    assert::eq("int('100000000000')", "100000000000");
+    assert::eq("int('-0x1f', 0)", "-31");
+}

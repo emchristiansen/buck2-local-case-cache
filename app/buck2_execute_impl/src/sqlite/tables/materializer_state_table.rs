@@ -35,7 +35,6 @@ use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::directory::INTERNER;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_hash::BuckMutMap;
-use gazebo::prelude::*;
 use itertools::Itertools;
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -55,6 +54,7 @@ use crate::materializers::artifact_type::ARTIFACT_TYPE_SYMLINK;
 use crate::materializers::artifact_type::ArtifactType;
 use crate::materializers::deferred::artifact_tree::ArtifactClassification;
 use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
+use crate::materializers::v2::entry::DiskEntry;
 use crate::sqlite::materializer_db::MaterializerState;
 use crate::sqlite::materializer_db::MaterializerStateEntry;
 
@@ -201,6 +201,94 @@ fn convert_artifact_metadata_to_sqlite_entries<'a>(
                 Some(classification),
             )]
         }
+    }
+}
+
+/// The rows for a root the disk-state core tracks: the same rows as for an `ArtifactMetadata`,
+/// from the tree's own entry type.
+fn convert_disk_entry_to_sqlite_entries<'a>(
+    path: &'a ProjectRelativePath,
+    entry: &'a DiskEntry,
+    timestamp: &'_ Timestamp,
+    classification: ArtifactClassification,
+) -> Vec<SqliteEntry<'a>> {
+    let mut result = vec![convert_disk_entry_to_sqlite_entry(
+        Cow::Borrowed(path.as_str()),
+        entry,
+        Some(timestamp.as_second()),
+        None,
+        Some(classification),
+    )];
+    if let DiskEntry::Dir(dir) = entry {
+        dir.walk(&mut |entry_path, entry| {
+            result.push(convert_disk_entry_to_sqlite_entry(
+                Cow::Owned(
+                    path.join(entry_path)
+                        .into_forward_relative_path_buf()
+                        .into_string(),
+                ),
+                entry,
+                None,
+                Some(Cow::Borrowed(path.as_str())),
+                None,
+            ));
+        });
+    }
+    result
+}
+
+fn convert_disk_entry_to_sqlite_entry<'a>(
+    path: Cow<'a, str>,
+    entry: &'a DiskEntry,
+    last_access_time: Option<i64>,
+    parent_path: Option<Cow<'a, str>>,
+    classification: Option<ArtifactClassification>,
+) -> SqliteEntry<'a> {
+    let (
+        artifact_type,
+        entry_size,
+        entry_hash,
+        entry_hash_kind,
+        file_is_executable,
+        symlink_target,
+    ) = match entry {
+        DiskEntry::File(file) => (
+            ArtifactType::File,
+            Some(file.digest.size()),
+            Some(Cow::Borrowed(file.digest.raw_digest().as_bytes())),
+            Some(file.digest.raw_digest().algorithm() as u8),
+            Some(file.executable),
+            None,
+        ),
+        DiskEntry::Symlink(symlink) => (
+            ArtifactType::Symlink,
+            None,
+            None,
+            None,
+            None,
+            Some(Cow::Borrowed(symlink.target().as_str())),
+        ),
+        DiskEntry::ExternalSymlink(symlink) => (
+            ArtifactType::ExternalSymlink,
+            None,
+            None,
+            None,
+            None,
+            Some(Cow::Borrowed(symlink.target_str())),
+        ),
+        DiskEntry::Dir(_) => (ArtifactType::Directory, None, None, None, None, None),
+    };
+    SqliteEntry {
+        path,
+        artifact_type,
+        entry_size,
+        entry_hash,
+        entry_hash_kind,
+        file_is_executable,
+        symlink_target,
+        last_access_time,
+        parent_path,
+        classification,
     }
 }
 
@@ -579,6 +667,26 @@ impl MaterializerStateSqliteTable {
     ) -> buck2_error::Result<()> {
         let entries =
             convert_artifact_metadata_to_sqlite_entries(path, metadata, &timestamp, classification);
+        self.insert_rows(path, entries)
+    }
+
+    /// As [`insert`](Self::insert), for a root the disk-state core tracks.
+    pub(crate) fn insert_disk_entry(
+        &self,
+        path: &ProjectRelativePath,
+        entry: &DiskEntry,
+        timestamp: Timestamp,
+        classification: ArtifactClassification,
+    ) -> buck2_error::Result<()> {
+        let entries = convert_disk_entry_to_sqlite_entries(path, entry, &timestamp, classification);
+        self.insert_rows(path, entries)
+    }
+
+    fn insert_rows(
+        &self,
+        path: &ProjectRelativePath,
+        entries: Vec<SqliteEntry<'_>>,
+    ) -> buck2_error::Result<()> {
         static SQL: LazyLock<String> = LazyLock::new(|| {
             format!(
                 "INSERT INTO {STATE_TABLE_NAME} (path, artifact_type, digest_size, entry_hash, entry_hash_kind, file_is_executable, symlink_target, last_access_time, parent_path, classification) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
@@ -625,8 +733,11 @@ impl MaterializerStateSqliteTable {
                 itertools::repeat_n("?", chunk.len()).join(","),
             );
             tracing::trace!(sql = %sql, chunk = ?chunk, "updating last_access_times");
-            tx.execute(&sql, rusqlite::params_from_iter(chunk.map(|p| p.as_str())))
-                .with_buck_error_context(|| format!("updating sqlite table {STATE_TABLE_NAME}"))?;
+            tx.execute(
+                &sql,
+                rusqlite::params_from_iter(chunk.iter().map(|p| p.as_str()).collect::<Vec<_>>()),
+            )
+            .with_buck_error_context(|| format!("updating sqlite table {STATE_TABLE_NAME}"))?;
         }
         tx.commit()?;
         Ok(())

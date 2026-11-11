@@ -19,7 +19,7 @@ use buck2_query_derive::query_module;
 use buck2_query_parser::BinaryOp;
 use buck2_query_parser::Expr;
 use buck2_query_parser::spanned::Spanned;
-use gazebo::variants::VariantName;
+use variant_name::VariantName;
 
 use crate::query::environment::QueryEnvironment;
 use crate::query::syntax::simple::eval::error::QueryError;
@@ -681,7 +681,7 @@ impl<Env: QueryEnvironment> DefaultQueryFunctionsModule<Env> {
     /// Example:
     /// `buck2 cquery "deps('//foo:bar', 1, toolchain_deps())"`
     async fn toolchain_deps(&self) -> QueryFuncResult<Env> {
-        Err(QueryError::NotAvailableInContext("configuration_deps"))
+        Err(QueryError::NotAvailableInContext("toolchain_deps"))
     }
     /// Computes the set intersection over the given arguments.
     /// Can be used with the `^` symbol. This operator is commutative.

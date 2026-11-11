@@ -164,7 +164,7 @@ fn test_remove_path() {
 }
 
 #[cfg(test)]
-mod state_machine {
+pub(crate) mod state_machine {
     #[cfg(all(unix, not(target_os = "macos")))]
     use std::ffi::OsString;
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -178,6 +178,7 @@ mod state_machine {
     use assert_matches::assert_matches;
     use buck2_common::file_ops::metadata::Symlink;
     use buck2_core::error::SoftErrorContext;
+    use buck2_core::error::with_soft_error_context;
     use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_error::BuckErrorContext;
@@ -215,14 +216,14 @@ mod state_machine {
     use crate::sqlite::materializer_db::testing_materializer_state_sqlite_db;
 
     #[derive(Debug, Eq, PartialEq, Allocative)]
-    enum Op {
+    pub(crate) enum Op {
         Clean,
         Materialize,
         MaterializeError,
     }
 
     #[derive(Allocative)]
-    struct StubIoHandler {
+    pub(crate) struct StubIoHandler {
         log: Mutex<Vec<(Op, ProjectRelativePathBuf)>>,
         fail: Mutex<bool>,
         fail_paths: Mutex<Vec<ProjectRelativePathBuf>>,
@@ -267,7 +268,7 @@ mod state_machine {
     }
 
     impl StubIoHandler {
-        fn take_log(&self) -> Vec<(Op, ProjectRelativePathBuf)> {
+        pub(crate) fn take_log(&self) -> Vec<(Op, ProjectRelativePathBuf)> {
             std::mem::take(&mut *self.log.lock())
         }
 
@@ -275,7 +276,7 @@ mod state_machine {
             *self.fail.lock() = fail;
         }
 
-        fn set_fail_on(&self, paths: Vec<ProjectRelativePathBuf>) {
+        pub(crate) fn set_fail_on(&self, paths: Vec<ProjectRelativePathBuf>) {
             *self.fail_paths.lock() = paths;
         }
 
@@ -291,7 +292,7 @@ mod state_machine {
             *self.invalidated_clean_attempts.lock()
         }
 
-        pub fn new(fs: ProjectRoot) -> Self {
+        pub(crate) fn new(fs: ProjectRoot) -> Self {
             Self {
                 log: Default::default(),
                 fail: Default::default(),
@@ -437,13 +438,17 @@ mod state_machine {
             unimplemented!()
         }
 
+        /// The stub has no CAS to upload to; a caller sees the failure it would see offline.
         async fn upload_materialized_artifact(
             self: &Arc<Self>,
-            _path: ProjectRelativePathBuf,
+            path: ProjectRelativePathBuf,
             _entry: ActionDirectoryEntry<ActionSharedDirectory>,
             _info: Arc<CasDownloadInfo>,
         ) -> buck2_error::Result<()> {
-            unimplemented!()
+            Err(buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "The IO stub cannot upload `{path}`"
+            ))
         }
 
         fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir> {
@@ -475,6 +480,21 @@ mod state_machine {
 
         fn digest_config(&self) -> DigestConfig {
             self.digest_config
+        }
+
+        async fn seal(
+            self: &Arc<Self>,
+            _path: ProjectRelativePathBuf,
+            _entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        ) -> buck2_error::Result<()> {
+            Ok(())
+        }
+
+        async fn make_outputs_writable(
+            self: &Arc<Self>,
+            _paths: Vec<ProjectRelativePathBuf>,
+        ) -> buck2_error::Result<()> {
+            Ok(())
         }
     }
 
@@ -708,7 +728,7 @@ mod state_machine {
                 && let Some(buck2_data::instant_event::Data::CleanStaleResult(result)) =
                     instant.data.as_ref()
             {
-                return result.clone();
+                return (**result).clone();
             }
         }
     }
@@ -756,11 +776,10 @@ mod state_machine {
             let artifact = ArtifactValue::file(io.digest_config().empty_file());
             let (dm, _daemon_dispatcher_events) = make_materializer(io, None).await;
 
-            dm.declare_existing(
-                &WriteLease::noop(),
-                vec![DeclareArtifactPayload { path, artifact }],
-            )
-            .await?;
+            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
+            dm.as_dyn()
+                .declare_existing(&lease, vec![DeclareArtifactPayload { path, artifact }])
+                .await?;
 
             let source = dm.allocative().await?.flamegraph().write();
             assert!(
@@ -1238,17 +1257,20 @@ mod state_machine {
             });
             let (mut dm, _events) = make_materializer(io, None).await;
             dm.materialize_final_artifacts = false;
-            dm.declare_existing(
-                &WriteLease::noop(),
-                vec![DeclareArtifactPayload {
-                    path: path.clone(),
-                    artifact: value.dupe(),
-                }],
-            )
-            .await?;
+            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
+            dm.as_dyn()
+                .declare_existing(
+                    &lease,
+                    vec![DeclareArtifactPayload {
+                        path: path.clone(),
+                        artifact: value.dupe(),
+                    }],
+                )
+                .await?;
             assert!(dm.has_artifact_at(path.clone()).await?);
 
             let response = dm
+                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value.dupe())],
                     MaterializationPurpose::FinalOutput { required: false },
@@ -1273,6 +1295,7 @@ mod state_machine {
 
             dm.materialize_final_artifacts = true;
             let response = dm
+                .as_dyn()
                 .materialize(request(
                     vec![(path, value)],
                     MaterializationPurpose::FinalOutput { required: true },
@@ -1549,6 +1572,41 @@ mod state_machine {
             assert_eq!(dm.io.take_log(), &[(Op::Materialize, target_path.clone()), ]);
             Ok(())
         }).await
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_finished_after_invalidation() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let (mut dm, mut channel) = make_processor(Default::default());
+            let path = make_path("foo/bar");
+            let value = ArtifactValue::file(dm.io.digest_config().empty_file());
+            dm.testing_declare(&path, value);
+
+            let pending = dm.tree.invalidate_paths_and_collect_futures(
+                vec![path.clone()],
+                dm.sqlite_db.as_mut(),
+                &dm.stats,
+            )?;
+            assert_eq!(pending.len(), 1);
+            join_all_existing_futs(pending).await?;
+            assert!(dm.tree.prefix_get(&mut path.iter()).is_none());
+
+            let completion = channel
+                .low_priority
+                .try_recv()
+                .expect("cleanup should have queued its completion");
+            assert_matches!(
+                completion,
+                LowPriorityMaterializerCommand::CleanupFinished { .. }
+            );
+            let context = Arc::new(SoftErrorContext::new("true", "")?);
+            with_soft_error_context(Some(context), || {
+                dm.testing_process_one_low_priority_command(completion);
+            });
+            assert!(dm.tree.prefix_get(&mut path.iter()).is_none());
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1861,6 +1919,90 @@ mod state_machine {
             let stats = event.stats.expect("failed event should preserve stats");
             assert_eq!(stats.cleaned_untracked_artifact_count, 1);
             assert_eq!(stats.delete_failed_artifact_count, 1);
+            Ok(())
+        })
+        .await
+    }
+
+    fn explicit_clean_stale_args(tracked_only: bool) -> CleanStaleArtifactsArgs {
+        CleanStaleArtifactsArgs {
+            policy: CleanStaleArtifactsPolicy::Explicit {
+                keep_since_time: jiff::Timestamp::MAX,
+                adaptive_low_disk_threshold: None,
+                adaptive_min_ttl: None,
+                adaptive_unmaterialize_active: false,
+            },
+            dry_run: false,
+            tracked_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clean_stale_tracked_only_with_file_at_tracked_dir() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let path = make_path(SAMPLE_BUCK_OUT_PATH);
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            materialize_write(&path, b"contents", &dm).await?;
+            // Drop dm and flush sqlite connection.
+            dm.abort();
+
+            // The state still lists `foo/bar`, but on disk `foo` is now an untracked file.
+            let foo = project_root.resolve(make_path("buck-out/v2/art/foo"));
+            fs_util::remove_dir_all(&foo)?;
+            fs_util::write(&foo, b"untracked")?;
+
+            let (dm, _) = make_materializer(io, None).await;
+            let error = dm
+                .clean_stale_artifacts(explicit_clean_stale_args(true))
+                .await
+                .expect_err("the stale path is reported, not deleted");
+            assert!(format!("{error:#}").contains("is not a directory on disk"));
+            // `foo` is not a directory, so nothing below it is ours to delete.
+            assert!(
+                fs_util::symlink_metadata_if_exists(&foo)?
+                    .expect("`foo` still exists")
+                    .is_file()
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_clean_stale_tracked_only_with_symlink_at_tracked_dir() -> buck2_error::Result<()>
+    {
+        ignore_stack_overflow_checks_for_future(async {
+            let path = make_path(SAMPLE_BUCK_OUT_PATH);
+            let project_root = temp_root();
+            let io = Arc::new(StubIoHandler::new(project_root.clone()));
+            let (dm, _) = make_materializer(io.dupe(), None).await;
+            materialize_write(&path, b"contents", &dm).await?;
+            dm.abort();
+
+            // The state still lists `foo/bar`, but on disk `foo` now points outside `buck-out`.
+            let outside = project_root.resolve(make_path("outside"));
+            let precious = project_root.resolve(make_path("outside/bar"));
+            fs_util::create_dir_all(&outside)?;
+            fs_util::write(&precious, b"precious")?;
+            let foo = project_root.resolve(make_path("buck-out/v2/art/foo"));
+            fs_util::remove_dir_all(&foo)?;
+            fs_util::symlink(&outside, &foo)?;
+
+            let (dm, _) = make_materializer(io, None).await;
+            let error = dm
+                .clean_stale_artifacts(explicit_clean_stale_args(true))
+                .await
+                .expect_err("the stale path is reported, not deleted");
+            assert!(format!("{error:#}").contains("is not a directory on disk"));
+            // Nothing is deleted through the symlink, and the symlink itself stays.
+            assert!(fs_util::try_exists(&precious)?);
+            assert!(
+                fs_util::symlink_metadata_if_exists(&foo)?
+                    .expect("`foo` still exists")
+                    .is_symlink()
+            );
             Ok(())
         })
         .await
@@ -2399,14 +2541,16 @@ mod state_machine {
 
             let existing = make_path("foo/existing");
             let existing_value = file_value(digest_config, b"existing");
-            dm.declare_existing(
-                &WriteLease::noop(),
-                vec![DeclareArtifactPayload {
-                    path: existing.clone(),
-                    artifact: existing_value.dupe(),
-                }],
-            )
-            .await?;
+            let lease = dm.as_dyn().prepare_outputs(vec![existing.clone()]).await?;
+            dm.as_dyn()
+                .declare_existing(
+                    &lease,
+                    vec![DeclareArtifactPayload {
+                        path: existing.clone(),
+                        artifact: existing_value.dupe(),
+                    }],
+                )
+                .await?;
 
             let remote = make_path("foo/remote");
             let remote_value = file_value(digest_config, b"remote");
@@ -2427,6 +2571,7 @@ mod state_machine {
             let undeclared = make_path("foo/undeclared");
 
             let response = dm
+                .as_dyn()
                 .materialize(request(
                     vec![
                         (remote.clone(), remote_value),
@@ -2459,17 +2604,19 @@ mod state_machine {
 
             let path = make_path("foo/output");
             io.fs().write_file(&path, "previous", false)?;
-            dm.declare_existing(
-                &WriteLease::noop(),
-                vec![DeclareArtifactPayload {
-                    path: path.clone(),
-                    artifact: file_value(digest_config, b"previous"),
-                }],
-            )
-            .await?;
+            let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
+            dm.as_dyn()
+                .declare_existing(
+                    &lease,
+                    vec![DeclareArtifactPayload {
+                        path: path.clone(),
+                        artifact: file_value(digest_config, b"previous"),
+                    }],
+                )
+                .await?;
             assert!(dm.has_artifact_at(path.clone()).await?);
 
-            let _lease = dm.prepare_outputs(vec![path.clone()]).await?;
+            let _lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
             assert!(!dm.has_artifact_at(path.clone()).await?);
             assert!(
                 io.fs().resolve(&path).exists(),
@@ -2491,13 +2638,17 @@ mod state_machine {
 
             let src = make_path("foo/placeholder");
             let dest = make_path("foo/content");
-            dm.publish(
-                &WriteLease::noop(),
-                src.clone(),
-                dest.clone(),
-                file_value(digest_config, b"published"),
-            )
-            .await?;
+            let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
+            drop(
+                dm.as_dyn()
+                    .publish(
+                        &lease,
+                        src.clone(),
+                        dest.clone(),
+                        file_value(digest_config, b"published"),
+                    )
+                    .await?,
+            );
 
             // `dest` is on disk before `publish` returns, and `src` stays tracked because it is
             // what `dest` copies from.
@@ -2538,6 +2689,7 @@ mod state_machine {
                 .await?;
 
             let response = dm
+                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value.dupe())],
                     MaterializationPurpose::FinalOutput { required: false },
@@ -2546,6 +2698,7 @@ mod state_machine {
             assert_eq!(response.results.len(), 1);
 
             let response = dm
+                .as_dyn()
                 .materialize(request(
                     vec![(path.clone(), value)],
                     MaterializationPurpose::FinalOutput { required: true },
@@ -2562,5 +2715,16 @@ mod state_machine {
             Ok(())
         })
         .await
+    }
+
+    /// The public API of the materializer under test, which lives on the trait object.
+    trait AsDyn {
+        fn as_dyn(&self) -> &dyn Materializer;
+    }
+
+    impl AsDyn for DeferredMaterializerAccessor<StubIoHandler> {
+        fn as_dyn(&self) -> &dyn Materializer {
+            self
+        }
     }
 }

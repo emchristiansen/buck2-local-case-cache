@@ -12,8 +12,6 @@
 
 use buck2_core::fs::project::ProjectRootTemp;
 use buck2_core::package::PackageLabel;
-use buck2_interpreter::paths::package::PackageFilePath;
-use buck2_interpreter::paths::path::OwnedStarlarkPath;
 use buck2_interpreter_for_build::interpreter::dice_calculation_delegate::HasCalculationDelegate;
 use buck2_node::attrs::display::AttrDisplayWithContextExt;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
@@ -64,9 +62,7 @@ async fn test_package_value_same_dir_package_file() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
 
@@ -124,9 +120,7 @@ async fn test_package_value_parent_dir_package_file() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
 
@@ -165,9 +159,7 @@ async fn test_overwrite_package_value_not_allowed_without_overwrite_flag() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
     let err = interpreter
@@ -254,9 +246,7 @@ async fn test_read_parent_package_value() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
 
@@ -323,9 +313,7 @@ async fn test_read_parent_package_value_from_bzl() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
 
@@ -363,9 +351,7 @@ async fn test_read_parent_package_value_is_suggested_in_package_file() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
     let err = interpreter
@@ -409,9 +395,7 @@ async fn test_read_parent_package_value_is_suggested_in_bzl_file() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
     let err = interpreter
@@ -457,9 +441,7 @@ async fn test_config_unification_rollout_function_override() {
     let ctx = calculation(&fs).await;
     let mut dice = ctx.ctx();
     let mut interpreter = dice
-        .get_interpreter_calculator(OwnedStarlarkPath::PackageFile(
-            PackageFilePath::package_file_for_dir(package_label.as_cell_path()),
-        ))
+        .get_interpreter_calculator_for_package(package_label)
         .await
         .unwrap();
 
@@ -473,4 +455,34 @@ async fn test_config_unification_rollout_function_override() {
     assert_eq!(1, target_nodes.len());
     let target_node = &target_nodes[0];
     assert!(!target_node.test_config_unification_rollout());
+}
+
+/// `set_starlark_peak_allocated_byte_limit()` is an error outside a build file context, like
+/// the other build-file-only functions, instead of silently doing nothing.
+#[tokio::test]
+async fn test_set_starlark_peak_allocated_byte_limit_in_package_file_is_an_error() {
+    let fs = ProjectRootTemp::new().unwrap();
+
+    fs.write_file("PACKAGE", "set_starlark_peak_allocated_byte_limit(1)");
+    fs.write_file("foo/BUCK", "");
+
+    let package_label = PackageLabel::testing_parse("root//foo");
+
+    let ctx = calculation(&fs).await;
+    let mut dice = ctx.ctx();
+    let mut interpreter = dice
+        .get_interpreter_calculator_for_package(package_label)
+        .await
+        .unwrap();
+    let err = interpreter
+        .eval_build_file(package_label, CancellationContext::testing())
+        .await
+        .1
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains(
+            "`set_starlark_peak_allocated_byte_limit()` can only be called from a build file context"
+        ),
+        "{err:#}"
+    );
 }

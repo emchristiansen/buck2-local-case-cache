@@ -216,7 +216,7 @@ async fn write_to_manifold(buf: &[u8], name: &str) -> Option<String> {
     let ttl = Ttl::from_days(14); // 14 days should be plenty of time to take action
 
     let bucket = Bucket::RAGE_DUMPS;
-    let mut cursor = &mut std::io::Cursor::new(buf);
+    let mut cursor = std::io::Cursor::new(buf);
 
     manifold
         .read_and_upload(bucket, &filename, ttl, &mut cursor)
@@ -310,12 +310,16 @@ pub(crate) trait SyncableQueryProcessor: Send + Sync {
     ) -> buck2_error::Result<(Self::Output, Self::Payload)>;
 
     /// Indicates that all derived data should be invalidated. This could happen, for example, if the watchman server restarts.
+    ///
+    /// `events_since_mergebase` says whether `events` lists every file that differs from
+    /// `mergebase`, rather than what changed since the previous query.
     async fn on_fresh_instance(
         &mut self,
         dice: Self::Payload,
         events: Vec<WatchmanEvent>,
         mergebase: &Option<String>,
         watchman_version: Option<String>,
+        events_since_mergebase: bool,
     ) -> buck2_error::Result<(Self::Output, Self::Payload)>;
 }
 
@@ -381,7 +385,7 @@ where
         // give Watchman time to warm up.
         let mut client = None;
         if let Err(e) = self.reconnect(&mut client).await {
-            tracing::warn!("Connecting to Watchman failed (will re-attempt): {:#}", e);
+            tracing::debug!("Connecting to Watchman failed (will re-attempt): {:#}", e);
         };
 
         loop {
@@ -437,7 +441,13 @@ where
                 } else {
                     (
                         self.processor
-                            .on_fresh_instance(payload, events, &merge_base, watchman_version)
+                            .on_fresh_instance(
+                                payload,
+                                events,
+                                &merge_base,
+                                watchman_version,
+                                false,
+                            )
                             .await?,
                         merge_base,
                         clock,
@@ -451,7 +461,13 @@ where
                 watchman_version,
             } => (
                 self.processor
-                    .on_fresh_instance(payload, events, &merge_base, watchman_version)
+                    .on_fresh_instance(
+                        payload,
+                        events,
+                        &merge_base,
+                        watchman_version,
+                        self.mergebase_with.is_some() && !self.query.empty_on_fresh_instance,
+                    )
                     .await?,
                 merge_base,
                 clock,
@@ -547,6 +563,24 @@ where
 
         // While we use scm-based queries, the processor api doesn't really support them yet so we just treat it as a fresh instance.
         let (new_mergebase, clock) = unpack_clock(clock);
+
+        // When the mergebase moved and the caller handles that incrementally (no DICE clear),
+        // the scm-aware result lists only the files that differ from the *new* mergebase: it
+        // misses files changed between the two mergebases and local edits the checkout dropped.
+        // Ask for everything since the last clock instead.
+        let (is_fresh_instance, files, clock) = if !is_fresh_instance
+            && !self.dice_clear_on_mergebase_change
+            && self.last_mergebase.is_some()
+            && new_mergebase != self.last_mergebase
+        {
+            let mut query = self.query.clone();
+            query.since = Some(Clock::Spec(self.last_clock.clone()));
+            let since_result = client.query::<BuckQueryResult>(query).await?;
+            let (_, clock) = unpack_clock(since_result.clock);
+            (since_result.is_fresh_instance, since_result.files, clock)
+        } else {
+            (is_fresh_instance, files, clock)
+        };
 
         let events = match files {
             None if is_fresh_instance => vec![],

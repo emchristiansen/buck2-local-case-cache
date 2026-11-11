@@ -34,12 +34,10 @@ dice_futures.workspace = true
 dupe.workspace = true
 either.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 pagable.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 starlark.workspace = true
-starlark_map.workspace = true
 strong_hash.workspace = true
 
 [lints]

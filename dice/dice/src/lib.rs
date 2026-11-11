@@ -167,9 +167,10 @@
 //! let mut builder = Dice::builder();
 //! builder.set_static("len4".into());
 //! let engine = builder.build(DetectCycles::Disabled);
+//! let root = rt.block_on(engine.new_root());
 //!
 //! // inject config
-//! let mut ctx = engine.updater();
+//! let mut ctx = engine.updater(root);
 //! ctx.inject_config(0);
 //!
 //! let mut ctx = rt.block_on(ctx.commit());
@@ -179,7 +180,7 @@
 //!     assert_eq!("aaaaaaaa", &*MyComputation(&mut ctx.ctx()).compute_a(4, "a".into()).await);
 //! });
 //!
-//! let mut ctx = engine.updater();
+//! let mut ctx = engine.updater(root);
 //! ctx.inject_config(2);
 //!
 //! let mut ctx = rt.block_on(ctx.commit());
@@ -206,10 +207,11 @@ pub(crate) mod metrics;
 pub(crate) mod opaque;
 pub(crate) mod storage;
 pub(crate) mod updater;
-pub(crate) mod user_cycle;
 pub(crate) mod value;
 mod versions;
 
+pub use dice_core::BranchId;
+pub use dice_core::Version;
 pub use dice_futures::cancellation::CancellationContext; // expose cancellation context as api
 pub use dice_futures::cancellation::CancellationHandle; // expose cancellation handle as api
 pub use dice_futures::spawn::CancellableJoinHandle; // expose cancellation context as api
@@ -244,12 +246,9 @@ pub use crate::api::key::TodoValueSerialize;
 pub use crate::api::key::ValueSerialize;
 pub use crate::api::projection::DiceProjectionComputations;
 pub use crate::api::projection::ProjectionKey;
-pub use crate::api::transaction::DiceEquality;
 pub use crate::api::transaction::DiceTransaction;
 pub use crate::api::transaction::DiceTransactionUpdater;
 pub use crate::api::user_data::UserComputationData;
-pub use crate::api::user_data::UserCycleDetector;
-pub use crate::api::user_data::UserCycleDetectorGuard;
 pub use crate::dice::Dice;
 pub use crate::dice::DiceDataBuilder;
 pub use crate::dice::PagableNodeCounts;
@@ -261,11 +260,14 @@ pub use crate::introspection::serialize_dense_graph;
 pub use crate::introspection::serialize_graph;
 pub use crate::key::DiceKeyDyn;
 pub use crate::key::DiceProjectionDyn;
+pub use crate::metrics::EvictionSnapshot;
 pub use crate::metrics::PagingMemorySnapshot;
 pub use crate::metrics::set_thread_alloc_counters;
 pub use crate::opaque::OpaqueValue;
 pub use crate::storage::DiceStorage;
+pub use crate::storage::EvictionPolicy;
 pub use crate::storage::PagableStorageBackend;
+pub use crate::storage::PageOutPolicy;
 pub use crate::value::DiceValueDyn;
 
 pub mod testing {

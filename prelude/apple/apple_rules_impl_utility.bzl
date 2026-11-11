@@ -45,6 +45,29 @@ def get_enable_library_evolution():
         })
     )
 
+def swift_dynamic_replacement_select(enabled, disabled):
+    """`enabled` or `disabled`, as the configuration decides Swift dynamic
+    replacement. The `swift_dynamic_replacement` constraint decides when it is
+    set, to `enabled` or `disabled`; the
+    `apple.swift_dynamic_replacement_override_enabled` buckconfig is only the
+    fallback for a configuration that leaves the constraint unspecified, so a
+    platform or a mode's modifier pins the decision and a buckconfig alone
+    cannot override a platform that pins `disabled`. No target can decide it."""
+    return select({
+        "DEFAULT": select({
+            "DEFAULT": disabled,
+            "config//features/apple:swift_dynamic_replacement_override_enabled": enabled,
+        }),
+        "config//features/apple/constraints:swift_dynamic_replacement[disabled]": disabled,
+        "config//features/apple/constraints:swift_dynamic_replacement[enabled]": enabled,
+    })
+
+def get_swift_dynamic_replacement_enabled():
+    """Whether the configuration compiles Swift for dynamic replacement, as
+    `swift_dynamic_replacement_select` decides; `default_only` because no
+    target may decide it."""
+    return attrs.default_only(attrs.bool(default = swift_dynamic_replacement_select(True, False)))
+
 def _strict_provisioning_profile_search_default_attr():
     default_value = read_root_config("apple", "strict_provisioning_profile_search", "true").lower() == "true"
     return attrs.bool(
@@ -79,6 +102,9 @@ def _versioned_macos_bundle_default_value():
         "config//features/apple/constraints:versioned_macos_bundle_false": False,
         "config//features/apple/constraints:versioned_macos_bundle_true": True,
     })
+
+def get_versioned_macos_bundle_attr():
+    return attrs.bool(default = _versioned_macos_bundle_default_value())
 
 def _include_build_info_file_default_value():
     return select({
@@ -155,7 +181,7 @@ def _apple_bundle_like_common_attrs():
         "provisioning_profile_filter": attrs.option(attrs.string(), default = None),
         "skip_adhoc_resigning_scrubbed_frameworks": attrs.option(attrs.bool(), default = None),
         "strict_provisioning_profile_search": attrs.option(attrs.bool(), default = None),
-        "versioned_macos_bundle": attrs.bool(default = _versioned_macos_bundle_default_value()),
+        "versioned_macos_bundle": get_versioned_macos_bundle_attr(),
         "_apple_xctoolchain": get_apple_xctoolchain_attr(),
         "_apple_xctoolchain_bundle_id": get_apple_xctoolchain_bundle_id_attr(),
         "_bundling_cache_buster": attrs.option(attrs.string(), default = None),
@@ -167,7 +193,7 @@ def _apple_bundle_like_common_attrs():
         "_codesign_type": attrs.option(attrs.enum(CodeSignType.values()), default = None),
         "_compile_resources_locally_override": attrs.option(attrs.bool(), default = None),
         "_fast_adhoc_signing_enabled_default": _fast_adhoc_signing_enabled_default_attr(),
-        "_fast_adhoc_signing_probe_enabled": attrs.bool(default = False),
+        "_fast_adhoc_signing_probe_enabled": attrs.bool(default = True),
         "_fast_provisioning_profile_parsing_enabled": attrs.bool(default = False),
         "_incremental_bundling_enabled": attrs.bool(default = False),
         "_no_check_certificates": attrs.bool(default = False),
@@ -177,6 +203,9 @@ def _apple_bundle_like_common_attrs():
         "_skip_adhoc_resigning_scrubbed_frameworks_default": _skip_adhoc_resigning_scrubbed_frameworks_default_attr(),
         "_skip_adhoc_resigning_scrubbed_frameworks_override": attrs.option(attrs.bool(), default = None),
         "_strict_provisioning_profile_search_default": _strict_provisioning_profile_search_default_attr(),
+        # Whether the configuration compiles Swift for dynamic replacement, the
+        # same attribute `apple_library` has; recorded in `BuildInfo.json`.
+        "_swift_dynamic_replacement_enabled": get_swift_dynamic_replacement_enabled(),
         APPLE_USE_ENTITLEMENTS_WHEN_ADHOC_CODE_SIGNING_CONFIG_OVERRIDE_ATTR_NAME: attrs.option(attrs.bool(), default = None),
         APPLE_USE_ENTITLEMENTS_WHEN_ADHOC_CODE_SIGNING_ATTR_NAME: attrs.bool(default = False),
         APPLE_EMBED_PROVISIONING_PROFILE_WHEN_ADHOC_CODE_SIGNING_CONFIG_OVERRIDE_ATTR_NAME: attrs.option(attrs.bool(), default = None),
@@ -295,6 +324,7 @@ def apple_bundle_extra_attrs():
         "split_arch_dsym": attrs.bool(default = False),
         "universal": attrs.option(attrs.bool(), default = None),
         "validate_rrapi_usage": attrs.bool(default = False),
+        "xcassets_usage_targets": attrs.list(attrs.split_transition_dep(cfg = cpu_split_transition), default = []),
         "_apple_toolchain": get_apple_bundle_toolchain_attr(),
         "_codesign_entitlements": attrs.option(attrs.source(), default = None),
     }

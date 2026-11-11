@@ -32,8 +32,7 @@ use buck2_event_observer::what_ran::WhatRanOutputWriter;
 use buck2_event_observer::what_ran::WhatRanRelevantAction;
 use buck2_event_observer::what_ran::WhatRanState;
 use buck2_events::span::SpanId;
-use buck2_hash::BuckIndexMap;
-use buck2_hash::BuckMutMap;
+use buck2_hash::BuckMutInsertionMap;
 use futures::TryStreamExt;
 use futures::stream::Stream;
 
@@ -204,8 +203,9 @@ impl WhatRanEntry {
 /// we have seen that are WhatRanRelevantActions, and the CommandReproducer associated with them.
 #[derive(Default)]
 pub struct WhatRanCommandState {
-    /// Maps action spans to their details.
-    known_actions: BuckMutMap<SpanId, WhatRanEntry>,
+    /// Maps action spans to their details, in the order the spans started: unfinished spans are
+    /// printed from this map at the end.
+    known_actions: BuckMutInsertionMap<SpanId, WhatRanEntry>,
 }
 
 impl WhatRanState for WhatRanCommandState {
@@ -282,12 +282,13 @@ impl WhatRanCommandState {
             }
             // Emit WhatRanRelevantAction when we see the corresponding SpanEnd
             if let buck2_data::buck_event::Data::SpanEnd(span) = &data
-                && let Some(mut entry) =
-                    self.known_actions.remove(&SpanId::from_u64(event.span_id)?)
+                && let Some(mut entry) = self
+                    .known_actions
+                    .shift_remove(&SpanId::from_u64(event.span_id)?)
                 && should_emit_finished_action(&span.data, options)
             {
                 // Get extra data out of SpanEnd event
-                let (execution_kind, std_err, duration, scheduling_mode) =
+                let (execution_kind, std_err, duration, scheduling_mode, remote_command) =
                     match &span.data {
                         Some(buck2_data::span_end_event::Data::ActionExecution(action_exec)) => (
                             Some(action_exec.execution_kind),
@@ -303,14 +304,24 @@ impl WhatRanCommandState {
                                 .scheduling_mode
                                 .as_ref()
                                 .and_then(|o| SchedulingMode::try_from(*o).ok()),
+                            last_remote_command(action_exec),
                         ),
-                        _ => (None, None, None, None),
+                        _ => (None, None, None, None, None),
                     };
 
-                if execution_kind == Some(buck2_data::ActionExecutionKind::LocalDepFile as i32) {
+                if execution_kind == Some(buck2_data::ActionExecutionKind::LocalDepFile as i32)
+                    && !options.options.skip_cache_hits
+                {
                     entry
                         .reproducers
                         .push(CommandReproducer::LocalDepFileCacheHit);
+                }
+                if let Some(remote) = remote_command {
+                    entry.reproducers = entry
+                        .reproducers
+                        .into_iter()
+                        .map(|repro| repro.with_remote_origin(remote))
+                        .collect();
                 }
 
                 entry.emit_what_ran_entry(output, options, std_err, duration, scheduling_mode)?;
@@ -318,6 +329,24 @@ impl WhatRanCommandState {
         }
 
         Ok(())
+    }
+}
+
+fn last_remote_command(
+    action_exec: &buck2_data::ActionExecutionEnd,
+) -> Option<&buck2_data::RemoteCommand> {
+    match action_exec
+        .commands
+        .last()?
+        .details
+        .as_ref()?
+        .command_kind
+        .as_ref()?
+        .command
+        .as_ref()?
+    {
+        buck2_data::command_execution_kind::Command::RemoteCommand(remote) => Some(remote),
+        _ => None,
     }
 }
 
@@ -411,18 +440,27 @@ impl WhatRanOutputWriter for OutputFormatWithWriter<'_> {
                             current_attempt: &reused.current_attempt,
                         }
                     }
-                    CommandReproducer::ReExecute(re_execute) => {
+                    CommandReproducer::ReExecute(re_execute)
+                    | CommandReproducer::ReServedFromCache(re_execute)
+                    | CommandReproducer::ReDeduplicated(re_execute) => {
+                        let not_run = match &command.repro {
+                            CommandReproducer::ReServedFromCache(..) => Some("served_from_cache"),
+                            CommandReproducer::ReDeduplicated(..) => Some("deduplicated"),
+                            _ => None,
+                        };
                         if re_execute.persistent_worker {
                             JsonReproducer::ReWorker {
                                 digest: &re_execute.action_digest,
                                 platform_properties: into_index_map(&re_execute.platform),
                                 action_key: re_execute.action_key.as_deref(),
+                                not_run,
                             }
                         } else {
                             JsonReproducer::Re {
                                 digest: &re_execute.action_digest,
                                 platform_properties: into_index_map(&re_execute.platform),
                                 action_key: re_execute.action_key.as_deref(),
+                                not_run,
                             }
                         }
                     }
@@ -513,13 +551,15 @@ impl WhatRanOutputWriter for OutputFormatWithWriter<'_> {
     }
 }
 
-fn into_index_map(platform: &Option<buck2_data::RePlatform>) -> BuckIndexMap<&str, &str> {
-    platform.as_ref().map_or_else(BuckIndexMap::new, |p| {
-        p.properties
-            .iter()
-            .map(|Property { name, value }| (name.as_ref(), value.as_ref()))
-            .collect()
-    })
+fn into_index_map(platform: &Option<buck2_data::RePlatform>) -> BuckMutInsertionMap<&str, &str> {
+    platform
+        .as_ref()
+        .map_or_else(BuckMutInsertionMap::new, |p| {
+            p.properties
+                .iter()
+                .map(|Property { name, value }| (name.as_ref(), value.as_ref()))
+                .collect()
+        })
 }
 
 #[derive(serde::Serialize)]
@@ -573,27 +613,33 @@ mod json_reproducer {
         },
         Re {
             digest: &'a str,
-            platform_properties: BuckIndexMap<&'a str, &'a str>,
+            platform_properties: BuckMutInsertionMap<&'a str, &'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             action_key: Option<&'a str>,
+            /// Why the remote execution service did not run the command, if it did not.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            not_run: Option<&'static str>,
         },
         ReWorker {
             digest: &'a str,
-            platform_properties: BuckIndexMap<&'a str, &'a str>,
+            platform_properties: BuckMutInsertionMap<&'a str, &'a str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             action_key: Option<&'a str>,
+            /// Why the remote execution service did not run the command, if it did not.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            not_run: Option<&'static str>,
         },
         Local {
             command: Cow<'a, [String]>,
-            env: BuckIndexMap<&'a str, &'a str>,
+            env: BuckMutInsertionMap<&'a str, &'a str>,
         },
         Worker {
             command: Cow<'a, [String]>,
-            env: BuckIndexMap<&'a str, &'a str>,
+            env: BuckMutInsertionMap<&'a str, &'a str>,
         },
         WorkerInit {
             command: Cow<'a, [String]>,
-            env: BuckIndexMap<&'a str, &'a str>,
+            env: BuckMutInsertionMap<&'a str, &'a str>,
         },
     }
 }
@@ -616,7 +662,13 @@ impl<'a> From<WhatRanOutputCommandExtra<'a>> for JsonExtra<'a> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_event_observer::what_ran::WhatRanOptions;
+    use buck2_event_observer::what_ran::WhatRanOutputCommand;
+    use buck2_event_observer::what_ran::WhatRanOutputWriter;
+
     use super::*;
+    use crate::what_ran::WhatRanCommandOptions;
+    use crate::what_ran::WhatRanCommandState;
 
     #[test]
     fn local_test_result_reproducer_preserves_original_and_current_provenance()
@@ -640,7 +692,7 @@ mod tests {
 
     fn make_base_command() -> JsonCommand<'static> {
         let command = Cow::Owned(vec!["some".to_owned(), "command".to_owned()]);
-        let mut env = BuckIndexMap::default();
+        let mut env = BuckMutInsertionMap::default();
         env.insert("KEY", "val");
 
         JsonCommand {
@@ -660,10 +712,11 @@ mod tests {
             identity: "some/target",
             reproducer: JsonReproducer::Re {
                 digest: "placeholder",
-                platform_properties: buck2_hash::buck_indexmap! {
+                platform_properties: buck2_hash::buck_mut_insertion_map! {
                     "platform" => "linux-remote-execution"
                 },
                 action_key: None,
+                not_run: None,
             },
             duration: Some("1".to_owned()),
             extra: None,
@@ -699,9 +752,9 @@ mod tests {
 
     #[test]
     fn serialize_what_ran_command_with_extra() -> buck2_error::Result<()> {
+        let cases = ["case".to_owned()];
         let mut command = make_base_command();
-        let cases = &["case".to_owned()];
-        command.extra = Some(JsonExtra::TestCases(cases));
+        command.extra = Some(JsonExtra::TestCases(&cases));
 
         let expected = r#"{
   "reason": "test.run",
@@ -748,6 +801,180 @@ mod tests {
   "duration": "1"
 }"#;
         assert_eq!(expected, serde_json::to_string_pretty(&command)?);
+        Ok(())
+    }
+
+    /// Collects `(identity, executor)` of every emitted command.
+    #[derive(Default)]
+    struct CollectCommands(Vec<(String, String)>);
+
+    impl WhatRanOutputWriter for CollectCommands {
+        fn emit_command(&mut self, command: WhatRanOutputCommand<'_>) -> buck2_error::Result<()> {
+            self.0
+                .push((command.identity.to_owned(), command.repro.executor()));
+            Ok(())
+        }
+    }
+
+    fn span_event(
+        span: u64,
+        parent: u64,
+        data: buck2_data::buck_event::Data,
+    ) -> buck2_data::BuckEvent {
+        buck2_data::BuckEvent {
+            span_id: span,
+            parent_id: parent,
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn action_start_event() -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                buck2_data::ActionExecutionStart {
+                    key: Some(buck2_data::ActionKey {
+                        owner: Some(buck2_data::action_key::Owner::TargetLabel(
+                            buck2_data::ConfiguredTargetLabel {
+                                label: Some(buck2_data::TargetLabel {
+                                    package: "root//pkg".to_owned(),
+                                    name: "t".to_owned(),
+                                }),
+                                configuration: Some(buck2_data::Configuration {
+                                    full_name: "cfg".to_owned(),
+                                }),
+                                execution_configuration: None,
+                            },
+                        )),
+                        ..Default::default()
+                    }),
+                    name: Some(buck2_data::ActionName {
+                        category: "cat".to_owned(),
+                        identifier: "id".to_owned(),
+                    }),
+                    kind: buck2_data::ActionKind::Run as i32,
+                },
+            )),
+        })
+    }
+
+    fn action_end_event(
+        execution_kind: buck2_data::ActionExecutionKind,
+    ) -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                buck2_data::ActionExecutionEnd {
+                    kind: buck2_data::ActionKind::Run as i32,
+                    execution_kind: execution_kind as i32,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        })
+    }
+
+    fn test_run_start_event(name: &str) -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::TestRun(
+                buck2_data::TestRunStart {
+                    suite: Some(buck2_data::TestSuite {
+                        suite_name: name.to_owned(),
+                        ..Default::default()
+                    }),
+                },
+            )),
+        })
+    }
+
+    fn local_execute_start_event() -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ExecutorStage(
+                buck2_data::ExecutorStageStart {
+                    stage: Some(buck2_data::executor_stage_start::Stage::Local(
+                        buck2_data::LocalStage {
+                            stage: Some(buck2_data::local_stage::Stage::Execute(
+                                buck2_data::LocalExecute::default(),
+                            )),
+                        },
+                    )),
+                },
+            )),
+        })
+    }
+
+    fn run_what_ran(
+        events: Vec<buck2_data::BuckEvent>,
+        options: &WhatRanCommandOptions,
+    ) -> buck2_error::Result<Vec<(String, String)>> {
+        let mut state = WhatRanCommandState::default();
+        let mut out = CollectCommands::default();
+        for e in events {
+            state.event(Box::new(e), &mut out, options)?;
+        }
+        state.emit_remaining(&mut out, options)?;
+        Ok(out.0)
+    }
+
+    /// A local dep-file cache hit is a cache hit, so `--skip-cache-hits` drops it.
+    #[test]
+    fn test_skip_cache_hits_skips_local_dep_file_hits() -> buck2_error::Result<()> {
+        let events = || {
+            vec![
+                span_event(1, 0, action_start_event()),
+                span_event(
+                    1,
+                    0,
+                    action_end_event(buck2_data::ActionExecutionKind::LocalDepFile),
+                ),
+            ]
+        };
+        let executors = |options: &WhatRanCommandOptions| -> buck2_error::Result<Vec<String>> {
+            Ok(run_what_ran(events(), options)?
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect())
+        };
+
+        let options = WhatRanCommandOptions {
+            options: WhatRanOptions::default(),
+            failed: false,
+            incomplete: false,
+        };
+        assert_eq!(vec!["dep_file".to_owned()], executors(&options)?);
+
+        let options = WhatRanCommandOptions {
+            options: WhatRanOptions {
+                skip_cache_hits: true,
+                ..Default::default()
+            },
+            failed: false,
+            incomplete: false,
+        };
+        assert_eq!(Vec::<String>::new(), executors(&options)?);
+        Ok(())
+    }
+
+    /// Commands of spans that never ended are printed in the order the spans started.
+    #[test]
+    fn test_incomplete_commands_in_start_order() -> buck2_error::Result<()> {
+        let options = WhatRanCommandOptions {
+            options: WhatRanOptions::default(),
+            failed: false,
+            incomplete: true,
+        };
+        let mut events = Vec::new();
+        for i in 0..64u64 {
+            let span = 2 * i + 1;
+            events.push(span_event(span, 0, test_run_start_event(&format!("s{i}"))));
+            events.push(span_event(span + 1, span, local_execute_start_event()));
+        }
+        let identities: Vec<String> = run_what_ran(events, &options)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let start_order: Vec<String> = (0..64).map(|i| format!("s{i}")).collect();
+
+        assert_eq!(start_order, identities);
         Ok(())
     }
 }

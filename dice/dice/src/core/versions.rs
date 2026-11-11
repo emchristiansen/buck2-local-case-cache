@@ -9,65 +9,60 @@
  */
 
 use allocative::Allocative;
+use dice_core::BranchId;
 use dupe::Dupe;
+use tokio::sync::oneshot;
 
 use crate::HashMap;
 use crate::epoch::cache::SharedCache;
+use crate::epoch::cache::WeakSharedCache;
+use crate::epoch::task::dice::DiceTask;
 use crate::versions::VersionNumber;
 
-/// The transactions in flight: one shared task cache per active version, and the epochs that
-/// tell a stale write from a live one.
+/// The transactions in flight: one shared task cache per active version, and the caches of the
+/// versions whose transactions are all gone while a task of theirs may still be running.
 #[derive(Allocative)]
 pub(crate) struct VersionTracker {
-    /// Versions before this one belong to a state that was dropped by `unstable_take`; writes
-    /// from their transactions are rejected.
-    discarded_before: VersionNumber,
     /// Tracks the currently active versions and how many contexts are holding each of them.
     active_versions: HashMap<VersionNumber, ActiveVersionData>,
-    epoch_tracker: VersionEpochTracker,
-}
-
-// an epoch counter that increases each time we create a new instance of state at a version. This
-// will increase the first time we create a version AND when we reuse a version that has been idle
-#[derive(Allocative)]
-struct VersionEpochTracker(usize);
-
-impl VersionEpochTracker {
-    fn next(&mut self) -> VersionEpoch {
-        let e = VersionEpoch(self.0);
-        self.0 += 1;
-
-        e
-    }
-
-    fn new() -> Self {
-        Self(0)
-    }
-}
-
-#[derive(Copy, Clone, Eq, Debug, Dupe, PartialEq, Allocative)]
-pub(crate) struct VersionEpoch(usize);
-
-impl VersionEpoch {
-    #[cfg(test)]
-    pub(crate) fn testing_new(e: usize) -> Self {
-        Self(e)
-    }
+    /// The caches of versions no transaction holds any more. Held weakly: the workers still
+    /// running in a cache keep it alive, and it goes away with the last of them.
+    #[allocative(skip)]
+    draining: Vec<(VersionNumber, WeakSharedCache)>,
+    /// Who is waiting for a version in their scope to lose its last transaction.
+    #[allocative(skip)]
+    released: Vec<(Option<BranchId>, oneshot::Sender<()>)>,
 }
 
 #[derive(Debug, Allocative)]
 struct ActiveVersionData {
     per_transaction_data: SharedCache,
     ref_count: usize,
-    version_epoch: VersionEpoch,
+}
+
+/// What stands between a scope and idleness (see `Dice::is_idle`).
+pub(crate) struct IdleStatus {
+    /// How many transactions are alive in the scope.
+    pub(crate) active_transactions: usize,
+    /// The tasks of dropped transactions in the scope that may still be running.
+    pub(crate) draining: Vec<DiceTask>,
+    /// Resolves once a version in the scope loses its last transaction. Present iff a
+    /// transaction is alive there.
+    pub(crate) released: Option<oneshot::Receiver<()>>,
+}
+
+impl IdleStatus {
+    pub(crate) fn is_idle(&self) -> bool {
+        self.active_transactions == 0 && self.draining.is_empty()
+    }
 }
 
 impl VersionTracker {
     pub(crate) fn new() -> Self {
         VersionTracker {
-            discarded_before: VersionNumber::FIRST,
             active_versions: HashMap::default(),
-            epoch_tracker: VersionEpochTracker::new(),
+            draining: Vec::new(),
+            released: Vec::new(),
         }
     }
 
@@ -77,62 +72,104 @@ impl VersionTracker {
             .map(|data| (data.ref_count, &data.per_transaction_data))
     }
 
-    pub(crate) fn at(&mut self, v: VersionNumber) -> (VersionEpoch, SharedCache) {
-        let entry = self.active_versions.entry(v).or_insert_with(|| {
-            let version_epoch = self.epoch_tracker.next();
-
-            ActiveVersionData {
+    pub(crate) fn at(&mut self, v: VersionNumber) -> SharedCache {
+        let entry = self
+            .active_versions
+            .entry(v)
+            .or_insert_with(|| ActiveVersionData {
                 per_transaction_data: SharedCache::new(),
                 ref_count: 0,
-                version_epoch,
-            }
-        });
+            });
 
         entry.ref_count += 1;
 
-        (entry.version_epoch, entry.per_transaction_data.dupe())
+        entry.per_transaction_data.dupe()
     }
 
-    /// Check whether computation associated with the given major version and epoch has or has not
-    /// been cancelled
-    pub(crate) fn is_cancelled(&self, v: VersionNumber, epoch: VersionEpoch) -> bool {
-        v < self.discarded_before
-            || self
-                .active_versions
-                .get(&v)
-                .is_none_or(|active| active.version_epoch != epoch)
-    }
+    /// Drops one reference to `v`. The last one dropped leaves the version's cache to drain:
+    /// the tasks in it go on as they were, but no later transaction shares them.
+    pub(crate) fn drop_at_version(&mut self, v: VersionNumber) {
+        let entry = self
+            .active_versions
+            .get_mut(&v)
+            .expect("shouldn't be able to return version without obtaining one");
 
-    /// Drops reference to a VersionNumber given the token
-    pub(crate) fn drop_at_version(&mut self, v: VersionNumber) -> Option<SharedCache> {
-        let ref_count = {
-            let entry = self
-                .active_versions
-                .get_mut(&v)
-                .expect("shouldn't be able to return version without obtaining one");
-
-            entry.ref_count -= 1;
-            entry.ref_count
-        };
-
-        if ref_count == 0 {
-            Some(
-                self.active_versions
-                    .remove(&v)
-                    .expect("existed above")
-                    .per_transaction_data,
-            )
-        } else {
-            None
+        entry.ref_count -= 1;
+        if entry.ref_count == 0 {
+            let data = self.active_versions.remove(&v).expect("existed above");
+            self.draining.retain(|(_, cache)| cache.is_alive());
+            self.draining
+                .push((v, data.per_transaction_data.downgrade()));
+            for (scope, waiter) in std::mem::take(&mut self.released) {
+                if scope.is_none_or(|b| b == v.branch()) {
+                    let _ = waiter.send(());
+                } else if !waiter.is_closed() {
+                    self.released.push((scope, waiter));
+                }
+            }
         }
     }
 
-    /// Rejects writes from every transaction at a version before `first_kept`.
-    pub(crate) fn discard_before(&mut self, first_kept: VersionNumber) {
-        // FIXME(JakobDegen): What's the safety story supposed to be here? It seems like we've made
-        // no attempt to stop there from being an ongoing transaction, and if there is we don't even
-        // attempt to actually cancel it. That seems obviously very unsound?
-        self.discarded_before = first_kept;
+    /// The transactions alive at the versions of `branch` (every version with `None`) and the
+    /// tasks of dropped ones there that may still be running. With transactions alive, also a
+    /// signal for when one of their versions loses its last one, so that a waiter knows to look
+    /// again.
+    pub(crate) fn idle_status(&mut self, branch: Option<BranchId>) -> IdleStatus {
+        let active_transactions = self
+            .active_versions
+            .iter()
+            .filter(|(v, _)| Self::in_scope(branch, v))
+            .map(|(_, data)| data.ref_count)
+            .sum();
+        let draining = self.draining_tasks(branch);
+        let released = (active_transactions > 0).then(|| {
+            let (tx, rx) = oneshot::channel();
+            self.released.push((branch, tx));
+            rx
+        });
+        IdleStatus {
+            active_transactions,
+            draining,
+            released,
+        }
+    }
+
+    /// Every task that may still be running at the versions of `branch` (every version with
+    /// `None`), whether its transaction is alive or gone.
+    ///
+    /// This scans every task of every cache in scope, so it costs time proportional to the work
+    /// in flight; it is what paging out asks right before it starts, not something to poll.
+    pub(crate) fn running_tasks(&mut self, branch: Option<BranchId>) -> Vec<DiceTask> {
+        let mut running = self.draining_tasks(branch);
+        for (v, active) in &self.active_versions {
+            if Self::in_scope(branch, v) {
+                running.extend(active.per_transaction_data.pending_tasks());
+            }
+        }
+        running
+    }
+
+    fn in_scope(branch: Option<BranchId>, v: &VersionNumber) -> bool {
+        branch.is_none_or(|b| v.branch() == b)
+    }
+
+    /// The tasks of dropped transactions in scope that may still be running, forgetting the
+    /// draining caches that have nothing left.
+    fn draining_tasks(&mut self, branch: Option<BranchId>) -> Vec<DiceTask> {
+        let mut pending = Vec::new();
+        self.draining.retain(|(v, weak)| {
+            let Some(cache) = weak.upgrade() else {
+                return false;
+            };
+            if !Self::in_scope(branch, v) {
+                return true;
+            }
+            let tasks = cache.pending_tasks();
+            let keep = !tasks.is_empty();
+            pending.extend(tasks);
+            keep
+        });
+        pending
     }
 }
 
@@ -190,7 +227,6 @@ pub(crate) mod introspection {
 mod tests {
     use assert_matches::assert_matches;
 
-    use crate::core::versions::VersionEpoch;
     use crate::core::versions::VersionTracker;
     use crate::versions::VersionNumber;
 
@@ -215,38 +251,5 @@ mod tests {
 
         vt.drop_at_version(VersionNumber::testing_new(1));
         assert_matches!(vt.active_versions.get(&VersionNumber::testing_new(1)), None);
-    }
-
-    #[test]
-    fn version_epoch_relevant() {
-        let mut vt = VersionTracker::new();
-
-        let (epoch, _s) = vt.at(VersionNumber::testing_new(1));
-        assert!(!vt.is_cancelled(VersionNumber::testing_new(1), epoch));
-        assert!(vt.is_cancelled(
-            VersionNumber::testing_new(1),
-            VersionEpoch::testing_new(9999)
-        ));
-
-        let (epoch1, _s) = vt.at(VersionNumber::testing_new(3));
-        assert!(vt.is_cancelled(VersionNumber::testing_new(1), epoch1));
-        assert!(!vt.is_cancelled(VersionNumber::testing_new(3), epoch1));
-        assert!(vt.is_cancelled(VersionNumber::testing_new(3), epoch));
-
-        vt.drop_at_version(VersionNumber::testing_new(3));
-        let (epoch2, _s) = vt.at(VersionNumber::testing_new(3));
-        assert!(vt.is_cancelled(VersionNumber::testing_new(1), epoch1));
-        assert!(vt.is_cancelled(VersionNumber::testing_new(3), epoch1));
-        assert!(!vt.is_cancelled(VersionNumber::testing_new(3), epoch2));
-    }
-
-    #[test]
-    fn discarding_cancels_earlier_versions() {
-        let mut vt = VersionTracker::new();
-        let (epoch1, _s) = vt.at(VersionNumber::testing_new(1));
-        let (epoch3, _s) = vt.at(VersionNumber::testing_new(3));
-        vt.discard_before(VersionNumber::testing_new(3));
-        assert!(vt.is_cancelled(VersionNumber::testing_new(1), epoch1));
-        assert!(!vt.is_cancelled(VersionNumber::testing_new(3), epoch3));
     }
 }

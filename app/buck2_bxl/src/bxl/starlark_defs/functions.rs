@@ -10,6 +10,7 @@
 
 use std::time::Instant;
 
+use buck2_build_api::actions::query::ActionQueryNode;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLikeUnpack;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 use buck2_core::cells::CellAliasResolver;
@@ -42,9 +43,11 @@ use super::context::output::get_cmd_line_inputs;
 use super::nodes::unconfigured::StarlarkTargetNode;
 use crate::bxl::starlark_defs::context::BxlContext;
 use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
+use crate::bxl::starlark_defs::nodes::action::StarlarkActionQueryNode;
 use crate::bxl::starlark_defs::nodes::configured::StarlarkConfiguredTargetNode;
 use crate::bxl::starlark_defs::targetset::StarlarkTargetSet;
 use crate::bxl::starlark_defs::time::StarlarkInstant;
+use crate::bxl::starlark_defs::visibility_intersection::StarlarkVisibilityIntersectionLayer;
 
 /// Global methods on the target set.
 #[starlark_module]
@@ -87,6 +90,28 @@ pub(crate) fn register_target_function(builder: &mut GlobalsBuilder) {
         Ok(StarlarkTargetSet::from_iter(
             nodes
                 .unwrap_or_default()
+                .items
+                .into_iter()
+                .map(|node| node.0),
+        ))
+    }
+
+    /// Creates a target set from a list of action query nodes.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_atarget_set(ctx):
+    ///     actions = ctx.aquery().all_actions("//target")
+    ///     excluded = bxl.atarget_set([actions[0]])
+    ///     remaining = actions - excluded
+    ///     ctx.output.print(len(remaining))
+    /// ```
+    fn atarget_set(
+        nodes: Option<UnpackList<StarlarkActionQueryNode>>,
+    ) -> starlark::Result<StarlarkTargetSet<ActionQueryNode>> {
+        Ok(StarlarkTargetSet::from_iter(
+            nodes
+                .unwrap_or(UnpackList::default())
                 .items
                 .into_iter()
                 .map(|node| node.0),
@@ -399,11 +424,13 @@ pub(crate) fn register_read_package_visibility_functions(builder: &mut GlobalsBu
         Ok(eval.heap().alloc(super_package.within_view().to_json()))
     }
 
-    /// Read the visibility cap propagated from `enforce_visibility_intersection()` in
-    /// ancestor `PACKAGE` files for the given package path.
+    /// Read the visibility intersection propagated from `enforce_visibility_intersection()` in
+    /// ancestor `PACKAGE` files for the given package path, in the legacy collapsed shape.
     ///
-    /// Returns the same JSON-shaped value as `buck2 audit package-values`: a list of
-    /// pattern strings, or `["PUBLIC"]` when no ancestor caps visibility (the default).
+    /// Returns a list of pattern strings, `["PUBLIC"]` when no ancestor restricts
+    /// visibility (the default), or `{"intersection": [list, ...]}` for several
+    /// layers. Omits `visibility_exempt_targets` exemptions. Kept for backwards
+    /// compatibility; new callers should use `read_package_visibility_intersection`.
     ///
     /// The `package_path` parameter accepts any of the following:
     /// - A `PackagePath`
@@ -422,7 +449,41 @@ pub(crate) fn register_read_package_visibility_functions(builder: &mut GlobalsBu
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let super_package = read_super_package(package_path, eval)?;
-        Ok(eval.heap().alloc(super_package.visibility_cap().to_json()))
+        Ok(eval
+            .heap()
+            .alloc(super_package.visibility_intersection().to_legacy_json()))
+    }
+
+    /// Read the per-layer visibility intersection propagated from
+    /// `enforce_visibility_intersection()` in ancestor `PACKAGE` files.
+    ///
+    /// Returns one `bxl.VisibilityIntersectionLayer` per contributing layer, or
+    /// an empty list when no ancestor restricts visibility.
+    ///
+    /// The `package_path` parameter accepts any of the following:
+    /// - A `PackagePath`
+    /// - A string representing a package path (e.g., "root//some/package")
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_read_package_visibility_intersection(ctx):
+    ///     node = ctx.unconfigured_targets("root//some/package:target")
+    ///     for layer in bxl.read_package_visibility_intersection(node.label.package_path):
+    ///         ctx.output.print(layer.patterns, layer.exempt_targets)
+    ///
+    ///     layers = bxl.read_package_visibility_intersection("root//path/to/pkg")
+    /// ```
+    fn read_package_visibility_intersection<'v>(
+        #[starlark(require = pos)] package_path: PackagePathArg<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Vec<StarlarkVisibilityIntersectionLayer>> {
+        let super_package = read_super_package(package_path, eval)?;
+        Ok(super_package
+            .visibility_intersection()
+            .layers()
+            .iter()
+            .map(|layer| StarlarkVisibilityIntersectionLayer(layer.dupe()))
+            .collect())
     }
 
     /// Read the `within_view` cap propagated from `enforce_within_view_intersection()`

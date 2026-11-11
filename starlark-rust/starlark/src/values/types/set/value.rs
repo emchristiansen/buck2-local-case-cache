@@ -106,10 +106,6 @@ impl<'v> SetData<'v> {
         self.content.insert_hashed(value)
     }
 
-    pub(crate) fn add_hashed_unique_unchecked(&mut self, value: Hashed<Value<'v>>) {
-        self.content.insert_hashed_unique_unchecked(value)
-    }
-
     pub fn remove_hashed(&mut self, value: Hashed<&Value<'v>>) -> bool {
         self.content.shift_remove_hashed(value)
     }
@@ -165,7 +161,7 @@ trait SetLike<'v>: Debug + Allocative {
 
     // These functions are unsafe for the same reason
     // `StarlarkValue` iterator functions are unsafe.
-    unsafe fn iter_start(&self);
+    unsafe fn iter_start(&self) -> crate::Result<()>;
     unsafe fn content_unchecked(&self) -> &SmallSet<Value<'v>>;
     unsafe fn iter_stop(&self);
     // fn set_at(&self, index: Hashed<Value<'v>>, value: Value<'v>) -> crate::Result<()>;
@@ -183,8 +179,16 @@ impl<'v> SetLike<'v> for RefCell<SetData<'v>> {
     }
 
     #[inline]
-    unsafe fn iter_start(&self) {
-        mem::forget(self.borrow());
+    unsafe fn iter_start(&self) -> crate::Result<()> {
+        // A method may hold this value mutably borrowed while it iterates one of its
+        // arguments, e.g. `d.update([d])`; that is an error, not a panic.
+        match self.try_borrow() {
+            Ok(borrow) => {
+                mem::forget(borrow);
+                Ok(())
+            }
+            Err(_) => Err(crate::Error::new_other(ValueError::MutationDuringIteration)),
+        }
     }
 
     #[inline]
@@ -213,7 +217,9 @@ impl<'v> SetLike<'v> for SetData<'v> {
         &self.content
     }
 
-    unsafe fn iter_start(&self) {}
+    unsafe fn iter_start(&self) -> crate::Result<()> {
+        Ok(())
+    }
 
     unsafe fn iter_stop(&self) {}
 
@@ -256,7 +262,7 @@ where
 
     unsafe fn iterate(&self, me: Value<'v>, _heap: Heap<'v>) -> crate::Result<Value<'v>> {
         unsafe {
-            self.0.iter_start();
+            self.0.iter_start()?;
             Ok(me)
         }
     }
@@ -319,24 +325,9 @@ where
     fn bit_xor(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "^", rhs), Ok)?;
-        if rhs.aref.content.is_empty() {
-            return Ok(heap.alloc(SetData {
-                content: self.0.content().clone(),
-            }));
-        }
-        let mut data = SetData::default();
-        for elem in self.0.content().iter_hashed() {
-            if !rhs.aref.contains_hashed(elem.copied()) {
-                data.add_hashed_unique_unchecked(elem.copied());
-            }
-        }
 
-        for hashed in rhs.aref.iter_hashed() {
-            if !self.0.content().contains_hashed(hashed.as_ref()) {
-                data.add_hashed(hashed);
-            }
-        }
-        Ok(heap.alloc(data))
+        let items = self.0.content().symmetric_difference(&rhs.aref.content);
+        Ok(heap.alloc(SetData { content: items }))
     }
 
     // Set difference

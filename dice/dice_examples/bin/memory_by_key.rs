@@ -123,6 +123,7 @@ impl Snapshot {
 /// Byte-granular, immune to LLVM elision (asks the allocator directly),
 /// and counts everything that goes through `malloc` (which is everything
 /// dice does).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_heap_allocated_bytes() -> isize {
     let mut epoch: u64 = 1;
     let mut sz_epoch: usize = std::mem::size_of::<u64>();
@@ -163,6 +164,15 @@ fn read_heap_allocated_bytes() -> isize {
     allocated as isize
 }
 
+/// There is no jemalloc on Windows. The Buck target is Linux-only, but cargo
+/// has no way to leave a `[[bin]]` out on one OS, so the workspace builds this
+/// binary there too; the metric reads as the broken-metric sentinel.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_heap_allocated_bytes() -> isize {
+    -1
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 unsafe extern "C" {
     // tikv_jemallocator uses a `_rjem_` prefix for its functions if prefixing is enabled:
     // <https://docs.rs/crate/tikv-jemalloc-sys/0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8/source/src/lib.rs#143>
@@ -466,11 +476,12 @@ async fn run_phase(shape: Shape, do_tx: bool) -> PhaseResult {
     }
 
     let dice = Dice::builder().build(DetectCycles::Disabled);
+    let root = dice.new_root().await;
 
     // Warmup: compute a small chain of leaves through the same code
     // paths so tokio + dice internals grow before we start measuring.
     {
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(Seed, 0u32)]).unwrap();
         let ctx = updater.commit().await;
         let n = WARMUP_KEYS.min(NODE_COUNT);
@@ -485,7 +496,7 @@ async fn run_phase(shape: Shape, do_tx: bool) -> PhaseResult {
     snaps.push(quiesce_and_snap(&dice).await);
     for s in 0..SHADOWS {
         // Build one shadow's root computation; dice walks the whole graph.
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(Seed, 0u32)]).unwrap();
         let ctx = updater.commit().await;
         drop(ctx.compute(&GraphNode(0, s)).await);
@@ -522,7 +533,7 @@ async fn run_phase(shape: Shape, do_tx: bool) -> PhaseResult {
         let total_keys = (NODE_COUNT as u64 + 1) * SHADOWS as u64;
         let total_keys_f = total_keys as f64;
 
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(Seed, 1u32)]).unwrap();
         let ctx = updater.commit().await;
         for s in 0..SHADOWS {
@@ -601,11 +612,12 @@ async fn run_suspended_phase(shape: Shape) -> SuspendedResult {
     }
 
     let dice = Dice::builder().build(DetectCycles::Disabled);
+    let root = dice.new_root().await;
 
     // Warmup through the same code paths (not in suspend mode) so tokio +
     // dice internals grow before we start measuring.
     {
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(Seed, 0u32)]).unwrap();
         let ctx = updater.commit().await;
         let n = WARMUP_KEYS.min(NODE_COUNT);
@@ -631,7 +643,7 @@ async fn run_suspended_phase(shape: Shape) -> SuspendedResult {
     snaps.push(baseline);
 
     for s in 0..SHADOWS {
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to(vec![(Seed, 0u32)]).unwrap();
         let ctx = updater.commit().await;
         handles.push(tokio::spawn(async move {
@@ -724,10 +736,11 @@ async fn async_main() {
 
     // ── Calibration & noise floor on a fresh dice (smallest setup) ──
     let dice_cal = Dice::builder().build(DetectCycles::Disabled);
+    let dice_cal_root = dice_cal.new_root().await;
     set_shape(Shape::Chain);
     {
         // Tiny warmup so the first read isn't on a cold runtime.
-        let mut updater = dice_cal.updater();
+        let mut updater = dice_cal.updater(dice_cal_root);
         updater.changed_to(vec![(Seed, 0u32)]).unwrap();
         let ctx = updater.commit().await;
         for i in 0..50 {

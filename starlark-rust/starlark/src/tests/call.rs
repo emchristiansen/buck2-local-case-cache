@@ -103,6 +103,18 @@ fn test_repeated_parameters() {
 }
 
 #[test]
+fn test_kwargs_non_string_key_message() {
+    assert::fail(
+        "def f(**kw): pass\nnoop(f)(**noop({1: 2}))",
+        "The keys of the dictionary provided for **kwargs must be strings",
+    );
+    assert::fail(
+        "dict(**noop({1: 2}))",
+        "The keys of the dictionary provided for **kwargs must be strings",
+    );
+}
+
+#[test]
 fn test_bad_application() {
     assert::fail("noop(['1'])(2)", "not supported");
     assert::fail("noop('test')(2)", "not supported");

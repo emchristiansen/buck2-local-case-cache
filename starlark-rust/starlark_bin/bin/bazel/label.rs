@@ -81,7 +81,7 @@ impl Label {
 
                 let (package, name) = rest.split_once(':').unwrap_or_else(|| {
                     // Here the name is implicit, and comes from the last component of the package name
-                    if let Some((index, _)) = rest.rmatch_indices('/').next_back() {
+                    if let Some(index) = rest.rfind('/') {
                         (rest, &rest[index + 1..])
                     } else {
                         (rest, rest)
@@ -275,6 +275,18 @@ mod tests {
         assert_eq!(
             format!("{}", Label::parse("//foo/bar").unwrap()),
             "//foo/bar:bar"
+        );
+    }
+
+    /// The implicit name is the last component of the package.
+    #[test]
+    fn test_implicit_name_is_the_last_package_component() {
+        let label = Label::parse("//a/b/c").unwrap();
+        assert_eq!(label.package.as_deref(), Some("a/b/c"));
+        assert_eq!(label.name, "c");
+        assert_eq!(
+            Label::parse("@repo//foo/bar/baz").unwrap().to_string(),
+            "@repo//foo/bar/baz:baz"
         );
     }
 }

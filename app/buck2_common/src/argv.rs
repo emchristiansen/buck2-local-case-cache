@@ -14,7 +14,6 @@ use std::sync::Arc;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_hash::BuckMutSet;
-use gazebo::prelude::VecExt;
 
 /// Argv contains the bare process argv and the "expanded" argv. The expanded argv is
 /// the argv after processing flagfiles (args like @mode/opt and --flagfile mode/opt)
@@ -75,7 +74,10 @@ impl ExpandedArgv {
 
     pub fn from_literals(args: Vec<String>) -> Self {
         Self {
-            args: args.into_map(|v| (v, ExpandedArgSource::Inline)),
+            args: args
+                .into_iter()
+                .map(|v| (v, ExpandedArgSource::Inline))
+                .collect::<Vec<_>>(),
         }
     }
 
@@ -125,6 +127,18 @@ impl ExpandedArgvBuilder {
 
     pub fn build(self) -> ExpandedArgv {
         self.argv
+    }
+
+    /// Whether `kind` is one of the argfiles whose expansion is in progress.
+    pub fn is_expanding(&self, kind: &ArgFileKind) -> bool {
+        let mut current = self.current_argfile.as_ref();
+        while let Some(argfile) = current {
+            if argfile.kind == *kind {
+                return true;
+            }
+            current = argfile.parent.as_ref();
+        }
+        false
     }
 
     pub fn argfile_scope<R>(&mut self, kind: ArgFileKind, func: impl FnOnce(&mut Self) -> R) -> R {

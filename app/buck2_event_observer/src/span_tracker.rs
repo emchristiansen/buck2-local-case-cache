@@ -10,13 +10,14 @@
 
 use std::sync::Arc;
 
+use buck2_core::soft_error_or_panic;
 use buck2_error::internal_error;
 use buck2_events::BuckEvent;
 use buck2_events::span::SpanId;
 use buck2_hash::BuckMutMap;
+use buck2_util::exact_size_iter::IterExactSize;
 use derivative::Derivative;
 use dupe::Dupe;
-use gazebo::prelude::IterExactSize;
 use linked_hash_map::LinkedHashMap;
 
 use crate::what_ran::WhatRanRelevantAction;
@@ -201,7 +202,14 @@ impl<T: SpanTrackable> Roots<T> {
                     *c -= 1;
                 }
                 v => {
-                    tracing::error!("Decrementing {} but it is was {:?}", dice_key_type, v);
+                    soft_error_or_panic!(
+                        "span_tracker_dice_count_underflow",
+                        buck2_error::internal_error!(
+                            "Decrementing {} but it was {:?}",
+                            dice_key_type,
+                            v
+                        )
+                    );
                 }
             }
         }
@@ -528,6 +536,7 @@ pub fn is_span_shown(event: &BuckEvent) -> bool {
             | Data::BxlExecution(..)
             | Data::BxlDiceInvocation(..)
             | Data::ReUpload(..)
+            | Data::ReSubmit(..)
             | Data::ConnectToInstaller(..)
             | Data::LocalResources(..)
             | Data::ReleaseLocalResources(..)

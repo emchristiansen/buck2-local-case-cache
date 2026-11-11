@@ -24,7 +24,7 @@ use crate::tests::v;
 #[test]
 fn asserting_the_current_revision_mints_no_version() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     assert_eq!(s.assert_at(root, k(0), r(1)), v(root, 2));
     assert_eq!(s.assert_at(root, k(0), r(1)), v(root, 2));
     assert_eq!(s.assert_at(root, k(0), r(2)), v(root, 3));
@@ -34,7 +34,7 @@ fn asserting_the_current_revision_mints_no_version() {
 #[test]
 fn a_commit_with_no_effective_change_returns_the_head() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     s.assert_at(root, k(1), r(1));
     let head = s.head(root);
@@ -59,7 +59,7 @@ fn a_commit_with_no_effective_change_returns_the_head() {
 #[test]
 fn a_dirty_always_mints_a_version() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     assert_eq!(s.dirty_at(root, k(0)), v(root, 2));
     assert_eq!(s.dirty_at(root, k(0)), v(root, 3));
     assert_ne!(s.epsilon(k(0), v(root, 2)), s.epsilon(k(0), v(root, 3)));
@@ -70,7 +70,7 @@ fn a_dirty_always_mints_a_version() {
 #[test]
 fn a_change_closes_its_transitive_dependents_only() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     s.assert_at(root, k(10), r(1));
     let head = s.head(root);
@@ -103,7 +103,7 @@ fn batched_changes_close_overlapping_dependents_only() {
     for inherited in [false, true] {
         for reverse in [false, true] {
             let mut s = State::new();
-            let root = s.root();
+            let root = s.new_root();
             s.assert_at(root, k(0), r(1));
             s.assert_at(root, k(1), r(1));
             for c in [
@@ -182,7 +182,7 @@ fn batched_changes_close_overlapping_dependents_only() {
 #[test]
 fn a_dirty_closes_the_key_and_its_dependents() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     let leaf = cert(k(0), r(1), &[], EpsilonToken::INITIAL);
     s.write_checked(&leaf);
     let dep = cert(k(1), r(1), &[(k(0), r(1))], EpsilonToken::INITIAL);
@@ -203,8 +203,7 @@ fn a_dirty_closes_the_key_and_its_dependents() {
 /// Closing an inherited claim gives the branch its own closed copy and leaves the parent alone.
 #[test]
 fn closing_an_inherited_claim_copies_it_to_the_committing_branch() {
-    let (mut s, c) = leaf_and_dependent();
-    let root = s.root();
+    let (mut s, root, c) = leaf_and_dependent();
     let child = s.fork_checked(v(root, 2));
     let c2 = s.assert_at(child, k(0), r(2));
     assert!(s.is_unknown_at(k(1), c2));
@@ -221,7 +220,7 @@ fn closing_an_inherited_claim_copies_it_to_the_committing_branch() {
 #[test]
 fn seqs_are_per_branch() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     s.assert_at(root, k(0), r(2));
     let child = s.fork_checked(v(root, 3));
@@ -232,28 +231,40 @@ fn seqs_are_per_branch() {
 }
 
 #[test]
+#[cfg_attr(
+    all(miri, panic = "abort"),
+    ignore = "with panic=abort the panic kills the in-process Miri harness"
+)]
 #[should_panic(expected = "never both")]
 fn asserting_a_certified_key_panics() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.write_checked(&cert(k(0), r(1), &[], EpsilonToken::INITIAL));
     s.assert_at(root, k(0), r(1));
 }
 
 #[test]
+#[cfg_attr(
+    all(miri, panic = "abort"),
+    ignore = "with panic=abort the panic kills the in-process Miri harness"
+)]
 #[should_panic(expected = "never both")]
 fn certifying_an_asserted_key_panics() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     s.write_checked(&cert(k(0), r(1), &[], EpsilonToken::INITIAL));
 }
 
 #[test]
+#[cfg_attr(
+    all(miri, panic = "abort"),
+    ignore = "with panic=abort the panic kills the in-process Miri harness"
+)]
 #[should_panic(expected = "never both")]
 fn dirtying_an_asserted_key_panics() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.assert_at(root, k(0), r(1));
     s.dirty_at(root, k(0));
 }
@@ -262,8 +273,7 @@ fn dirtying_an_asserted_key_panics() {
 /// inherited dependents stay attached.
 #[test]
 fn asserting_the_inherited_revision_on_a_child_mints_no_version() {
-    let (mut s, _) = leaf_and_dependent();
-    let root = s.root();
+    let (mut s, root, _) = leaf_and_dependent();
     let child = s.fork_checked(v(root, 2));
     assert_eq!(s.assert_at(child, k(0), r(1)), v(child, 1));
     assert_eq!(s.valid_at(k(1), v(child, 1)), Some(r(1)));
@@ -277,8 +287,7 @@ fn asserting_the_inherited_revision_on_a_child_mints_no_version() {
 /// the child only.
 #[test]
 fn dirtying_an_inherited_computed_key_closes_it_at_the_child_only() {
-    let (mut s, _) = leaf_and_dependent();
-    let root = s.root();
+    let (mut s, root, _) = leaf_and_dependent();
     s.write_checked(&cert(k(2), r(1), &[(k(1), r(1))], EpsilonToken::INITIAL));
     let child = s.fork_checked(v(root, 2));
     let child_v2 = s.dirty_at(child, k(1));
@@ -302,8 +311,7 @@ fn dirtying_an_inherited_computed_key_closes_it_at_the_child_only() {
 /// close the key when the child changes the dep.
 #[test]
 fn a_childs_edges_survive_the_parent_draining_its_own() {
-    let (mut s, _) = leaf_and_dependent();
-    let root = s.root();
+    let (mut s, root, _) = leaf_and_dependent();
     let child = s.fork_checked(v(root, 2));
     s.assert_at(root, k(0), r(2));
     assert!(s.rdeps(root, k(0)).is_empty());
@@ -317,8 +325,7 @@ fn a_childs_edges_survive_the_parent_draining_its_own() {
 /// from the parent's: asserting the parent's revision again after an own change is a change.
 #[test]
 fn reasserting_the_parents_revision_after_an_own_change_is_a_change() {
-    let (mut s, _) = leaf_and_dependent();
-    let root = s.root();
+    let (mut s, root, _) = leaf_and_dependent();
     let child = s.fork_checked(v(root, 2));
     assert_eq!(s.assert_at(child, k(0), r(2)), v(child, 2));
     assert_eq!(s.assert_at(child, k(0), r(1)), v(child, 3));
@@ -328,10 +335,14 @@ fn reasserting_the_parents_revision_after_an_own_change_is_a_change() {
 }
 
 #[test]
+#[cfg_attr(
+    all(miri, panic = "abort"),
+    ignore = "with panic=abort the panic kills the in-process Miri harness"
+)]
 #[should_panic(expected = "appears twice in one commit")]
 fn a_key_appearing_twice_in_one_commit_panics() {
     let mut s = State::new();
-    let root = s.root();
+    let root = s.new_root();
     s.commit(
         root,
         vec![
@@ -347,13 +358,17 @@ fn a_key_appearing_twice_in_one_commit_panics() {
     );
 }
 
-/// `take` forgets claims, not that a key has been certified: asserting it afterwards is still the
-/// mistake it was before.
+/// Deleting the only branch with a claim on a key forgets the claim, not that the key has been
+/// certified: asserting it afterwards is still the mistake it was before.
 #[test]
+#[cfg_attr(
+    all(miri, panic = "abort"),
+    ignore = "with panic=abort the panic kills the in-process Miri harness"
+)]
 #[should_panic(expected = "asserted after being certified")]
-fn a_key_certified_before_take_still_cannot_be_asserted() {
-    let (mut s, _) = leaf_and_dependent();
-    let root = s.root();
-    s.take_checked();
-    s.assert_at(root, k(1), r(1));
+fn a_key_certified_on_a_deleted_branch_still_cannot_be_asserted() {
+    let (mut s, root, _) = leaf_and_dependent();
+    let other = s.new_root();
+    s.delete_checked(root);
+    s.assert_at(other, k(1), r(1));
 }

@@ -31,6 +31,7 @@ use pagable::storage::traits::ArcSerCache;
 use starlark_derive::NoSerialize;
 use starlark_derive::ProvidesStaticType;
 use starlark_derive::StarlarkPagable;
+use starlark_derive::StarlarkPagableUnsupported;
 use starlark_derive::starlark_value;
 use starlark_syntax::codemap::CodeMap;
 use starlark_syntax::codemap::FileSpan;
@@ -51,6 +52,7 @@ use crate::pagable::starlark_serialize_context::StarlarkSerState;
 use crate::singleton_heap_name;
 use crate::starlark_simple_value;
 use crate::values::AllocFrozenValue;
+use crate::values::Deferred;
 use crate::values::FrozenHeap;
 use crate::values::FrozenHeapName;
 use crate::values::FrozenValueTyped;
@@ -210,6 +212,41 @@ starlark_simple_value!(SimpleData);
 #[starlark_value(type = "SimpleData")]
 impl<'v> StarlarkValue<'v> for SimpleData {
     type Canonical = Self;
+}
+
+/// A value that cannot be paged, as a heap holding one must say so without panicking.
+#[derive(
+    Debug,
+    Display,
+    Allocative,
+    ProvidesStaticType,
+    NoSerialize,
+    StarlarkPagableUnsupported
+)]
+#[display("Unpagable")]
+struct Unpagable;
+
+starlark_simple_value!(Unpagable);
+
+#[starlark_value(type = "Unpagable")]
+impl<'v> StarlarkValue<'v> for Unpagable {
+    type Canonical = Self;
+}
+
+#[test]
+fn unsupported_value_fails_page_out_instead_of_panicking() {
+    let owned: OwnedFrozen<Value> =
+        OwnedFrozen::build(TestHeapName::heap_name("test_unpagable"), |heap| {
+            heap.alloc_simple(Unpagable)
+        });
+    let mut ser = pagable::testing::TestingSerializer::new();
+    let error = owned
+        .pagable_serialize(&mut ser)
+        .expect_err("a heap holding an unpagable value fails to page out");
+    assert!(
+        format!("{error:#}").contains("`Unpagable` cannot be paged out"),
+        "{error:#}"
+    );
 }
 
 /// Round-trip an `OwnedFrozen` through the testing serializer. Returns the restored value.
@@ -1057,18 +1094,18 @@ fn test_deser_state_retained_bytes_tracks_cached_heap_memory() -> crate::Result<
         "a cached deserialized heap should retain its deserialization state",
     );
 
-    drop(restored);
-    assert_eq!(
-        starlark_deserialization_state_retained_bytes(&handle),
-        retained_bytes,
-        "the deserialized Arc cache should keep the heap state alive",
-    );
-
-    let _restored_again = deser_owned_frozen_from_storage(&backing, &handle, &root_key)?;
+    let restored_again = deser_owned_frozen_from_storage(&backing, &handle, &root_key)?;
     assert_eq!(
         starlark_deserialization_state_retained_bytes(&handle),
         retained_bytes,
         "reusing the cached heap must not duplicate its deserialization state",
+    );
+
+    drop((restored, restored_again));
+    assert_eq!(
+        starlark_deserialization_state_retained_bytes(&handle),
+        0,
+        "the deserialized Arc cache must not keep a dropped heap alive",
     );
     Ok(())
 }
@@ -1821,6 +1858,118 @@ fn test_frozen_record_type_round_trip() -> crate::Result<()> {
     assert!(
         Arc::ptr_eq(data_a, data_b),
         "pagable Arc dedup should round-trip the shared Arc<TyRecordData> as a single allocation",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_frozen_record_round_trip() -> crate::Result<()> {
+    use std::sync::Arc;
+
+    use starlark_map::small_map::SmallMap;
+
+    use crate::eval::ParametersSpec;
+    use crate::eval::ParametersSpecParam;
+    use crate::typing::Ty;
+    use crate::values::layout::avalue::TrailingValues;
+    use crate::values::record::Record;
+    use crate::values::record::field::Field;
+    use crate::values::record::record_type::FrozenRecordType;
+    use crate::values::record::record_type::RecordVariantFrozen;
+    use crate::values::record::ty_record_type::TyRecordData;
+    use crate::values::types::type_instance_id::TypeInstanceId;
+    use crate::values::typing::type_compiled::compiled::TypeCompiled;
+
+    let heap = ErasingHeap::new();
+
+    let id = TypeInstanceId::for_test(&"frozen_record_instance_type");
+    let record_type_fv = heap.with(|heap| {
+        let mut fields: SmallMap<String, Field> = SmallMap::new();
+        for name in ["x", "y"] {
+            fields.insert(
+                name.to_owned(),
+                Field {
+                    typ: TypeCompiled::any(),
+                    default: None,
+                },
+            );
+        }
+        erase(
+            heap.alloc_simple(FrozenRecordType {
+                id,
+                ty_record_data: RecordVariantFrozen {
+                    ty: Some(Arc::new(TyRecordData {
+                        name: "Point".to_owned(),
+                        ty_record: Ty::any(),
+                        ty_record_type: Ty::any(),
+                        parameter_spec_prototype: ParametersSpec::<()>::new_named_only(
+                            "Point",
+                            [
+                                ("x", ParametersSpecParam::Required),
+                                ("y", ParametersSpecParam::Required),
+                            ],
+                        )
+                        .prototype(),
+                    })),
+                },
+                fields,
+            }),
+        )
+    });
+    let x = heap.alloc_simple(SimpleData {
+        flag: true,
+        count: 7,
+    });
+    let y = heap.alloc_str("seven");
+    // Two instances of one type, so the type must round-trip as a single value.
+    let (first, second) = heap.with(|heap| {
+        let typ = ErasingHeap::restore_one(heap, record_type_fv);
+        let values = ErasingHeap::restore(heap, &[x, y]);
+        (
+            erase(heap.alloc_record(typ, &values)),
+            erase(heap.alloc_record(typ, &values[..1].repeat(2))),
+        )
+    });
+    let root = heap.alloc_tuple(&[first, second]);
+
+    let heap_ref = heap.into_ref_named(TestHeapName::heap_name("test_frozen_record"));
+    // SAFETY: heap_ref owns the arena hosting root.
+    let owned = unsafe { OwnedFrozen::from_erased(heap_ref, root) };
+    let restored = round_trip_owned_pagable_ser_de_impl(owned)?;
+
+    let tuple: &crate::values::types::tuple::value::Tuple = restored
+        .as_ref()
+        .value()
+        .downcast_ref::<crate::values::types::tuple::value::Tuple>()
+        .unwrap();
+    let content = tuple.content();
+    let first = Record::from_value(content[0]).expect("first element is a record");
+    let second = Record::from_value(content[1]).expect("second element is a record");
+
+    assert_eq!(first.record_type_id(), id);
+    assert!(
+        first.typ.ptr_eq(second.typ),
+        "both instances should share the single restored record type"
+    );
+    let typ: &FrozenRecordType = first.typ.downcast_ref::<FrozenRecordType>().unwrap();
+    assert_eq!(
+        typ.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["x", "y"]
+    );
+
+    assert_eq!(first.content().len(), 2);
+    let first_x: &SimpleData = first.content()[0].downcast_ref::<SimpleData>().unwrap();
+    assert_eq!(first_x.count, 7);
+    assert_eq!(first.content()[1].unpack_str(), Some("seven"));
+
+    let fields: Vec<(&str, Value)> = second.iter().collect();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].0, "x");
+    assert_eq!(fields[1].0, "y");
+    assert!(
+        fields[0].1.ptr_eq(fields[1].1),
+        "a value stored twice in one record should round-trip as one allocation"
     );
 
     Ok(())
@@ -3945,6 +4094,296 @@ fn test_unread_dependency_is_bound_but_not_read() -> crate::Result<()> {
     Ok(())
 }
 
+#[derive(
+    Debug,
+    ProvidesStaticType,
+    Allocative,
+    starlark_derive::StarlarkPagable
+)]
+struct DeferredRef<'v> {
+    target: Deferred<Value<'v>>,
+}
+
+crate::register_starlark_any_complex!(frozen DeferredRef<'_>);
+
+/// Storage whose rows can be made unreadable one key at a time.
+#[cfg(fbcode_build)]
+struct FailingRowStorage {
+    inner: Arc<dyn pagable::storage::traits::PagableStorage>,
+    unreadable: std::sync::Mutex<Vec<pagable::DataKey>>,
+}
+
+#[cfg(fbcode_build)]
+impl FailingRowStorage {
+    fn check(&self, key: &pagable::DataKey) -> anyhow::Result<()> {
+        if self.unreadable.lock().unwrap().contains(key) {
+            return Err(anyhow::anyhow!("row {key:?} is unreadable"));
+        }
+        Ok(())
+    }
+}
+
+// Written out by hand because `async_trait` is not a dependency of this crate.
+#[cfg(fbcode_build)]
+impl pagable::storage::traits::PagableStorage for FailingRowStorage {
+    fn arc_cache(&self) -> &pagable::storage::traits::DeserializedArcCache {
+        self.inner.arc_cache()
+    }
+
+    fn fetch_data_blocking(
+        &self,
+        key: &pagable::DataKey,
+    ) -> anyhow::Result<Arc<pagable::storage::data::PagableData>> {
+        self.check(key)?;
+        self.inner.fetch_data_blocking(key)
+    }
+
+    fn fetch_data<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        key: &'life1 pagable::DataKey,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<Arc<pagable::storage::data::PagableData>>,
+                > + Send
+                + 'async_trait,
+        >,
+    >
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check(key)?;
+            self.inner.fetch_data(key).await
+        })
+    }
+
+    fn schedule_for_paging(&self, arc: Box<dyn pagable::arc_erase::ArcEraseDyn>) {
+        self.inner.schedule_for_paging(arc)
+    }
+
+    fn storage_context(&self) -> &pagable::StorageContext {
+        self.inner.storage_context()
+    }
+
+    fn store_data_ticketed(
+        &self,
+        data: pagable::storage::data::PagableData,
+    ) -> anyhow::Result<(pagable::DataKey, pagable::storage::traits::WriteTicket)> {
+        self.inner.store_data_ticketed(data)
+    }
+
+    fn commit_frontier(&self) -> pagable::storage::traits::CommitFrontier {
+        self.inner.commit_frontier()
+    }
+
+    fn discard_unwritten(&self) {
+        self.inner.discard_unwritten()
+    }
+}
+
+#[cfg(fbcode_build)]
+#[test]
+fn heap_indexed_under_two_keys_is_reported_once() {
+    use pagable::DataKey;
+    use pagable::traits::StorageContext;
+
+    use crate::pagable::heap_ref_id::HeapRefId;
+    use crate::values::FrozenHeapName;
+    use crate::values::layout::heap::sealed::heap_key_index::StarlarkHeapKeyIndex;
+    use crate::values::layout::heap::sealed::heap_key_index::take_heap_rekeys;
+
+    let context = StorageContext::new();
+    let index = context.get_or_init(StarlarkHeapKeyIndex::default);
+    let heap_id = HeapRefId::from_heap_name(&FrozenHeapName::user("rekeyed"));
+    index.insert(heap_id, DataKey::testing_new(1));
+    index.insert(heap_id, DataKey::testing_new(1));
+    assert_eq!(take_heap_rekeys(&context), 0, "the same key is not a rekey");
+    index.insert(heap_id, DataKey::testing_new(2));
+    assert_eq!(take_heap_rekeys(&context), 1);
+    assert_eq!(take_heap_rekeys(&context), 0, "each rekey is counted once");
+}
+
+#[cfg(fbcode_build)]
+#[test]
+fn test_unreadable_dependency_heap_is_recorded_as_a_deferred_read_failure() -> crate::Result<()> {
+    use std::sync::Mutex;
+
+    use pagable::DeferredReadFailures;
+    use pagable::storage::handle::PagableStorageHandle;
+    use pagable::storage::in_memory::InMemoryPagableStorage;
+
+    use crate::pagable::DeferredFieldReadsEnabled;
+
+    let dep = ErasingHeap::new();
+    let target = dep.alloc_str("in the dependency");
+    let dep_ref = dep.into_ref_named(TestHeapName::heap_name("unreadable_dep"));
+
+    let owner = ErasingHeap::new();
+    owner.add_reference(dep_ref.owner());
+    let root_fv = owner.with(|heap| {
+        erase(heap.alloc_simple(StarlarkAnyComplex {
+            value: DeferredRef {
+                target: Deferred::new(ErasingHeap::restore_one(heap, target)),
+            },
+        }))
+    });
+    let owner_ref = owner.into_ref_named(TestHeapName::heap_name("unreadable_owner"));
+    // SAFETY: `owner_ref` owns the arena hosting `root_fv`.
+    let ofv: OwnedFrozen<Value> = unsafe { OwnedFrozen::from_erased(owner_ref, root_fv) };
+
+    let backing = InMemoryPagableStorage::new();
+    let failing = Arc::new(FailingRowStorage {
+        inner: backing.handle(),
+        unreadable: Mutex::new(Vec::new()),
+    });
+    let handle = PagableStorageHandle::new(failing.clone());
+    handle
+        .storage_context()
+        .get_or_init(|| DeferredFieldReadsEnabled);
+    let failures = handle
+        .storage_context()
+        .get_or_init(DeferredReadFailures::default);
+    let key = ser_owned_frozen_value_into_storage(&backing, &ofv)?;
+    drop(ofv);
+    drop(dep_ref);
+
+    let restored = deser_owned_frozen_from_storage(&backing, &handle, &key)?;
+    let fields = restored
+        .as_ref()
+        .value()
+        .downcast_ref::<StarlarkAnyComplex<DeferredRef>>()
+        .expect("the restored root is a DeferredRef");
+    assert!(
+        fields.value.target.peek().is_none(),
+        "the pointer into the dependency is deferred"
+    );
+    let dep = restored
+        .owner()
+        .refs()
+        .next()
+        .expect("the owner retains its dependency");
+    assert!(
+        !dep.heap_arc().is_header_loaded(),
+        "the dependency is a skeleton"
+    );
+    let dep_row = dep
+        .heap_arc()
+        .deser_state()
+        .and_then(|state| state.source())
+        .expect("a skeleton knows its row");
+    assert!(
+        failures.snapshot().is_empty(),
+        "the eager page-in records nothing"
+    );
+
+    failing.unreadable.lock().unwrap().push(dep_row);
+    let error = fields
+        .value
+        .target
+        .read()
+        .expect_err("a dependency whose row is unreadable cannot be read");
+    let failures = failures.snapshot();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with("heap `TestHeapName(unreadable_owner)`: "),
+        "the failure names the heap owning the field: {failures:?} ({error:#})"
+    );
+    assert!(
+        fields.value.target.peek().is_none(),
+        "the field stays unread"
+    );
+    Ok(())
+}
+
+#[cfg(fbcode_build)]
+#[test]
+fn test_prefetch_many_resolves_fields_without_a_later_storage_read() -> crate::Result<()> {
+    use std::sync::Mutex;
+
+    use pagable::storage::handle::PagableStorageHandle;
+    use pagable::storage::in_memory::InMemoryPagableStorage;
+
+    use crate::pagable::DeferredFieldReadsEnabled;
+
+    // `prefetch_many` resolves on the current multi-thread runtime's blocking pool.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("test runtime");
+    let _runtime = runtime.enter();
+
+    let dep = ErasingHeap::new();
+    let target = dep.alloc_str("in the dependency");
+    let dep_ref = dep.into_ref_named(TestHeapName::heap_name("prefetched_dep"));
+
+    let owner = ErasingHeap::new();
+    owner.add_reference(dep_ref.owner());
+    let root_fv = owner.with(|heap| {
+        erase(heap.alloc_simple(StarlarkAnyComplex {
+            value: DeferredRef {
+                target: Deferred::new(ErasingHeap::restore_one(heap, target)),
+            },
+        }))
+    });
+    let owner_ref = owner.into_ref_named(TestHeapName::heap_name("prefetched_owner"));
+    // SAFETY: `owner_ref` owns the arena hosting `root_fv`.
+    let ofv: OwnedFrozen<Value> = unsafe { OwnedFrozen::from_erased(owner_ref, root_fv) };
+
+    let backing = InMemoryPagableStorage::new();
+    let failing = Arc::new(FailingRowStorage {
+        inner: backing.handle(),
+        unreadable: Mutex::new(Vec::new()),
+    });
+    let handle = PagableStorageHandle::new(failing.clone());
+    handle
+        .storage_context()
+        .get_or_init(|| DeferredFieldReadsEnabled);
+    let key = ser_owned_frozen_value_into_storage(&backing, &ofv)?;
+    drop(ofv);
+    drop(dep_ref);
+
+    let restored = deser_owned_frozen_from_storage(&backing, &handle, &key)?;
+    let fields = restored
+        .as_ref()
+        .value()
+        .downcast_ref::<StarlarkAnyComplex<DeferredRef>>()
+        .expect("the restored root is a DeferredRef");
+    let dep = restored
+        .owner()
+        .refs()
+        .next()
+        .expect("the owner retains its dependency");
+    assert!(
+        !dep.heap_arc().is_header_loaded(),
+        "the dependency starts as a skeleton"
+    );
+    let dep_row = dep
+        .heap_arc()
+        .deser_state()
+        .and_then(|state| state.source())
+        .expect("a skeleton knows its row");
+
+    Deferred::prefetch_many([&fields.value.target])?;
+    assert!(
+        dep.heap_arc().is_header_loaded(),
+        "the prefetch loaded the dependency heap"
+    );
+    assert!(
+        fields.value.target.peek().is_some(),
+        "the prefetch resolved the field"
+    );
+
+    // With its row now unreadable, the read can only succeed because the
+    // field is already resident.
+    failing.unreadable.lock().unwrap().push(dep_row);
+    let value = fields.value.target.read()?;
+    assert_eq!(value.unpack_str(), Some("in the dependency"));
+    Ok(())
+}
+
 /// Three heaps where A lists only B, B lists G, and A's root points straight
 /// into G; paged out into a fresh storage with the rows of all three indexed.
 fn page_out_indirect_graph(
@@ -4309,7 +4748,7 @@ fn deser_owned_frozen_value_with_scope_from_storage(
     let value =
         <OwnedFrozen<Value>>::pagable_deserialize(&mut de).map_err(crate::Error::new_other)?;
     let scope = de
-        .page_in_scope()
+        .storage_context()
         .get::<StarlarkDeserScope>()
         .expect("OwnedFrozen page-in should initialize a Starlark scope");
     Ok((value, scope))
@@ -4449,11 +4888,11 @@ fn same_name_heaps_serialize_independently_in_shared_session_impl() -> crate::Re
     Ok(())
 }
 
-/// A cached owner heap must bring its transitive heap graph into each new
-/// page-in scope, because an `OwnedFrozen` may point into one of those
-/// dependency heaps rather than the owner heap itself.
+/// A cached owner heap must bring its transitive heap graph into each root
+/// page-in that reuses it, because an `OwnedFrozen` may point into one of
+/// those dependency heaps rather than the owner heap itself.
 #[test]
-fn test_cached_owner_registers_transitive_heap_in_new_page_in_scope() -> crate::Result<()> {
+fn test_cached_owner_registers_transitive_heap_in_later_page_in() -> crate::Result<()> {
     use pagable::storage::handle::PagableStorageHandle;
     use pagable::storage::in_memory::InMemoryPagableStorage;
 
@@ -4490,9 +4929,8 @@ fn test_cached_owner_registers_transitive_heap_in_new_page_in_scope() -> crate::
         42,
     );
 
-    // The second root page-in has a fresh StarlarkDeserScope but reuses cached
-    // P. It must register P -> L in that scope before resolving the value's
-    // `(HeapRefId(L), value_index)` wire pointer.
+    // The second root page-in reuses cached P. It must register P -> L before
+    // resolving the value's `(HeapRefId(L), value_index)` wire pointer.
     let (second, second_scope) =
         deser_owned_frozen_value_with_scope_from_storage(&backing, &handle, &root_key)?;
     assert_eq!(
@@ -4512,7 +4950,7 @@ fn test_cached_owner_registers_transitive_heap_in_new_page_in_scope() -> crate::
     assert_eq!(
         second_scope.get_heap(&leaf_id).as_ref(),
         Some(second_leaf_ref.heap_arc()),
-        "the cache hit must bind transitive heap L in the second root scope",
+        "the cache hit must bind transitive heap L for the second root",
     );
     assert_eq!(
         second

@@ -202,15 +202,15 @@ pub enum TestProviderKind {
 pub fn test_provider_of_kind<'v>(
     providers: &ProviderCollection<'v>,
     kind: TestProviderKind,
-) -> Option<&'v dyn TestProvider<'v>> {
-    match kind {
+) -> buck2_error::Result<Option<&'v dyn TestProvider<'v>>> {
+    Ok(match kind {
         TestProviderKind::Internal => providers
-            .builtin_provider::<InternalRunnerTestInfo>()
+            .builtin_provider::<InternalRunnerTestInfo>()?
             .map(|provider| provider.as_ref() as &dyn TestProvider),
         TestProviderKind::External => providers
-            .builtin_provider::<ExternalRunnerTestInfo>()
+            .builtin_provider::<ExternalRunnerTestInfo>()?
             .map(|provider| provider.as_ref() as &dyn TestProvider),
-    }
+    })
 }
 
 /// The test provider a build that runs no test uses for a target's test artifacts. A test run
@@ -219,15 +219,15 @@ pub fn test_provider_of_kind<'v>(
 /// `InternalRunnerTestInfo`, and builds that provider's artifacts.
 pub fn test_provider_from_collection<'v>(
     providers: &ProviderCollection<'v>,
-) -> Option<&'v dyn TestProvider<'v>> {
+) -> buck2_error::Result<Option<&'v dyn TestProvider<'v>>> {
     // Check for InternalRunnerTestInfo first
-    if let Some(provider) = providers.builtin_provider::<InternalRunnerTestInfo>() {
-        return Some(provider.as_ref());
+    if let Some(provider) = providers.builtin_provider::<InternalRunnerTestInfo>()? {
+        return Ok(Some(provider.as_ref()));
     }
 
-    if let Some(provider) = providers.builtin_provider::<ExternalRunnerTestInfo>() {
-        return Some(provider.as_ref());
+    if let Some(provider) = providers.builtin_provider::<ExternalRunnerTestInfo>()? {
+        return Ok(Some(provider.as_ref()));
     }
 
-    None
+    Ok(None)
 }

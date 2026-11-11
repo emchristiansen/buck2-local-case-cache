@@ -19,7 +19,6 @@ package com.facebook
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
-import org.jetbrains.kotlin.backend.jvm.JvmIrDeserializerImpl
 import org.jetbrains.kotlin.cli.common.config.KotlinSourceRoot
 import org.jetbrains.kotlin.cli.common.config.kotlinSourceRoots
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
@@ -28,8 +27,6 @@ import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.compiler.VfsBasedProjectEnvironment
-import org.jetbrains.kotlin.cli.jvm.compiler.createContextForIncrementalCompilation
-import org.jetbrains.kotlin.cli.jvm.compiler.report
 import org.jetbrains.kotlin.cli.jvm.config.jvmClasspathRoots
 import org.jetbrains.kotlin.com.intellij.openapi.diagnostic.Logger
 import org.jetbrains.kotlin.com.intellij.openapi.project.Project
@@ -50,7 +47,6 @@ import org.jetbrains.kotlin.extensions.CompilerConfigurationExtension
 import org.jetbrains.kotlin.extensions.PreprocessedFileCreator
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.FirSession
-import org.jetbrains.kotlin.fir.backend.jvm.JvmFir2IrExtensions
 import org.jetbrains.kotlin.fir.declarations.FirConstructor
 import org.jetbrains.kotlin.fir.declarations.FirEnumEntry
 import org.jetbrains.kotlin.fir.declarations.FirRegularClass
@@ -101,8 +97,6 @@ import org.jetbrains.kotlin.psi.KtAnnotationEntry
 import org.jetbrains.kotlin.psi.KtClass
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtTreeVisitorVoid
-import org.jetbrains.kotlin.resolve.multiplatform.hmppModuleName
-import org.jetbrains.kotlin.resolve.multiplatform.isCommonSource
 import org.jetbrains.kotlin.types.ConstantValueKind
 
 @SuppressWarnings("PackageLocationMismatch")
@@ -156,6 +150,9 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
           sourceFiles,
           module,
       )
+
+      // Decide before any FIR cleanup below rewrites declarations.
+      pipeline.inlineBodies.decide(analysisResults, sourceFiles, messageCollector)
 
       // Collect class usage from the resolved FIR tree for dep file tracking.
       // The DependencyTracker compiler plugin's FIR checkers don't run in kosabi's
@@ -303,11 +300,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
           // since an error type always indicates something is unresolvable.
           try {
             val classId = type.lookupTag.classId
-            if (
-                !classId.isLocal &&
-                    !classId.packageFqName.asString().startsWith("kotlin") &&
-                    !classId.packageFqName.asString().startsWith("java")
-            ) {
+            if (!classId.isLocal && !isStdlibOrJdkPackage(classId.packageFqName.asString())) {
               missingTypes.add(classId)
             }
           } catch (_: Exception) {
@@ -323,10 +316,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
           checkedClasses.add(classId)
 
           // Skip standard library classes - they're always available
-          if (
-              classId.packageFqName.asString().startsWith("kotlin") ||
-                  classId.packageFqName.asString().startsWith("java")
-          ) {
+          if (isStdlibOrJdkPackage(classId.packageFqName.asString())) {
             return
           }
 
@@ -466,10 +456,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         val coneType =
             (superTypeRef as? FirResolvedTypeRef)?.coneType as? ConeClassLikeType ?: continue
         val superClassId = coneType.lookupTag.classId
-        if (
-            superClassId.packageFqName.asString().startsWith("kotlin") ||
-                superClassId.packageFqName.asString().startsWith("java")
-        ) {
+        if (isStdlibOrJdkPackage(superClassId.packageFqName.asString())) {
           continue
         }
         val superSymbol =
@@ -513,7 +500,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
       sourceFiles: List<KtFile>,
       project: Project,
   ): ModuleCompilerIrBackendInputCompat {
-    val extensions = JvmFir2IrExtensions(configuration, JvmIrDeserializerImpl())
+    val extensions = createJvmFir2IrExtensionsCompat(configuration)
     val composeAbiEnabled =
         configuration.get(K2JvmAbiConfigurationKeys.ENABLE_COMPOSE_ABI_EMULATION) == true
     val allIrExtensions = buildList {
@@ -523,6 +510,10 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         add(pipeline.composeAbi.createExtension())
       }
       add(ParcelizeAbiEmulationExtension())
+      // Restores kept inline bodies before the sanitizer, which leaves exactly those bodies alone.
+      if (pipeline.inlineBodies.keptFirFunctions.isNotEmpty()) {
+        add(pipeline.inlineBodies.createExtension(configuration.messageCollector))
+      }
       add(pipeline.irSanitizer.createExtension(sourceFiles))
     }
 
@@ -578,7 +569,18 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
     pipeline.firMetadataSanitizer.cleanupFirMetadataSources(irInput.irModuleFragment, firSession)
 
     // Phase 4: Code generation
-    val result = generateCodeFromIrCompat(irInput, compilerEnvironment)
+    val keptInlineBodies = pipeline.inlineBodies.restoredIrFunctions
+    val result =
+        if (keptInlineBodies.isEmpty()) {
+          generateCodeFromIrCompat(irInput, compilerEnvironment)
+        } else {
+          generateCodeFromIrWithInlineBodiesCompat(
+              irInput,
+              compilerEnvironment,
+              keptInlineBodies,
+              messageCollector,
+          )
+        }
 
     // Write bytecode from generationState.factory to disk.
     // Apply bytecode post-processing (strip @Throws annotations and private metadata)
@@ -720,7 +722,7 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
     fun ensurePluginsConfigured() {
       if (!pluginsConfigured) {
         for (extension in CompilerConfigurationExtension.getInstances(project)) {
-          extension.updateFileRegistry()
+          extension.updateFileRegistryCompat(project)
         }
         pluginsConfigured = true
       }
@@ -740,14 +742,18 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
               )
         }
 
-        configuration.report(CompilerMessageSeverity.ERROR, message, reportLocation)
+        configuration.messageCollector.report(
+            CompilerMessageSeverity.ERROR,
+            message,
+            reportLocation,
+        )
         continue
       }
 
       if (!vFile.isDirectory && vFile.extension != KotlinFileType.EXTENSION) {
         ensurePluginsConfigured()
         if (vFile.fileType != KotlinFileType.INSTANCE) {
-          configuration.report(
+          configuration.messageCollector.report(
               CompilerMessageSeverity.ERROR,
               "Source entry is not a Kotlin file: $sourceRootPath",
               reportLocation,
@@ -795,9 +801,9 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         moduleName ->
       psiManager.findFile(virtualFile)?.let {
         if (it is KtFile) {
-          it.isCommonSource = isCommon
+          it.isCommonSourceCompat = isCommon
           if (moduleName != null) {
-            it.hmppModuleName = moduleName
+            it.hmppModuleNameCompat = moduleName
           }
           result.add(it)
         }
@@ -1080,14 +1086,12 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
     // - Package: androidx, Class: annotation (unlikely)
     // - Package: androidx.annotation, Class: VisibleForTesting (likely exists!)
     // - Package: androidx.annotation.VisibleForTesting, Class: Companion (won't exist as top-level)
-    for (splitPoint in 1 until segments.size) {
+    // Split 0 (root package + full nested path) finds root-packaged nested classes, and
+    // no split is skipped for source packages: the dependencies provider cannot see
+    // sources, so a hit always means the constant resolves from dependencies.
+    for (splitPoint in segments.size - 1 downTo 0) {
       val packageFqName = FqName.fromSegments(segments.take(splitPoint).map { it.asString() })
       val classNameParts = segments.drop(splitPoint)
-
-      // Skip if this is from a package being compiled
-      if (packageFqName in sourcePackages) {
-        continue
-      }
 
       // Build the ClassId - for nested classes like VisibleForTesting.Companion,
       // we need to use the proper nested class syntax
@@ -1288,14 +1292,12 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
         projectEnvironment.getSearchScopeByPsiFiles(ktFiles) +
             projectEnvironment.getSearchScopeForProjectJavaSources()
 
-    var librariesScope = projectEnvironment.getSearchScopeForProjectLibraries()
-
-    val providerAndScopeForIncrementalCompilation =
-        createContextForIncrementalCompilation(projectEnvironment, configuration, sourceScope)
-
-    providerAndScopeForIncrementalCompilation?.precompiledBinariesFileScope?.let {
-      librariesScope -= it
-    }
+    val (librariesScope, providerAndScopeForIncrementalCompilation) =
+        prepareLibrariesScopeAndIncrementalContextCompat(
+            projectEnvironment,
+            configuration,
+            sourceScope,
+        )
     val sessionsWithSources = prepareJvmSessionsCompat(
         ktFiles,
         rootModuleName,
@@ -1328,16 +1330,11 @@ class K2JvmAbiFirAnalysisHandlerExtension(private val outputPath: String) :
     if (state.fabricatedConstants.isEmpty()) return
     pipeline.repairLog.fabricatedConstants.addAll(state.fabricatedConstants)
 
-    val policy =
-        AbiRepairPolicy.parse(configuration.get(K2JvmAbiConfigurationKeys.ABI_VALIDATION_MODE))
-    if (policy == AbiRepairPolicy.OFF) return
-
-    val severity =
-        if (policy == AbiRepairPolicy.ERROR) CompilerMessageSeverity.ERROR
-        else CompilerMessageSeverity.WARNING
+    // A fabricated constant is never correct under any policy: the placeholder cannot match the
+    // real declaration, so this runs unconditionally rather than behind `abiValidationMode`.
     for (constant in state.fabricatedConstants) {
       configuration.messageCollector.report(
-          severity,
+          CompilerMessageSeverity.ERROR,
           "Kosabi source-only ABI: the value of constant `${constant.classId}.${constant.name}` " +
               "is not available, because no target on the source-only ABI classpath declares it. " +
               "A placeholder of type `${constant.emittedType}` " +

@@ -86,16 +86,16 @@ public class KotlinExtraParamsSerializer {
         Optional.of(kotlinExtraParams.getIncrementalStateDir())
             .filter(s -> !s.isEmpty())
             .map(AbsPathSerializer::deserialize),
-        kotlinExtraParams.getShouldKsp2RunIncrementally(),
         kotlinExtraParams.getLanguageVersion(),
         (kotlinExtraParams.getShouldKotlincRunIncrementally()
-                    || kotlinExtraParams.getShouldKsp2RunIncrementally()
                 ? AbsPathSerializer.deserialize(kotlinExtraParams.getIncrementalStateDir())
                 : scratchDir.get().toAbsolutePath())
             .resolve("__kotlin_classes__"),
         Optional.of(kotlinExtraParams.getJavaBinary()).filter(s -> !s.isEmpty()),
         kotlinExtraParams.getApplicabilityClasspathList().stream()
             .map(AbsPathSerializer::deserialize)
-            .collect(ImmutableList.toImmutableList()));
+            .collect(ImmutableList.toImmutableList()),
+        kotlinExtraParams.getShouldKosabiUseShallowClassUsage(),
+        kotlinExtraParams.getKosabiAbiValidationMode());
   }
 }

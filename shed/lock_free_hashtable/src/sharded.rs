@@ -38,12 +38,20 @@ impl<T: AtomicValue, const SHARDS: usize> Default for ShardedLockFreeRawTable<T,
 }
 
 impl<T: AtomicValue, const SHARDS: usize> ShardedLockFreeRawTable<T, SHARDS> {
-    const _ASSERTIONS: () = assert!(SHARDS.is_power_of_two());
+    /// Checked when a table is created: a shard count that is not a power of two (zero
+    /// included) does not compile.
+    ///
+    /// ```compile_fail
+    /// let _ = lock_free_hashtable::sharded::ShardedLockFreeRawTable::<Box<u32>, 3>::new();
+    /// ```
+    const ASSERTIONS: () = assert!(SHARDS.is_power_of_two());
 
     const SHARD_BITS: usize = SHARDS.trailing_zeros() as usize;
 
     /// Create a new empty hashtable.
     pub const fn new() -> ShardedLockFreeRawTable<T, SHARDS> {
+        let () = Self::ASSERTIONS;
+
         struct Empty<A>(marker::PhantomData<A>);
         impl<A: AtomicValue> Empty<A> {
             #[allow(clippy::declare_interior_mutable_const)]
@@ -58,7 +66,11 @@ impl<T: AtomicValue, const SHARDS: usize> ShardedLockFreeRawTable<T, SHARDS> {
     #[inline]
     fn table_for_hash(&self, hash: u64) -> &LockFreeRawTable<T> {
         // `LockFreeRawTable` uses low bits of hash, so we use high bits to select a shard.
-        let shard_index = (hash >> (64 - Self::SHARD_BITS)) as usize;
+        let shard_index = if Self::SHARD_BITS == 0 {
+            0
+        } else {
+            (hash >> (64 - Self::SHARD_BITS)) as usize
+        };
         &self.shards[shard_index].0
     }
 
@@ -194,6 +206,17 @@ mod tests {
             align_of::<CachePaddedLockFreeRawTable<Box<u32>>>(),
             "shard headers must not share effective cache lines",
         );
+    }
+
+    /// With a single shard every hash selects shard 0.
+    #[test]
+    fn test_one_shard() {
+        let table = ShardedLockFreeRawTable::<Box<u32>, 1>::new();
+        for (hash, value) in [(0, 1), (1, 2), (u64::MAX, 3)] {
+            table.insert(hash, Box::new(value), |a, b| a == b, |_| hash);
+            assert_eq!(Some(&value), table.lookup(hash, |v| *v == value));
+        }
+        assert_eq!(3, table.iter().count());
     }
 
     #[test]

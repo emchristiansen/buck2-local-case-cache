@@ -27,6 +27,7 @@ use std::fmt::Formatter;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 
 use bumpalo::Bump;
 use dupe::Dupe;
@@ -41,8 +42,6 @@ use crate::values::OwnedFrozenRef;
 use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::Trace;
-use crate::values::UnpackValue;
-use crate::values::ValueOf;
 use crate::values::ValueOfUnchecked;
 use crate::values::ValueTyped;
 use crate::values::layout::avalue::AValue;
@@ -60,7 +59,6 @@ use crate::values::layout::heap::fast_cell::FastCell;
 use crate::values::layout::heap::frozen::HeapReferences;
 use crate::values::layout::heap::profile::by_type::HeapSummary;
 use crate::values::layout::heap::repr::AValueHeapEntryState;
-use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::layout::value::Value;
 use crate::values::string::intern::interner::StringValueInterner;
 
@@ -197,8 +195,9 @@ impl<'v> Heap<'v> {
         A::StarlarkValue: HeapSendable<'v>,
     {
         let arena = self.0.arena.borrow();
-        let v: &AValueRepr<_> = arena.alloc(x);
-        ValueTyped::new_repr(v)
+        let v = arena.alloc(x);
+        // SAFETY: just allocated in this heap, by the allocation's pointer.
+        unsafe { ValueTyped::new_repr(v) }
     }
 
     pub(in crate::values::layout) fn alloc_raw_extra<A>(
@@ -214,7 +213,8 @@ impl<'v> Heap<'v> {
     {
         let arena = self.0.arena.borrow();
         let (v, extra) = arena.alloc_extra(x);
-        let v = unsafe { ValueTyped::new_repr(&*v) };
+        // SAFETY: just allocated in this heap, by the allocation's pointer.
+        let v = unsafe { ValueTyped::new_repr(NonNull::new_unchecked(v)) };
         (v, extra)
     }
 
@@ -231,7 +231,7 @@ impl<'v> Heap<'v> {
         // However, we promise not to clear the RefCell other than for GC
         // so we can make the `arena` available longer
         unsafe {
-            let value = Value::new_ptr(&*v, true);
+            let value = Value::new_ptr(NonNull::new_unchecked(v), true);
             StringValue::new_unchecked(value)
         }
     }
@@ -250,18 +250,6 @@ impl<'v> Heap<'v> {
     /// Allocate a value and return [`ValueOfUnchecked`] of it.
     pub fn alloc_typed_unchecked<T: AllocValue<'v>>(self, x: T) -> ValueOfUnchecked<'v, T> {
         ValueOfUnchecked::new(self.alloc(x))
-    }
-
-    /// Allocate a value and return [`ValueOf`] of it.
-    pub fn alloc_value_of<T>(self, x: T) -> ValueOf<'v, &'v T>
-    where
-        T: AllocValue<'v>,
-        &'v T: UnpackValue<'v>,
-    {
-        let value = self.alloc(x);
-        ValueOf::unpack_value(value)
-            .unwrap()
-            .expect("just allocate value must be unpackable to the type of value")
     }
 
     pub(crate) unsafe fn visit_arena(
@@ -352,7 +340,8 @@ impl<'v> Heap<'v> {
 /// Used to perform garbage collection by [`Trace::trace`](crate::values::Trace::trace).
 pub struct Tracer<'v> {
     arena: Arena<Bump>,
-    phantom: PhantomData<&'v ()>,
+    // Invariant in the brand, like every carrier of one.
+    phantom: PhantomData<fn(&'v ()) -> &'v ()>,
 }
 
 impl<'v> Tracer<'v> {
@@ -387,7 +376,8 @@ impl<'v> Tracer<'v> {
 
     pub(crate) fn alloc_str(&self, x: &str) -> Value<'v> {
         let v = self.arena.alloc_str(x);
-        unsafe { Value::new_ptr(&*v, true) }
+        // SAFETY: just allocated in this heap, by the allocation's pointer.
+        unsafe { Value::new_ptr(NonNull::new_unchecked(v), true) }
     }
 
     fn adjust(&self, value: Value<'v>) -> Value<'v> {
@@ -400,7 +390,14 @@ impl<'v> Tracer<'v> {
         // Case 2: We have already been replaced with a forwarding, or need to freeze
         match old_val.state() {
             AValueHeapEntryState::Forward(x) => unsafe { x.forward_ptr().unpack_unfrozen_value() },
-            AValueHeapEntryState::Value(v) => unsafe { v.unpack().heap_copy(self) },
+            // SAFETY: just checked to be a live value.
+            AValueHeapEntryState::Value(_) => unsafe {
+                value
+                    .0
+                    .value_header_ptr_unchecked()
+                    .unpack()
+                    .heap_copy(self)
+            },
             AValueHeapEntryState::Reservation(_) => {
                 unreachable!("a heap reservation cannot appear in the source heap")
             }

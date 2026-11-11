@@ -44,7 +44,6 @@ use dupe::Dupe;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::Shared;
-use gazebo::prelude::*;
 use itertools::Either;
 use itertools::Itertools;
 use tokio::sync::oneshot;
@@ -230,6 +229,24 @@ pub(crate) struct AqueryData {
     nodes_cache: DiceAqueryNodesCache,
 }
 
+// SAFETY: `_assert_send_sync` requires every field to be `Send + Sync`. Spelled out
+// so that auto-trait proofs for aquery futures stop here; see `dice::DiceComputations`.
+unsafe impl Send for AqueryData {}
+unsafe impl Sync for AqueryData {}
+
+fn _assert_send_sync(
+    AqueryData {
+        artifact_fs,
+        delegate_query_data,
+        nodes_cache,
+    }: &AqueryData,
+) {
+    fn assert<T: Send + Sync>(_: &T) {}
+    assert(artifact_fs);
+    assert(delegate_query_data);
+    assert(nodes_cache);
+}
+
 /// Resolves inputs one level deep: direct artifacts to their producing actions, tset
 /// projections to their keys (without building the projections' nodes).
 async fn convert_inputs_shallow<
@@ -277,7 +294,10 @@ async fn convert_inputs<
 ) -> buck2_error::Result<Vec<ActionInput>> {
     let (artifacts, projections) = convert_inputs_shallow(ctx, inputs).await?;
 
-    let mut deps = artifacts.into_map(ActionInput::ActionKey);
+    let mut deps = artifacts
+        .into_iter()
+        .map(ActionInput::ActionKey)
+        .collect::<Vec<_>>();
     let projection_deps = ctx
         .try_compute_join(projections, async |ctx, key| {
             get_tset_node(node_cache.dupe(), ctx, key).await

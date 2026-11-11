@@ -11,6 +11,9 @@
 use std::future::Future;
 use std::time::SystemTime;
 
+use buck2_agent_interactive::Advice;
+use buck2_agent_interactive::Decision;
+use buck2_agent_interactive::Invocation;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::TenantIdentity;
 use buck2_cli_proto::client_context::ExitWhen as GrpcExitWhen;
@@ -27,12 +30,15 @@ use buck2_error::BuckErrorContext;
 use buck2_event_observer::verbosity::Verbosity;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
+use buck2_settings::BuckSettings;
+use buck2_settings::ResolvedSettings;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
 use superconsole::Stdin;
 use tokio::runtime::Runtime;
 
 use crate::agent_context::AgentContext;
+use crate::agent_invocation_info::AgentInvocationInfo;
 use crate::client_metadata::ClientMetadata;
 use crate::common::BuckArgMatches;
 use crate::common::CommonEventLogOptions;
@@ -69,7 +75,7 @@ pub struct ClientCommandContext<'a> {
     oncall: Option<String>,
     pub(crate) client_metadata: Vec<ClientMetadata>,
     pub(crate) isolation: FileNameBuf,
-    agent_context: AgentContext,
+    agent_invocation_info: AgentInvocationInfo,
 }
 
 impl<'a> ClientCommandContext<'a> {
@@ -89,7 +95,7 @@ impl<'a> ClientCommandContext<'a> {
         oncall: Option<String>,
         client_metadata: Vec<ClientMetadata>,
         isolation: FileNameBuf,
-        agent_context: AgentContext,
+        agent_invocation_info: AgentInvocationInfo,
     ) -> Self {
         ClientCommandContext {
             init,
@@ -107,7 +113,7 @@ impl<'a> ClientCommandContext<'a> {
             oncall,
             client_metadata,
             isolation,
-            agent_context,
+            agent_invocation_info,
         }
     }
 
@@ -121,7 +127,11 @@ impl<'a> ClientCommandContext<'a> {
     }
 
     pub fn agent_context(&self) -> &AgentContext {
-        &self.agent_context
+        self.agent_invocation_info.agent_context()
+    }
+
+    pub(crate) fn agent_invocation_info(&self) -> &AgentInvocationInfo {
+        &self.agent_invocation_info
     }
 
     pub fn paths(&self) -> buck2_error::Result<&InvocationPaths> {
@@ -139,6 +149,43 @@ impl<'a> ClientCommandContext<'a> {
             InvocationPathsResult::OutsideOfRepo(_) => Ok(None), // commands like log don't need a root but still need to create an invocation record
             InvocationPathsResult::OtherError(e) => Err(e.dupe()),
         }
+    }
+
+    /// Loads settings for the invocation's repository without parsing its build configuration.
+    pub fn buck_settings(&self) -> buck2_error::Result<&BuckSettings> {
+        self.immediate_config
+            .buck_settings(self.paths()?.project_root())
+    }
+
+    /// Like [`buck_settings`](Self::buck_settings), with where each value came from.
+    pub fn resolved_settings(&self) -> buck2_error::Result<ResolvedSettings> {
+        self.immediate_config
+            .resolved_settings(self.paths()?.project_root())
+    }
+
+    /// Evaluates repository-scoped advice without loading build configuration.
+    /// Callers apply the decision only when the guarded operation will actually run.
+    pub fn agent_advice(&self, advice: Advice) -> buck2_error::Result<Decision> {
+        let agent = self.agent_context();
+        if !agent.is_direct_call() || self.maybe_paths()?.is_none() {
+            return Ok(Decision::Inactive);
+        }
+        let settings = &self.buck_settings()?.invocation.agent_interactive;
+        let enabled = match advice {
+            Advice::Killall => settings.killall_enabled(),
+            Advice::Clean => settings.clean_enabled(),
+            Advice::NewIsolationDir => settings.new_isolation_dir_enabled(),
+            // Only the daemon knows its current configuration, so it evaluates this advice.
+            Advice::ConfigChange => return Ok(Decision::Inactive),
+        };
+        Ok(advice.evaluate(
+            &Invocation {
+                enabled,
+                direct_call: agent.is_direct_call(),
+                reason: agent.reason(),
+            },
+            agent.is_advice_acknowledged(advice.id()),
+        ))
     }
 
     pub fn with_runtime<Fut, F>(self, func: F) -> <Fut as Future>::Output
@@ -248,6 +295,7 @@ impl<'a> ClientCommandContext<'a> {
             }
             .into(),
             profile_pattern_opts: starlark_opts.profile_pattern_opts(&self.working_dir),
+            invocation_settings: Some(serde_json::to_string(&self.buck_settings()?.invocation)?),
             ..self.empty_client_context(cmd.logging_name())?
         })
     }
@@ -297,8 +345,9 @@ impl<'a> ClientCommandContext<'a> {
             representative_config_flags: Vec::new(),
             exit_when: Default::default(),
             profile_pattern_opts: None,
-            agent_context: self.agent_context.to_proto(),
+            agent_context: self.agent_context().to_proto(),
             tenant_identity,
+            invocation_settings: None,
         })
     }
 
@@ -313,6 +362,7 @@ impl<'a> ClientCommandContext<'a> {
         Ok(self
             .immediate_config
             .daemon_startup_config()?
+            .startup_options
             .log_download_method
             .clone())
     }

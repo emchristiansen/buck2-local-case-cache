@@ -17,13 +17,13 @@ use buck2_core::cells::cell_root_path::CellRootPath;
 use buck2_error::BuckErrorContext;
 use buck2_fs::paths::RelativePath;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
+use buck2_hash::BuckFixedSortedMap;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use pagable::Pagable;
 use regex::Regex;
-use starlark_map::sorted_map::SortedMap;
 
 use super::cells::ExternalPathBuckconfigData;
 use crate::legacy_configs::args::ResolvedConfigFlag;
@@ -53,6 +53,8 @@ enum ConfigError {
     SectionMissingTrailingBracket(String),
     #[error("Improperly include directive path. Got {0}")]
     BadIncludePath(String),
+    #[error("Detected a cycle in buckconfig includes: `{0}` is already being parsed")]
+    IncludeCycle(String),
     #[error(
         "Couldn't parse line. Expected include directive (`<file:/file.bcfg>`), section(`[some_section]`), or key assignment (`some_key = some_value`). Got `{0}`"
     )]
@@ -76,7 +78,7 @@ struct SectionBuilder {
 impl SectionBuilder {
     fn finish(self) -> LegacyBuckConfigSection {
         LegacyBuckConfigSection {
-            values: SortedMap::from_iter(self.values),
+            values: BuckFixedSortedMap::from_iter(self.values),
         }
     }
 }
@@ -235,10 +237,20 @@ impl<'p> LegacyConfigFileParser<'p> {
     }
 
     fn push_file(&mut self, line: usize, path: &ConfigPath) -> buck2_error::Result<()> {
+        let current_file = self.current_file.dupe().unwrap_or_else(|| panic!("push_file() called without any files on the include stack. top-level files should use start_file()"));
+        let path_string = path.to_string();
+        if current_file.path == path_string
+            || self
+                .include_stack
+                .iter()
+                .any(|included_from| included_from.source_file.path == path_string)
+        {
+            return Err(ConfigError::IncludeCycle(path_string).into());
+        }
         let include_source = ConfigFileLocationWithLine {
-                source_file: self.current_file.dupe().unwrap_or_else(|| panic!("push_file() called without any files on the include stack. top-level files should use start_file()")),
-                line,
-            };
+            source_file: current_file,
+            line,
+        };
 
         self.include_stack.push(include_source.clone());
 
@@ -303,6 +315,10 @@ impl<'p> LegacyConfigFileParser<'p> {
         .boxed()
     }
 
+    fn is_comment_line(line: &str) -> bool {
+        line.starts_with('#') || line.starts_with(';')
+    }
+
     fn strip_line_comment(line: &str) -> &str {
         match line.split_once(" #") {
             Some((before, _)) => before,
@@ -337,9 +353,11 @@ impl<'p> LegacyConfigFileParser<'p> {
             .enumerate()
             // Coalesce escaped newlines.
             .coalesce(|(i, mut prev), (j, next)| {
-                if prev.ends_with('\\') {
+                if prev.ends_with('\\') && !Self::is_comment_line(&prev) {
                     prev.truncate(prev.len() - 1);
-                    prev.push_str(&next);
+                    if !Self::is_comment_line(&next) {
+                        prev.push_str(&next);
+                    }
                     Ok((i, prev))
                 } else {
                     Err(((i, prev), (j, next)))
@@ -348,7 +366,7 @@ impl<'p> LegacyConfigFileParser<'p> {
             // Remove commented lines.
             // This needs to come after the coalesce in case someone has an empty line after an escaped newline
             // Remove empty lines and comment lines (support both '#' and ';' for comment lines)
-            .filter(|(_, l)| !l.is_empty() && !l.starts_with('#') && !l.starts_with(';'));
+            .filter(|(_, l)| !l.is_empty() && !Self::is_comment_line(l));
 
         for (i, line) in lines {
             if let Some(section) = Self::parse_section_marker(&line)? {

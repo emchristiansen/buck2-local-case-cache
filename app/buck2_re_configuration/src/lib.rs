@@ -27,6 +27,10 @@ pub trait RemoteExecutionStaticMetadataImpl: Sized {
     fn cas_semaphore_size(&self) -> usize;
     fn exec_semaphore_size(&self) -> usize;
     fn action_cache_semaphore_size(&self) -> usize;
+    /// How many CAS presence-check RPCs may be in flight at once.
+    fn presence_check_concurrency(&self) -> usize;
+    /// How many digests one CAS presence-check RPC carries at most.
+    fn presence_check_max_batch(&self) -> usize;
 }
 
 #[derive(Clone, Debug, Allocative)]
@@ -102,6 +106,8 @@ mod fbcode {
         // gRPC settings
         pub cas_address: Option<String>,
         pub cas_connection_count: i32,
+        pub presence_check_concurrency: usize,
+        pub presence_check_max_batch: usize,
         pub shared_casd_cache_path: Option<String>,
         pub legacy_shared_casd_mode: Option<String>,
         pub shared_casd_mode_small_files: Option<CASdMode>,
@@ -172,6 +178,23 @@ mod fbcode {
                         property: "cas_connection_count",
                     })?
                     .unwrap_or(16),
+                // Well under the CAS client's own limit on these RPCs (an internal semaphore
+                // of 5000 at the time of writing), and above what a build's uploads had in
+                // flight before buck2 bounded them at all.
+                presence_check_concurrency: legacy_config
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "presence_check_concurrency",
+                    })?
+                    .unwrap_or(10),
+                // The internal CAS client accepts up to 500 per RPC; we see significant
+                // improvements from larger batching
+                presence_check_max_batch: legacy_config
+                    .parse(BuckconfigKeyRef {
+                        section: BUCK2_RE_CLIENT_CFG_SECTION,
+                        property: "presence_check_max_batch",
+                    })?
+                    .unwrap_or(500),
                 shared_casd_cache_path: legacy_config.parse(BuckconfigKeyRef {
                     section: BUCK2_RE_CLIENT_CFG_SECTION,
                     property: "cas_shared_cache",
@@ -372,13 +395,22 @@ mod fbcode {
         }
 
         fn action_cache_semaphore_size(&self) -> usize {
-            // See D116018045 for data showing that scaling this much higher doesn't really matter, and
-            // hurts Max RSS as more state is kept in-flight without actually completing anything faster
-            self.action_cache_semaphore_size.unwrap_or(1000)
+            // See D116018045 for data showing that scaling this much higher doesn't really matter
+            // at data center latency, and hurts Max RSS; on non-dc networks though, somewhat larger
+            // numbers are needed
+            self.action_cache_semaphore_size.unwrap_or(5000)
         }
 
         fn exec_semaphore_size(&self) -> usize {
             self.execution_concurrency_limit as usize
+        }
+
+        fn presence_check_concurrency(&self) -> usize {
+            self.presence_check_concurrency
+        }
+
+        fn presence_check_max_batch(&self) -> usize {
+            self.presence_check_max_batch
         }
     }
 }
@@ -414,6 +446,14 @@ mod not_fbcode {
 
         fn exec_semaphore_size(&self) -> usize {
             self.0.execution_concurrency_limit.unwrap_or(400)
+        }
+
+        fn presence_check_concurrency(&self) -> usize {
+            100
+        }
+
+        fn presence_check_max_batch(&self) -> usize {
+            50
         }
     }
 }
@@ -464,8 +504,7 @@ pub struct Buck2OssReConfiguration {
     /// `FindMissingBlobs` (a.k.a. `GetDigestsTtl`) RPC. Larger values
     /// reduce per-call wall-clock latency by issuing fewer round-trips,
     /// at the cost of bigger requests and more concurrent server load
-    /// when many actions issue independent calls. Recommended to raise
-    /// only in combination with `[buck2] deduplicate_get_digests_ttl_calls`.
+    /// when many actions issue independent calls.
     pub find_missing_blobs_batch_size: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,

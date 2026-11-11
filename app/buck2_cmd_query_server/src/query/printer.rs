@@ -30,7 +30,6 @@ use buck2_util::indent::indent;
 use dupe::Clone_;
 use dupe::Copy_;
 use dupe::Dupe_;
-use gazebo::variants::UnpackVariants;
 use indent_write::fmt::IndentWriter;
 use indent_write::io::IndentWriter as IoIndentWriter;
 use regex::RegexSet;
@@ -47,7 +46,7 @@ use crate::query::QueryCommandError;
 use crate::query::query_target_ext::QueryCommandTarget;
 use crate::query_output_format::QueryOutputFormatInfo;
 
-#[derive(Copy_, Dupe_, Clone_, UnpackVariants)]
+#[derive(Copy_, Dupe_, Clone_)]
 pub(crate) enum ShouldPrintProviders<'a, T> {
     No,
     Yes(&'a dyn ProviderLookUp<T>),
@@ -85,7 +84,7 @@ impl<'a, T: QueryTarget> TargetSetJsonPrinter<'a, T> {
                 .await?,
             is_complex: attributes.is_some()
                 || target_call_stacks
-                || print_providers.unpack_yes().is_some(),
+                || matches!(print_providers, ShouldPrintProviders::Yes(_)),
         })
     }
 }
@@ -135,6 +134,16 @@ impl<T: QueryCommandTarget> Display for PrintableQueryTarget<'_, T> {
     }
 }
 
+/// Serde's error for the attribute walk, which reports an unreadable attribute
+/// through the same channel.
+struct AttrWalkError<E>(E);
+
+impl<E: serde::ser::Error> From<buck2_error::Error> for AttrWalkError<E> {
+    fn from(error: buck2_error::Error) -> Self {
+        AttrWalkError(E::custom(error))
+    }
+}
+
 impl<T: QueryCommandTarget> Serialize for PrintableQueryTarget<'_, T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -165,11 +174,13 @@ impl<T: QueryCommandTarget> Serialize for PrintableQueryTarget<'_, T> {
                             target: self.value,
                             attr: attr_value,
                         },
-                    )?;
+                    )
+                    .map_err(AttrWalkError)?;
                 }
             }
             Ok(())
-        })?;
+        })
+        .map_err(|AttrWalkError(error)| error)?;
 
         if self.target_call_stacks {
             map.serialize_entry("buck.target_call_stack", &self.value.call_stack())?;
@@ -211,7 +222,7 @@ impl Serialize for FileSetJsonPrinter<'_> {
             seq.serialize_element(
                 &self
                     .resolver
-                    .resolve_path(file.as_ref())
+                    .resolve_path(*file)
                     .map_err(serde::ser::Error::custom)?
                     .to_string(),
             )?;
@@ -424,11 +435,7 @@ impl<'a> QueryResultPrinter<'a> {
                 match self.output_format {
                     QueryOutputFormatInfo::Default | QueryOutputFormatInfo::Starlark => {
                         for file in files.iter() {
-                            writeln!(
-                                &mut output,
-                                "{}",
-                                self.resolver.resolve_path(file.as_ref())?
-                            )?;
+                            writeln!(&mut output, "{}", self.resolver.resolve_path(*file)?)?;
                         }
                     }
                     QueryOutputFormatInfo::Json => {

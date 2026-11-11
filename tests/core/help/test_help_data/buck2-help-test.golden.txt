@@ -23,8 +23,9 @@ Options:
       --include <INCLUDE>...
           Labels on targets to include from tests. Prefixing with `!` means to exclude. First match
           wins unless overridden by `always-exclude` flag.
-          If include patterns are present, regardless of whether exclude patterns are present, then
-          all targets are by default excluded unless explicitly included.
+          If any include pattern without a `!` prefix is present, regardless of whether exclude
+          patterns are present, then all targets are by default excluded unless explicitly included.
+          Include patterns that all carry a `!` prefix only exclude.
 
       --always-exclude
           Whether to always exclude if the label appears in `exclude`, regardless of which appears
@@ -116,8 +117,9 @@ Options:
       --streaming-build-report <PATH>
           Stream intermediary build reports to a file in json lines format.
 
-          Each output materialization will trigger a new build report which will be written to the
-          file as a single line json.
+          A line is written each time a requested output is materialized, and each time a requested
+          target or one of its configurations finishes building. Each line carries one target.
+          Entries that have not finished building read `IN_PROGRESS` instead of `SUCCESS`.
 
   -j, --num-threads <THREADS>
           Number of threads to use during execution (default is # cores)
@@ -440,6 +442,6 @@ Universal Options:
 
       --agent-context <AGENT_CONTEXT>
           Agent context key=value pairs for telemetry. Used by AI agents to pass structured
-          metadata. Schema is defined via buckconfig. Entries can be comma-separated or passed as
-          separate flags. Examples: --agent-context intent=fix,attempt=2,prior_error=missing_target
-          --agent-context intent=build --agent-context attempt=1
+          metadata. Schema is defined via buckconfig. Examples: --agent-context
+          intent=fix,attempt=2,prior_error=missing_target --agent-context intent=build
+          --agent-context attempt=1 --agent-context "reason=fix the build, then test"

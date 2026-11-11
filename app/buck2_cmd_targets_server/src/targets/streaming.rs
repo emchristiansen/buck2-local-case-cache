@@ -27,6 +27,7 @@ use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::target::name::TargetName;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::load_module::INTERPRETER_CALCULATION_IMPL;
 use buck2_interpreter::load_module::InterpreterCalculation;
@@ -43,10 +44,8 @@ use dupe::Dupe;
 use futures::Stream;
 use futures::StreamExt;
 use futures::future::FutureExt;
-use gazebo::prelude::VecExt;
 use itertools::Either;
 use itertools::Itertools;
-use starlark_map::small_set::SmallSet;
 use tokio::sync::Semaphore;
 
 use crate::target_hash::TargetHashes;
@@ -108,7 +107,7 @@ pub(crate) async fn targets_streaming(
     fast_hash: Option<bool>, // None = no hashing
     threads: Option<usize>,
 ) -> buck2_error::Result<Stats> {
-    let imported = Arc::new(Mutex::new(SmallSet::new()));
+    let imported = Arc::new(Mutex::new(BuckMutInsertionSet::new()));
     let concurrency = package_concurrency(threads)?;
     let threads = Arc::new(Semaphore::new(concurrency.loads.get()));
 
@@ -155,7 +154,7 @@ pub(crate) async fn targets_streaming(
     formatter.begin(&mut buffer);
     let mut stats = Stats::default();
     let mut needs_separator = false;
-    let mut package_files_seen = SmallSet::new();
+    let mut package_files_seen = BuckMutInsertionSet::new();
     let cell_resolver = dice.ctx().get_cell_resolver().await?;
 
     // Process package results and finally output the result
@@ -215,7 +214,7 @@ pub(crate) async fn targets_streaming(
                     None => match cell_resolver.resolve_path(x.as_cell_path())?.parent() {
                         None => None,
                         Some(parent) => Some(PackageLabel::from_cell_path(
-                            cell_resolver.get_cell_path(parent).as_ref(),
+                            cell_resolver.get_cell_path(parent),
                         )?),
                     },
                 };
@@ -228,7 +227,7 @@ pub(crate) async fn targets_streaming(
     let mut todo = mem::take(&mut *imported.lock().unwrap());
     let mut seen_imported = BuckMutSet::default();
     while let Some(path) = todo.pop() {
-        if seen_imported.insert(path.path().clone()) {
+        if seen_imported.insert(*path.path()) {
             // If these lead to an error, that's surpsing (we had a working module with it loaded)
             // so we should always propagate the error here (even with keep_going)
             if needs_separator {
@@ -274,7 +273,7 @@ impl PreparePackageResult {
         formatter: &dyn TargetFormatter,
         imports_flag: bool,
         fast_hash: Option<bool>,
-        imported: Arc<Mutex<SmallSet<ImportPath>>>,
+        imported: Arc<Mutex<BuckMutInsertionSet<ImportPath>>>,
     ) {
         if let Some(ref err) = error {
             self.record_error(err, formatter);
@@ -338,7 +337,7 @@ async fn process_package(
     imports_flag: bool,
     fast_hash: Option<bool>,
     threads: Arc<Semaphore>,
-    imported: Arc<Mutex<SmallSet<ImportPath>>>,
+    imported: Arc<Mutex<BuckMutInsertionSet<ImportPath>>>,
 ) -> PreparePackageResult {
     let mut result = PreparePackageResult::from_package(package.dupe());
     let targets = {
@@ -451,9 +450,12 @@ async fn load_targets(
                 };
                 Ok((result, targets, err))
             } else {
-                let targets = targets.into_try_map(|(target, TargetPatternExtra)| {
-                    buck2_error::Ok(result.resolve_target(target.as_ref())?.to_owned())
-                })?;
+                let targets = targets
+                    .into_iter()
+                    .map(|(target, TargetPatternExtra)| {
+                        buck2_error::Ok(result.resolve_target(target.as_ref())?.to_owned())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok((result, targets, None))
             }
         }

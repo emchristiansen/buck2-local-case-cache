@@ -17,6 +17,7 @@ use buck2_core::package::PackageLabel;
 use buck2_core::package::package_relative_path::PackageRelativePath;
 use buck2_core::package::source_path::SourcePath;
 use buck2_error::internal_error;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_interpreter::types::opaque_metadata::OpaqueMetadata;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
@@ -31,14 +32,12 @@ use buck2_node::visibility::VisibilityPattern;
 use buck2_node::visibility::VisibilityPatternList;
 use buck2_node::visibility::VisibilitySpecification;
 use buck2_node::visibility::WithinViewSpecification;
-use buck2_util::arc_str::ArcS;
+use buck2_util::arc_str::PackedStr;
 use dupe::Dupe;
-use gazebo::prelude::SliceExt;
 use starlark::values::Heap;
 use starlark::values::Value;
 use starlark::values::list::AllocList;
 use starlark::values::tuple::AllocTuple;
-use starlark_map::small_map::SmallMap;
 
 use crate::attrs::resolve::attr_type::arg::ConfiguredStringWithMacrosExt;
 use crate::attrs::resolve::attr_type::configuration_dep::ConfigurationDepAttrTypeExt;
@@ -54,7 +53,7 @@ use crate::attrs::resolve::ctx::AttrResolutionContext;
 #[buck2(tag = Tier0)]
 enum ConfiguredAttrError {
     #[error("Source path `{0}` cannot be used in attributes referenced in transition")]
-    SourceFileToStarlarkValue(ArcS<PackageRelativePath>),
+    SourceFileToStarlarkValue(PackedStr<PackageRelativePath>),
 }
 
 pub trait ConfiguredAttrExt {
@@ -126,14 +125,14 @@ impl ConfiguredAttrExt for ConfiguredAttr {
                 Ok(ctx.heap().alloc(AllocTuple(values)))
             }
             ConfiguredAttr::Dict(dict) => {
-                let mut res = SmallMap::with_capacity(dict.len());
+                let mut res = BuckMutInsertionMap::with_capacity(dict.len());
                 for (k, v) in dict.iter() {
                     res.insert_hashed(
                         k.resolve_single(pkg, ctx)?.get_hashed()?,
                         v.resolve_single(pkg, ctx)?,
                     );
                 }
-                Ok(ctx.heap().alloc_dict(res))
+                Ok(ctx.heap().alloc(res))
             }
             ConfiguredAttr::None => Ok(Value::new_none()),
             ConfiguredAttr::OneOf(box l, _) => l.resolve_single(pkg, ctx),
@@ -191,14 +190,18 @@ fn configured_attr_to_value<'v>(
         ConfiguredAttr::Bool(v) => heap.alloc(v.0),
         ConfiguredAttr::Int(v) => heap.alloc(*v),
         ConfiguredAttr::String(s) | ConfiguredAttr::EnumVariant(s) => heap.alloc(s.as_str()),
-        ConfiguredAttr::List(list) => {
-            heap.alloc(list.try_map(|v| configured_attr_to_value(v, pkg, heap))?)
-        }
+        ConfiguredAttr::List(list) => heap.alloc(
+            list.iter()
+                .map(|v| configured_attr_to_value(v, pkg, heap))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         ConfiguredAttr::Tuple(v) => heap.alloc(AllocTuple(
-            v.try_map(|v| configured_attr_to_value(v, pkg, heap))?,
+            v.iter()
+                .map(|v| configured_attr_to_value(v, pkg, heap))
+                .collect::<Result<Vec<_>, _>>()?,
         )),
         ConfiguredAttr::Dict(map) => {
-            let mut res = SmallMap::with_capacity(map.len());
+            let mut res = BuckMutInsertionMap::with_capacity(map.len());
 
             for (k, v) in map.iter() {
                 res.insert_hashed(
@@ -207,7 +210,7 @@ fn configured_attr_to_value<'v>(
                 );
             }
 
-            heap.alloc_dict(res)
+            heap.alloc(res)
         }
         ConfiguredAttr::None => Value::new_none(),
         ConfiguredAttr::OneOf(box l, _) => configured_attr_to_value(l, pkg, heap)?,
@@ -233,7 +236,7 @@ fn configured_attr_to_value<'v>(
             heap.alloc(StarlarkConfiguredProvidersLabel::new(t.dep.dupe()))
         }
         ConfiguredAttr::SplitTransitionDep(t) => {
-            let mut map = SmallMap::with_capacity(t.deps.len());
+            let mut map = BuckMutInsertionMap::with_capacity(t.deps.len());
 
             for (trans, p) in t.deps.iter() {
                 map.insert_hashed(
@@ -242,7 +245,7 @@ fn configured_attr_to_value<'v>(
                 );
             }
 
-            heap.alloc_dict(map)
+            heap.alloc(map)
         }
         ConfiguredAttr::ConfigurationDep(c) => {
             // TODO(T198210718)
@@ -273,7 +276,7 @@ fn configured_attr_to_value<'v>(
             }
         },
         ConfiguredAttr::Metadata(data) => heap.alloc(data.to_value()),
-        ConfiguredAttr::TargetModifiers(data) => heap.alloc(data.to_value()),
+        ConfiguredAttr::TargetModifiers(data) => data.alloc_starlark(heap),
     })
 }
 

@@ -25,7 +25,6 @@ use derive_more::Display;
 use dice::DiceComputations;
 use dupe::Dupe;
 use futures::FutureExt;
-use gazebo::prelude::OptionExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
@@ -169,7 +168,6 @@ async fn unpack_action_nodes<'v>(
                 &this.global_cfg_options_override,
                 &this.ctx,
                 dice,
-                true,
                 false,
             )
             .await?
@@ -217,7 +215,8 @@ fn aquery_methods(builder: &mut MethodsBuilder) {
                     async {
                         let filter = filter
                             .into_option()
-                            .try_map(buck2_query_parser::parse_expr)?;
+                            .map(buck2_query_parser::parse_expr)
+                            .transpose()?;
 
                         let universe = unpack_action_nodes(this, dice, universe).await?;
 

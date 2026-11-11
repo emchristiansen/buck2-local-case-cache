@@ -58,12 +58,18 @@ CompileContext = record(
     # Clippy wrapper (wrapping clippy-driver so it has the same CLI as rustc).
     clippy_wrapper = field(cmd_args),
     # Memoized common args for reuse.
-    common_args = field(dict[(CrateType, Emit, LinkStrategy, bool, bool, bool, ProfileMode), CommonArgsInfo]),
+    common_args = field(dict[(CrateType, Emit, LinkStrategy, bool, bool, bool, bool, ProfileMode), CommonArgsInfo]),
     # Memoized dependency args for reuse across emits with the same inputs.
     dependency_args = field(dict[(CrateType, LinkStrategy, MetadataKind, bool), DependencyArgsInfo]),
+    # Memoized environment classifications for reuse across multiple emits,
+    # keyed by the environment's origin. A record field cannot be reassigned,
+    # so the memo lives in a dict even while "rustc" is its only key.
+    processed_env = field(dict[str, tuple]),
     cxx_toolchain_info = field(CxxToolchainInfo),
     dep_ctx = field(DepCollectionContext),
     exec_is_windows = field(bool),
+    # Exec-platform OS lookup, for tools that branch on script flavor.
+    exec_os_type = field(OsLookup),
     internal_tools_info = field(RustInternalToolsInfo),
     # The linker that we pass to `-Clinker`. This needs to be a wrapper script for two reasons:
     #  1. The `linker` in the cxx toolchain is a `cmd_args` which might have multiple args, we need
@@ -102,6 +108,7 @@ def compile_context(ctx: AnalysisContext, binary: bool = False) -> CompileContex
         is_proc_macro = getattr(ctx.attrs, "proc_macro", False),
         explicit_sysroot_deps = toolchain_info.explicit_sysroot_deps,
         panic_runtime = toolchain_info.panic_runtime,
+        linker_deps = toolchain_info.linker_deps,
     )
 
     transitive_srcs = ctx.actions.tset(
@@ -130,16 +137,19 @@ def compile_context(ctx: AnalysisContext, binary: bool = False) -> CompileContex
     else:
         sysroot_args = cmd_args()
 
-    exec_is_windows = ctx.attrs._exec_os_type[OsLookup].os == Os("windows")
+    exec_os_type = ctx.attrs._exec_os_type[OsLookup]
+    exec_is_windows = exec_os_type.os == Os("windows")
     path_sep = "\\" if exec_is_windows else "/"
 
     return CompileContext(
         clippy_wrapper = clippy_wrapper,
         common_args = {},
         dependency_args = {},
+        processed_env = {},
         cxx_toolchain_info = cxx_toolchain_info,
         dep_ctx = dep_ctx,
         exec_is_windows = exec_is_windows,
+        exec_os_type = exec_os_type,
         internal_tools_info = internal_tools_info,
         linker_with_pre_args = linker_with_pre_args,
         path_sep = path_sep,
@@ -298,6 +308,10 @@ _EMIT_PREFIX_SUFFIX = {
     Emit("mir"): (None, ".mir"),
     Emit("expand"): (None, ".rs"),
     Emit("clippy"): ("lib", ".rmeta"),  # Treated like metadata-fast
+    # Same naming as `link` (build_param prefix/suffix); the `miri`
+    # subdir keeps the interpreter artifact distinct. Consumed by the
+    # interpreter, never linked.
+    Emit("miri"): (None, None),
 }
 
 # Return the filename for a particular emitted artifact type

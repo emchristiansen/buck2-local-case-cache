@@ -9,7 +9,6 @@
  */
 
 use dice_error::DiceErrorImpl;
-use dice_error::cycles::DetectCyclesParseError;
 use dice_error::storage::PagableStorageBackendParseError;
 
 use crate::ErrorTag;
@@ -24,27 +23,14 @@ impl From<dice_error::DiceError> for crate::Error {
             DiceErrorImpl::InjectedKeyGotInvalidation(_) => {
                 ErrorTag::DiceInjectedKeyGotInvalidation
             }
-            // `DiceRejected` is a weird name for this, but is what it was historically, so keeping
-            // it
-            DiceErrorImpl::TransactionCancelled => ErrorTag::DiceRejected,
-            DiceErrorImpl::UnexpectedCycleGuardType { .. } => {
-                ErrorTag::DiceUnexpectedCycleGuardType
-            }
+            DiceErrorImpl::PageInFailed { .. } => ErrorTag::Tier0,
             DiceErrorImpl::DuplicateActivationData => ErrorTag::DiceDuplicateActivationData,
+            DiceErrorImpl::Cycle(_) => ErrorTag::DiceCycle,
         };
 
         crate::conversion::from_any_with_tag(value, error_tag)
     }
 }
-
-impl From<DetectCyclesParseError> for crate::Error {
-    #[cold]
-    #[track_caller]
-    fn from(value: DetectCyclesParseError) -> Self {
-        crate::conversion::from_any_with_tag(value, ErrorTag::Input)
-    }
-}
-
 impl From<PagableStorageBackendParseError> for crate::Error {
     #[cold]
     #[track_caller]

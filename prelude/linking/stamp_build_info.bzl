@@ -25,11 +25,15 @@ PRE_STAMPED_SUFFIX = "-pre_stamped"
 
 def cxx_stamp_build_info(ctx: AnalysisContext) -> bool:
     if getattr(ctx.attrs, "_generated_build_info_enabled", False):
+        if not getattr(ctx.attrs, "build_info_as_shared_library", True):
+            return False
         spec = ctx.attrs._generated_build_info_spec
         return bool(spec.get("link_as_shared_library", False) and cxx_is_gnu(ctx))
 
     generated_build_info = getattr(ctx.attrs, "_generated_build_info_spec", {})
     if generated_build_info.get("enabled", False):
+        if not getattr(ctx.attrs, "build_info_as_shared_library", True):
+            return False
         return bool(generated_build_info.get("link_as_shared_library", False) and cxx_is_gnu(ctx))
 
     if not hasattr(ctx.attrs, "_build_info") or not ctx.attrs._build_info or not cxx_is_gnu(ctx):
@@ -72,10 +76,15 @@ def stamp_build_info(
             if library_versions:
                 build_info["library_versions"] = library_versions
             build_info_json = ctx.actions.write_json(obj.short_path + "-build-info.json", build_info, has_content_based_path = has_content_based_path)
-        stem, ext = paths.split_extension(obj.short_path)
         if not stamped_output:
-            name = stem.removesuffix(PRE_STAMPED_SUFFIX) if stem.endswith(PRE_STAMPED_SUFFIX) else stem + "-stamped"
-            stamped_output = ctx.actions.declare_output(name + ext, has_content_based_path = has_content_based_path)
+            stem, ext = paths.split_extension(obj.short_path)
+            if obj.short_path.endswith(PRE_STAMPED_SUFFIX):
+                name = obj.short_path.removesuffix(PRE_STAMPED_SUFFIX)
+            elif stem.endswith(PRE_STAMPED_SUFFIX):
+                name = stem.removesuffix(PRE_STAMPED_SUFFIX) + ext
+            else:
+                name = stem + "-stamped" + ext
+            stamped_output = ctx.actions.declare_output(name, has_content_based_path = has_content_based_path)
 
         toolchain = get_cxx_toolchain_info(ctx)
 

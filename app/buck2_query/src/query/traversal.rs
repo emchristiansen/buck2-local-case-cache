@@ -9,9 +9,10 @@
  */
 
 use async_trait::async_trait;
+use buck2_hash::BuckMutMap;
+use buck2_hash::BuckMutSet;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use starlark_map::StarlarkHasherBuilder;
 
 use crate::query::graph::graph::Graph;
 use crate::query::graph::node::LabeledNode;
@@ -39,6 +40,16 @@ pub trait NodeLookup<T: LabeledNode> {
 #[async_trait]
 pub trait AsyncNodeLookup<T: LabeledNode>: Send + Sync {
     async fn get(&self, label: &T::Key) -> buck2_error::Result<T>;
+
+    /// `get`, told which node's expansion is asking. Lookups that load on
+    /// demand can credit the load to the requester.
+    async fn get_from(
+        &self,
+        label: &T::Key,
+        _requester: Option<&T::Key>,
+    ) -> buck2_error::Result<T> {
+        self.get(label).await
+    }
 }
 
 /// Node lookup when node key is the same as the node.
@@ -61,6 +72,10 @@ impl<T: LabeledNode<Key = T>> AsyncNodeLookup<T> for NodeLookupId {
 impl<T: LabeledNode, A: AsyncNodeLookup<T>> AsyncNodeLookup<T> for &A {
     async fn get(&self, label: &T::Key) -> buck2_error::Result<T> {
         (*self).get(label).await
+    }
+
+    async fn get_from(&self, label: &T::Key, requester: Option<&T::Key>) -> buck2_error::Result<T> {
+        (*self).get_from(label, requester).await
     }
 }
 
@@ -99,10 +114,7 @@ pub async fn async_fast_depth_first_postorder_traversal<
     // mean changing the delegate's for_each_children to return an iterator,
     // but idk.
 
-    // Deliberately keyed with starlark's hasher, not buck2_hash's, so hashes stay
-    // consistent with starlark_map collections used alongside it.
-    // ast-grep-ignore: rust/buck2-no-std-hashmap
-    let mut visited: std::collections::HashSet<T::Key, StarlarkHasherBuilder> = Default::default();
+    let mut visited: BuckMutSet<T::Key> = BuckMutSet::default();
     let mut work: Vec<WorkItem<T>> = root.into_iter().map(|t| WorkItem::Visit(t)).collect();
 
     while let Some(curr) = work.pop() {
@@ -146,19 +158,16 @@ pub async fn async_depth_limited_traversal<
     max_depth: u32,
     allow_partial_graph: bool,
 ) -> buck2_error::Result<()> {
-    // Deliberately keyed with starlark's hasher, not buck2_hash's, so hashes stay
-    // consistent with starlark_map collections used alongside it.
-    // ast-grep-ignore: rust/buck2-no-std-hashmap
-    let mut visited: std::collections::HashMap<_, _, StarlarkHasherBuilder> = Default::default();
+    let mut visited: BuckMutMap<_, _> = BuckMutMap::default();
     let mut push =
         |queue: &mut FuturesOrdered<_>, target: &T::Key, parent: Option<T::Key>, depth: u32| {
             if visited.contains_key(target) {
                 return;
             }
-            visited.insert(target.clone(), parent);
+            visited.insert(target.clone(), parent.clone());
             let target = target.clone();
             queue.push_back(async move {
-                let result = nodes.get(&target).await;
+                let result = nodes.get_from(&target, parent.as_ref()).await;
                 (target, depth, result)
             })
         };
@@ -173,25 +182,11 @@ pub async fn async_depth_limited_traversal<
     // (see https://github.com/rust-lang/futures-rs/issues/2053). Clean this up once a good
     // solution there exists.
     while let Some((target, depth, node)) = tokio::task::unconstrained(queue.next()).await {
-        // `allow_partial_graph` only skips graph load / enumeration errors. A `visit` error
-        // is the caller's own error and must always propagate, so `visit` runs outside this
-        // block.
-        let result: buck2_error::Result<_> = try {
-            let node = node?;
-            if depth != max_depth {
-                let depth = depth + 1;
-                successors
-                    .for_each_child(&node, &mut |child: &T::Key| {
-                        push(&mut queue, child, Some(target.clone()), depth);
-                        Ok(())
-                    })
-                    .await?;
-            }
-
-            node
-        };
-
-        let node = match result {
+        // `allow_partial_graph` only skips graph load / enumeration errors: a node that does not
+        // load is dropped, and a node whose children cannot be enumerated is kept without them,
+        // as `Graph::build` does. A `visit` error is the caller's own error and always
+        // propagates.
+        let node = match node {
             Ok(node) => node,
             Err(mut e) => {
                 if allow_partial_graph {
@@ -208,6 +203,30 @@ pub async fn async_depth_limited_traversal<
                 return Err(e);
             }
         };
+
+        if depth != max_depth {
+            let depth = depth + 1;
+            let children = successors
+                .for_each_child(&node, &mut |child: &T::Key| {
+                    push(&mut queue, child, Some(target.clone()), depth);
+                    Ok(())
+                })
+                .await;
+            if let Err(mut e) = children {
+                if allow_partial_graph {
+                    tracing::trace!(
+                        "query allow-partial-graph: skipping children of `{target}` due to error: {e:#}"
+                    );
+                } else {
+                    let mut target = target;
+                    while let Some(Some(parent)) = visited.get(&target) {
+                        e = e.context(format!("Error traversing children of {parent}"));
+                        target = parent.clone();
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         visit(node)?;
     }
@@ -250,7 +269,6 @@ mod tests {
     use derive_more::Display;
     use dupe::Dupe;
     use dupe::IterDupedExt;
-    use gazebo::prelude::*;
 
     use super::*;
     use crate::query::environment::QueryTarget;
@@ -296,7 +314,10 @@ mod tests {
             self.1.iter()
         }
 
-        fn special_attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+        fn special_attrs_for_each<
+            E: From<buck2_error::Error>,
+            F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+        >(
             &self,
             _func: F,
         ) -> Result<(), E> {
@@ -310,21 +331,31 @@ mod tests {
             unimplemented!()
         }
 
-        fn attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+        fn attrs_for_each<
+            E: From<buck2_error::Error>,
+            F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+        >(
             &self,
             _func: F,
         ) -> Result<(), E> {
             unimplemented!()
         }
 
-        fn defined_attrs_for_each<E, F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>>(
+        fn defined_attrs_for_each<
+            E: From<buck2_error::Error>,
+            F: FnMut(&str, &Self::Attr<'_>) -> Result<(), E>,
+        >(
             &self,
             _func: F,
         ) -> Result<(), E> {
             unimplemented!()
         }
 
-        fn map_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(&self, _key: &str, _func: F) -> R {
+        fn map_attr<R, F: FnMut(Option<&Self::Attr<'_>>) -> R>(
+            &self,
+            _key: &str,
+            _func: F,
+        ) -> buck2_error::Result<R> {
             unimplemented!()
         }
 
@@ -332,7 +363,7 @@ mod tests {
             &self,
             _key: &str,
             _func: F,
-        ) -> R {
+        ) -> buck2_error::Result<R> {
             unimplemented!()
         }
 
@@ -422,7 +453,10 @@ mod tests {
     fn make_graph(nodes: &[(i64, &[i64])]) -> buck2_error::Result<Graph> {
         let mut map = BuckMutMap::default();
         for (n, deps) in nodes {
-            map.insert(Ref(*n), Node(Ref(*n), deps.map(|v| Ref(*v))));
+            map.insert(
+                Ref(*n),
+                Node(Ref(*n), deps.iter().map(|v| Ref(*v)).collect::<Vec<_>>()),
+            );
         }
         Ok(Graph(map))
     }

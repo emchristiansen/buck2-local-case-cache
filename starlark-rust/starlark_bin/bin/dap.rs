@@ -369,6 +369,24 @@ mod tests {
         handle.join().unwrap()
     }
 
+    /// `arguments` is optional in the protocol: a request without it is answered, and a
+    /// request whose arguments do not parse gets an error response instead of a crash.
+    #[test]
+    fn requests_without_arguments_are_answered() {
+        let harness = TestHarness::new();
+        let request = |command: &str| Request {
+            arguments: None,
+            command: command.to_owned(),
+            seq: 1,
+            type_: "request".to_owned(),
+        };
+        let response = dispatch(&harness.backend, &request("disconnect"));
+        assert!(response.success, "{response:?}");
+        let response = dispatch(&harness.backend, &request("stackTrace"));
+        assert!(!response.success, "{response:?}");
+        assert!(response.message.is_some(), "{response:?}");
+    }
+
     fn dap_request(args: impl serde::Serialize, command: &str, seq: i64) -> Request {
         Request {
             arguments: Some(serde_json::to_value(args).unwrap()),

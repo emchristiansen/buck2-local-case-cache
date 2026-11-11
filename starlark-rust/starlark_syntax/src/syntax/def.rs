@@ -252,9 +252,16 @@ impl<'a, P: AstPayload> DefParams<'a, P> {
                     index_of_star = Some(i);
                 }
                 ParameterP::Slash => {
-                    if state >= State::SeenSlash {
+                    if state == State::SeenSlash {
                         return Err(EvalException::parser_error(
                             "Multiple `/` in parameters",
+                            param.span,
+                            codemap,
+                        ));
+                    }
+                    if state > State::SeenSlash {
+                        return Err(EvalException::parser_error(
+                            "`/` must come before `*`, `*args` and `**kwargs`",
                             param.span,
                             codemap,
                         ));
@@ -430,6 +437,13 @@ mod tests {
     #[test]
     fn test_slash_slash() {
         fails("slash_slash", "def test(x, /, y, /): pass");
+    }
+
+    #[test]
+    fn test_slash_after_star() {
+        fails("slash_after_star", "def test(x, *, y, /): pass");
+        fails("slash_after_args", "def test(x, *args, /): pass");
+        fails("slash_after_kwargs", "def test(x, **kwargs, /): pass");
     }
 
     #[test]

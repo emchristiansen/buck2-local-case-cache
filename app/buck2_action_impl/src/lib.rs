@@ -10,13 +10,11 @@
 
 #![feature(arbitrary_self_types)]
 #![feature(try_blocks)]
-#![feature(used_with_arg)]
 
 use std::sync::Once;
 
 mod actions;
 mod context;
-pub mod dynamic;
 mod starlark_defs;
 
 pub fn init_late_bindings() {
@@ -25,8 +23,7 @@ pub fn init_late_bindings() {
         actions::impls::run::audit_dep_files::init_audit_dep_files();
         actions::impls::run::dep_files::init_dep_file_cache();
         context::init_analysis_action_methods_actions();
-        dynamic::calculation::init_dynamic_lambda_calculation();
-        dynamic::storage::init_dynamic_lambda_params_storages();
+        buck2_dynamic_actions::init_late_bindings();
         starlark_defs::init_register_buck2_action_impl_globals();
     });
 }

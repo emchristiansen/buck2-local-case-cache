@@ -26,10 +26,9 @@ use dice::InvalidationSourcePriority;
 use dice::Key;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
-use gazebo::prelude::*;
-use gazebo::variants::VariantName;
 use pagable::Pagable;
 use pagable::pagable_typetag;
+use variant_name::VariantName;
 
 #[derive(Allocative, Clone, Copy, Debug, Display, Eq, PartialEq, Hash, Pagable)]
 #[pagable_typetag(DiceKeyDyn)]
@@ -174,10 +173,14 @@ fn assert_single_invalidation(
         ) => {
             assert_eq!(
                 expected,
-                actual.get_invalidation_path().map(|v| (
-                    format!("{}({})", v.key.key_type_name(), v.key),
-                    v.version.testing_value()
-                ))
+                actual
+                    .get_invalidation_path()
+                    .iter()
+                    .map(|v| (
+                        format!("{}({})", v.key.key_type_name(), v.key),
+                        v.version.testing_value()
+                    ))
+                    .collect::<Vec<_>>()
             )
         }
         (ExpectedInvalidation::Invalidated(..), _) => {
@@ -208,17 +211,18 @@ fn test_compute_tracks_invalidations() -> anyhow::Result<()> {
             let builder = Dice::builder();
             builder.build(DetectCycles::Enabled)
         };
+        let root = dice.new_root().await;
 
         // We want to set up the invalidation sources such that the FooInjected(n) are all invalidated at `2 * n + 2` (i.e. NormalInjected(4)
         // is invalidated at 10) and the FooChanged(n) forms are at `2 * n + 3`
 
         for i in 0..10 {
-            let mut updater = dice.updater();
+            let mut updater = dice.updater(root);
             updater.changed_to([(NormalInjected(i), i)])?;
             updater.changed_to([(HighInjected(i), i)])?;
             updater.commit().await;
 
-            let mut updater = dice.updater();
+            let mut updater = dice.updater(root);
             updater.changed([NormalChanged(i)])?;
             updater.changed([HighChanged(i)])?;
             updater.commit().await;
@@ -273,7 +277,7 @@ fn test_compute_tracks_invalidations() -> anyhow::Result<()> {
             }
         }
 
-        let ctx = dice.updater().commit().await;
+        let ctx = dice.updater(root).commit().await;
 
         assert_invalidations(
             ExpectedInvalidation::Clean,
@@ -342,6 +346,7 @@ fn test_compute_tracks_invalidations_over_versions() -> anyhow::Result<()> {
             let builder = Dice::builder();
             builder.build(DetectCycles::Enabled)
         };
+        let root = dice.new_root().await;
 
         #[derive(Allocative, Clone, Copy, Debug, Display, Eq, PartialEq, Hash, Pagable)]
         #[pagable_typetag(DiceKeyDyn)]
@@ -368,11 +373,11 @@ fn test_compute_tracks_invalidations_over_versions() -> anyhow::Result<()> {
             }
         }
 
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to([(HighInjected(0), 0)])?;
         updater.commit().await;
 
-        let ctx = dice.updater().commit().await;
+        let ctx = dice.updater(root).commit().await;
         assert_invalidations(
             ExpectedInvalidation::Invalidated(vec![
                 ExpectedInvalidation::item(HighInjected(0), 2),
@@ -385,11 +390,11 @@ fn test_compute_tracks_invalidations_over_versions() -> anyhow::Result<()> {
             ctx.compute(&Top(0)).await?,
         );
 
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed_to([(HighInjected(0), 1)])?;
         updater.commit().await;
 
-        let ctx = dice.updater().commit().await;
+        let ctx = dice.updater(root).commit().await;
         assert_invalidations(
             ExpectedInvalidation::Invalidated(vec![
                 ExpectedInvalidation::item(HighInjected(0), 3),
@@ -402,11 +407,11 @@ fn test_compute_tracks_invalidations_over_versions() -> anyhow::Result<()> {
             ctx.compute(&Top(0)).await?,
         );
 
-        let mut updater = dice.updater();
+        let mut updater = dice.updater(root);
         updater.changed([HighChanged(0)])?;
         updater.commit().await;
 
-        let ctx = dice.updater().commit().await;
+        let ctx = dice.updater(root).commit().await;
         assert_invalidations(
             ExpectedInvalidation::Invalidated(vec![ExpectedInvalidation::item(HighChanged(0), 4)]),
             ExpectedInvalidation::Invalidated(vec![ExpectedInvalidation::item(HighChanged(0), 4)]),

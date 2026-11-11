@@ -11,7 +11,9 @@
 use std::sync::Arc;
 
 use buck2_build_api::analysis::AnalysisResult;
+use buck2_build_api::analysis::AnalysisSplitInstants;
 use buck2_build_api::analysis::anon_promises_dyn::RunAnonPromisesAccessorPair;
+use buck2_build_api::analysis::extra_v::AnalysisExtraValue;
 use buck2_build_api::analysis::registry::AnalysisRegistry;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::CommandLineArg;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisContext;
@@ -30,10 +32,12 @@ use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_core::unsafe_send_future::UnsafeSendFuture;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_execute::digest_config::HasDigestConfig;
+use buck2_hash::BuckFixedSortedMap;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutMap;
-use buck2_hash::StdBuckHashMap;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_interpreter::factory::BuckStarlarkModule;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
@@ -53,9 +57,7 @@ use starlark::eval::Evaluator;
 use starlark::values::FrozenValueTyped;
 use starlark::values::Value;
 use starlark::values::ValueTyped;
-use starlark_map::small_map::SmallMap;
 
-use crate::analysis::calculation::AnalysisSplitInstants;
 use crate::analysis::plugins::plugins_to_starlark_value;
 use crate::attrs::resolve::ctx::AnalysisQueryResult;
 use crate::attrs::resolve::ctx::AttrResolutionContext;
@@ -97,11 +99,7 @@ impl<'a, 'v> AttrResolutionContext<'v> for &'_ RuleAnalysisAttrResolutionContext
         &mut self,
         name: &str,
     ) -> buck2_error::Result<Option<CommandLineArg<'v>>> {
-        Ok(resolve_unkeyed_placeholder(
-            &self.dep_analysis_results,
-            name,
-            self.module,
-        ))
+        resolve_unkeyed_placeholder(&self.dep_analysis_results, name, self.module)
     }
 
     fn resolve_query(&mut self, query: &str) -> buck2_error::Result<Arc<AnalysisQueryResult>> {
@@ -132,23 +130,28 @@ pub fn resolve_unkeyed_placeholder<'v>(
     dep_analysis_results: &BuckMutMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
     name: &str,
     module: &Module<'v>,
-) -> Option<CommandLineArg<'v>> {
+) -> buck2_error::Result<Option<CommandLineArg<'v>>> {
     // TODO(cjhopman): Make it an error if two deps provide a value for the placeholder.
     for providers in dep_analysis_results.values() {
         let resolved = providers.value.by_ref_with_reconstructor(|collection, r| {
-            let placeholder_info = collection
+            let Some(placeholder_info) = collection
                 .as_ref()
-                .builtin_provider::<TemplatePlaceholderInfo>()?;
-            let value = placeholder_info.unkeyed_variables().get(name).copied()?;
+                .builtin_provider::<TemplatePlaceholderInfo>()?
+            else {
+                return buck2_error::Ok(None);
+            };
+            let Some(value) = placeholder_info.unkeyed_variables().get(name).copied() else {
+                return Ok(None);
+            };
             // IMPORTANT: Anything given back to the user must be kept alive; the edge
             // makes the dep's heap a dependency of the module's heap.
-            Some(r.edge(module.heap()).rebrand(value))
-        });
+            Ok(Some(r.edge(module.heap()).rebrand(value)))
+        })?;
         if let Some(value) = resolved {
-            return Some(value);
+            return Ok(Some(value));
         }
     }
-    None
+    Ok(None)
 }
 
 pub fn resolve_query(
@@ -178,7 +181,7 @@ pub trait RuleSpec: Sync {
     fn promise_artifact_mappings<'v>(
         &self,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> buck2_error::Result<SmallMap<String, Value<'v>>>;
+    ) -> buck2_error::Result<BuckMutInsertionMap<String, Value<'v>>>;
 }
 
 /// Container for the environment that analysis implementation functions should run in
@@ -254,7 +257,7 @@ async fn run_analysis_with_env_underlying(
                     .dupe()
                     .map(|v| ((*label).dupe(), v))
             })
-            .collect::<SmallMap<_, _>>();
+            .collect::<BuckMutInsertionMap<_, _>>();
 
         let (attributes, plugins) = {
             let dep_analysis_results = get_deps_from_analysis_results(analysis_env.deps)?;
@@ -284,6 +287,16 @@ async fn run_analysis_with_env_underlying(
         let (ctx, list_res) = reentrant_eval.with_evaluator(|eval| {
             eval.set_print_handler(&print);
             eval.set_soft_error_handler(&Buck2StarlarkSoftErrorHandler);
+
+            // Test infos that name an execution group record that group's executor at creation,
+            // so a test runs with it even when another rule returns the test info.
+            if AnalysisExtraValue::get_or_init(eval.module())?
+                .execution_platform_resolution
+                .set(node.execution_platform_resolution().dupe())
+                .is_err()
+            {
+                return Err(internal_error!("execution platform resolution set twice").into());
+            }
 
             let ctx = AnalysisContext::prepare(
                 eval.heap(),
@@ -327,7 +340,7 @@ async fn run_analysis_with_env_underlying(
         let validations = transitive_validations(
             validations_from_deps,
             recorded_values.provider_collection()?,
-        );
+        )?;
 
         Ok((
             token,
@@ -335,12 +348,13 @@ async fn run_analysis_with_env_underlying(
                 AnalysisResult::new(
                     recorded_values,
                     profile_data,
-                    StdBuckHashMap::default(),
+                    BuckFixedSortedMap::default(),
                     declared_actions,
                     declared_artifacts,
                     validations,
                     requested_anon_targets,
-                ),
+                    node.rule_type().dupe(),
+                )?,
                 split_instants,
             ),
         ))
@@ -349,12 +363,12 @@ async fn run_analysis_with_env_underlying(
 }
 
 pub fn transitive_validations(
-    deps: SmallMap<ConfiguredTargetLabel, TransitiveValidations>,
+    deps: BuckMutInsertionMap<ConfiguredTargetLabel, TransitiveValidations>,
     provider_collection: FrozenProviderCollectionValueRef,
-) -> Option<TransitiveValidations> {
+) -> buck2_error::Result<Option<TransitiveValidations>> {
     let provider_collection = provider_collection.to_owned();
-    let info = provider_collection.builtin_provider_value::<ValidationInfo>();
-    if info.is_some() || deps.len() > 1 {
+    let info = provider_collection.builtin_provider_value::<ValidationInfo>()?;
+    Ok(if info.is_some() || deps.len() > 1 {
         Some(TransitiveValidations(Arc::new(TransitiveValidationsData {
             info,
             children: deps.into_keys().collect(),
@@ -365,7 +379,7 @@ pub fn transitive_validations(
             "Reuse the single element if any from one of the deps for current node."
         );
         deps.into_values().next()
-    }
+    })
 }
 
 pub fn get_rule_callable<'v>(
@@ -395,7 +409,7 @@ pub fn promise_artifact_mappings<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
     module: &FrozenModule,
     name: &str,
-) -> buck2_error::Result<SmallMap<String, Value<'v>>> {
+) -> buck2_error::Result<BuckMutInsertionMap<String, Value<'v>>> {
     let rule_callable = get_rule_callable(eval, module, name)?;
     let promise_artifact_mappings =
         (FROZEN_PROMISE_ARTIFACT_MAPPINGS_GET_IMPL.get()?)(rule_callable)?;
@@ -403,7 +417,7 @@ pub fn promise_artifact_mappings<'v>(
     Ok(promise_artifact_mappings
         .iter()
         .map(|(name, func)| (name.to_string(), *func))
-        .collect::<SmallMap<_, _>>())
+        .collect::<BuckMutInsertionMap<_, _>>())
 }
 
 pub fn get_user_defined_rule_spec(
@@ -428,7 +442,7 @@ pub fn get_user_defined_rule_spec(
         fn promise_artifact_mappings<'v>(
             &self,
             eval: &mut Evaluator<'v, '_, '_>,
-        ) -> buck2_error::Result<SmallMap<String, Value<'v>>> {
+        ) -> buck2_error::Result<BuckMutInsertionMap<String, Value<'v>>> {
             promise_artifact_mappings(eval, &self.module, &self.name)
         }
     }

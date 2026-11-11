@@ -73,16 +73,17 @@ async fn test_dice_recompute_doesnt_reuse_wrong_deps() -> anyhow::Result<()> {
     }
 
     let dice = Dice::builder().build(DetectCycles::Enabled);
+    let root = dice.new_root().await;
 
-    let mut updater = dice.updater();
+    let mut updater = dice.updater(root);
     updater.changed_to([(Leaf(0), 1), (Leaf(1), 100), (Leaf(2), 200)])?;
     let ctx1 = updater.commit().await;
 
-    let mut updater = dice.updater();
+    let mut updater = dice.updater(root);
     updater.changed_to([(Leaf(0), 1), (Leaf(1), 300), (Leaf(2), 200)])?;
     let ctx2 = updater.commit().await;
 
-    let mut updater = dice.updater();
+    let mut updater = dice.updater(root);
     updater.changed_to([(Leaf(0), 2), (Leaf(1), 400), (Leaf(2), 100)])?;
     let ctx3 = updater.commit().await;
 
@@ -94,7 +95,7 @@ async fn test_dice_recompute_doesnt_reuse_wrong_deps() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_dice_clear_doesnt_break_ongoing_computation() -> anyhow::Result<()> {
+async fn deleting_the_branch_does_not_break_an_ongoing_computation() -> anyhow::Result<()> {
     #[derive(
         Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative, Pagable
     )]
@@ -130,92 +131,17 @@ async fn test_dice_clear_doesnt_break_ongoing_computation() -> anyhow::Result<()
     }
 
     let dice = Dice::builder().build(DetectCycles::Enabled);
-    let updater = dice.updater();
+    let root = dice.new_root().await;
+    let updater = dice.updater(root);
     let ctx1 = updater.commit().await;
 
     ctx1.compute(&Fib(3)).await?;
 
-    let updater = dice.updater();
-    updater.unstable_take();
+    dice.delete_branch(root);
 
-    let res = ctx1.compute(&Fib(10)).await;
-
-    assert!(res.is_err(), "Expected `Err(_)`, got `{res:?}`");
+    assert_eq!(*ctx1.compute(&Fib(10)).await?, Some(89));
 
     Ok(())
-}
-
-#[test]
-fn test_dice_clear_doesnt_cause_inject_compute() {
-    // Detecting that a dice compute panicked is actually kinda tricky, in normal flow
-    // that is a hard error but in tests it instead just looks to dice like the node is cancelled.
-    // We detect it by configuring the runtime to shutdown and panic itself if any task panics, but
-    // that only works right now with the current_thread runtime.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .unhandled_panic(tokio::runtime::UnhandledPanic::ShutdownRuntime)
-        .build()
-        .unwrap();
-
-    // Spawn the root task
-    rt.block_on(async {
-        #[derive(
-            Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative, Pagable
-        )]
-        #[display("{:?}", self)]
-        #[pagable_typetag(DiceKeyDyn)]
-        struct Node;
-
-        #[async_trait]
-        impl Key for Node {
-            type Value = u32;
-            fn value_serialize() -> impl dice::ValueSerialize<Value = Self::Value> {
-                dice::NoValueSerialize::<Self::Value>::new()
-            }
-
-            async fn compute(
-                &self,
-                ctx: &mut DiceComputations,
-                _cancellations: &CancellationContext,
-            ) -> u32 {
-                drop(ctx.compute(&Leaf).await);
-                1
-            }
-
-            fn equality_behavior() -> EqualityBehavior<Self::Value> {
-                EqualityBehavior::Compare(|_x, _y| false)
-            }
-        }
-
-        #[derive(
-            Clone, Copy, Dupe, Display, Debug, Eq, PartialEq, Hash, Allocative, Pagable
-        )]
-        #[display("{:?}", self)]
-        #[pagable_typetag(DiceKeyDyn)]
-        struct Leaf;
-
-        impl InjectedKey for Leaf {
-            type Value = u32;
-            fn value_serialize() -> impl dice::ValueSerialize<Value = Self::Value> {
-                dice::NoValueSerialize::<Self::Value>::new()
-            }
-
-            fn equality_behavior() -> EqualityBehavior<Self::Value> {
-                EqualityBehavior::Compare(|_x, _y| false)
-            }
-        }
-
-        let dice = Dice::builder().build(DetectCycles::Enabled);
-        let mut updater = dice.updater();
-        drop(updater.changed_to([(Leaf, 1)]));
-        let ctx1 = updater.commit().await;
-        let fut = ctx1.compute(&Node);
-
-        let updater = dice.updater();
-        updater.unstable_take();
-
-        drop(fut.await);
-    });
 }
 
 /// Regression: a dep dropped from a key's compute on a later run must not
@@ -331,9 +257,10 @@ async fn dropped_dep_does_not_leave_stale_rdep_edge() -> anyhow::Result<()> {
     }
 
     let dice = Dice::builder().build(DetectCycles::Disabled);
+    let root = dice.new_root().await;
 
     // v1: Selector=true, Left=1, Right=10. K depends on {Selector, Left, Right}.
-    let mut updater = dice.updater();
+    let mut updater = dice.updater(root);
     updater.changed_to([(Selector, true)])?;
     updater.changed_to([(Left, 1u32)])?;
     updater.changed_to([(Right, 10u32)])?;
@@ -343,7 +270,7 @@ async fn dropped_dep_does_not_leave_stale_rdep_edge() -> anyhow::Result<()> {
 
     // v2: flip Selector to false, forcing K's recompute. K now depends on
     // {Selector, Left} only — Right has been dropped from the dep set.
-    let mut updater = dice.updater();
+    let mut updater = dice.updater(root);
     updater.changed_to([(Selector, false)])?;
     let ctx = updater.commit().await;
     assert_eq!(*ctx.compute(&K).await.unwrap(), 1);
@@ -357,7 +284,7 @@ async fn dropped_dep_does_not_leave_stale_rdep_edge() -> anyhow::Result<()> {
     data.tracker = Arc::new(Recorder {
         events: events.clone(),
     });
-    let mut updater = dice.updater_with_data(data);
+    let mut updater = dice.updater_with_data(root, data);
     updater.changed_to([(Right, 999u32)])?;
     let ctx = updater.commit().await;
     assert_eq!(*ctx.compute(&K).await.unwrap(), 1);

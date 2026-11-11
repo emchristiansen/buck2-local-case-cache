@@ -228,6 +228,18 @@ impl CongestionControlState {
         }
     }
 
+    /// A request of `sent` messages was pushed back as a whole: cut the next request below it.
+    /// The state's cutoff may be above `sent` (a stale `last_cutoff`, or a batch shorter than
+    /// the cutoff), and halving with `+ 1` does not move below 2 by itself.
+    fn congested(&mut self, sent: usize) {
+        self.current_cutoff = sent;
+        self.update_cutoff(true);
+        if self.current_cutoff >= sent {
+            self.current_cutoff = sent.saturating_sub(1).max(1);
+            self.cliff_bottom = self.current_cutoff;
+        }
+    }
+
     /// Compute and return the recovery amount of each step
     fn compute_recovery_amount(&self) -> usize {
         self.cliff_top.saturating_sub(self.current_cutoff) / FAST_RECOVERY_STEPS + 1
@@ -512,7 +524,7 @@ impl ScribeProducer {
             if cutoff_len == retryable_error_count {
                 // Congested; all messages were pushed back with retryable errors, which means
                 // Scribed/Scribble couldn't prepare enough buffer to hold the message vector.
-                cc_state.update_cutoff(true);
+                cc_state.congested(cutoff_len);
                 retry_count += 1;
             } else if cutoff_len == success_count {
                 // Success; all the messages up to the cutoff were successfully processed.
@@ -1095,10 +1107,7 @@ mod tests {
                 WriteMessageResultCode::ENQUEUE_FAILED,
                 WriteMessageResultCode::ENQUEUE_FAILED,
             ],
-            vec![
-                WriteMessageResultCode::ENQUEUE_FAILED,
-                WriteMessageResultCode::ENQUEUE_FAILED,
-            ],
+            vec![WriteMessageResultCode::ENQUEUE_FAILED],
         ];
         let client = mock_client(codes.clone());
         let producer = make_ScribeProducer(fb, client, codes[0].len());
@@ -1172,6 +1181,59 @@ mod tests {
         let counters = producer.export_counters();
         assert_eq!(counters.successes, 16);
         assert_eq!(counters.failures(), 0);
+    }
+
+    fn cap_client(cap: usize, sizes: Arc<Mutex<Vec<usize>>>) -> ProducerServiceClient {
+        let client = Arc::new(scribe_producer_service_mocks::new::<dyn ProducerService>());
+        client.WriteMessages.mock(move |req| {
+            let n = req.messages.len();
+            sizes.lock().unwrap().push(n);
+            let code = if n <= cap {
+                WriteMessageResultCode::OK
+            } else {
+                WriteMessageResultCode::ENQUEUE_FAILED
+            };
+            WriteMessagesResponse {
+                results: (0..n)
+                    .map(|_| ThriftWriteMessageResult {
+                        code,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+        });
+        client
+    }
+
+    /// When Scribe queues only one-message requests, the batch is cut down to one message and
+    /// every message is delivered.
+    #[fbinit::test]
+    async fn test_cutoff_with_one_message_capacity(fb: FacebookInit) {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let producer = make_ScribeProducer(fb, cap_client(1, Arc::clone(&sizes)), 3);
+        let res = producer
+            .send_messages_now(vec![message("a"), message("b"), message("c")])
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(*sizes.lock().unwrap(), vec![3, 2, 1, 1, 1]);
+        assert_eq!(producer.export_counters().successes, 3);
+    }
+
+    /// A stale `last_cutoff` above the batch size does not keep the requests at the full size:
+    /// a congested request is cut from the size that was sent.
+    #[fbinit::test]
+    async fn test_stale_last_cutoff(fb: FacebookInit) {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let producer = ScribeProducer {
+            last_cutoff: Mutex::new(Some(501)),
+            ..make_ScribeProducer(fb, cap_client(2, Arc::clone(&sizes)), 3)
+        };
+        let res = producer
+            .send_messages_now(vec![message("a"), message("b"), message("c")])
+            .await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(*sizes.lock().unwrap(), vec![3, 2, 1]);
     }
 
     #[test]

@@ -115,10 +115,21 @@ impl<T: 'static> Intern<T> {
         &self.pointer.data
     }
 
-    /// SAFETY: This may only be called with pointers returned from [`Self::deref_static`]
+    /// The interned value as a pointer, for storing an `Intern` as one. Recover the `Intern`
+    /// with [`Self::from_ptr`]. A pointer taken from [`Self::deref_static`] would not do for
+    /// that: it has provenance over the `T` alone, not the allocation around it.
+    #[inline]
+    pub const fn as_ptr(&self) -> *const T {
+        &raw const self.pointer.data
+    }
+
+    /// # Safety
+    ///
+    /// `p` must have been returned by [`Self::as_ptr`].
     #[inline]
     pub const unsafe fn from_ptr(p: *const T) -> Self {
-        // SAFETY: `p` is a pointer to the `data` field of an `InternedData<T>`
+        // SAFETY: `p` points at the `data` field of an `InternedData<T>`, with provenance over
+        // the whole `InternedData<T>`.
         unsafe {
             let p = p
                 .cast::<u8>()
@@ -246,16 +257,20 @@ impl<T: 'static, H: Hasher + Default> Interner<T, H> {
             data: hashed_value.value.into(),
             hash: hashed_value.hash,
         });
-        let pointer = self
-            .table
-            .insert(
-                hashed_value.hash,
-                pointer,
-                |a, b| a.hash == b.hash && a.data == b.data,
-                |t| t.hash,
-            )
-            .0;
-        (Intern { pointer }, InternDisposition::Computed)
+        let (pointer, existing) = self.table.insert(
+            hashed_value.hash,
+            pointer,
+            |a, b| a.hash == b.hash && a.data == b.data,
+            |t| t.hash,
+        );
+        // Another thread may have interned the same value between the lookup and the insert;
+        // `insert` then hands the value back and returns the entry that thread stored.
+        let disposition = if existing.is_some() {
+            InternDisposition::Interned
+        } else {
+            InternDisposition::Computed
+        };
+        (Intern { pointer }, disposition)
     }
 
     /// Get a value if it has been interned.
@@ -370,8 +385,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::collections::hash_map::DefaultHasher;
 
+    use crate::Equivalent;
     use crate::Intern;
     use crate::InternDisposition;
+    use crate::Interner;
 
     #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
     pub struct StringValue(String);
@@ -403,8 +420,9 @@ mod tests {
     // Make sure things work with reallocation.
     #[test]
     fn test_resize() {
+        let n = if cfg!(miri) { 2000 } else { 100000 };
         let mut interned_strings = Vec::new();
-        for i in 0..100000 {
+        for i in 0..n {
             let s = i.to_string();
             let interned = STRING_INTERNER.intern(s.clone());
             assert_eq!(&s, &*interned.0);
@@ -425,6 +443,57 @@ mod tests {
         TestDispositionValue,
         String
     );
+    /// A lookup key whose conversion into the interned value waits until both racing threads
+    /// have missed the lookup, which forces the schedule "A misses, B misses, A inserts, B finds
+    /// A's entry".
+    struct RacingKey(&'static str);
+
+    static BOTH_MISSED: std::sync::LazyLock<std::sync::Barrier> =
+        std::sync::LazyLock::new(|| std::sync::Barrier::new(2));
+
+    #[derive(Debug, Hash, PartialEq, Eq)]
+    struct RacedValue(String);
+
+    static RACE_INTERNER: Interner<RacedValue> = Interner::new();
+
+    impl std::hash::Hash for RacingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            // The same as the derived `Hash` of `RacedValue`.
+            self.0.to_owned().hash(state)
+        }
+    }
+
+    impl Equivalent<RacedValue> for RacingKey {
+        fn equivalent(&self, key: &RacedValue) -> bool {
+            self.0 == key.0
+        }
+    }
+
+    impl From<RacingKey> for RacedValue {
+        fn from(k: RacingKey) -> RacedValue {
+            BOTH_MISSED.wait();
+            RacedValue(k.0.to_owned())
+        }
+    }
+
+    /// Two threads that intern the same new value at once: the one whose insert finds the
+    /// entry of the other reports `Interned`.
+    #[test]
+    fn test_disposition_of_racing_interns() {
+        let (a, b) = std::thread::scope(|s| {
+            let ta = s.spawn(|| RACE_INTERNER.observed_intern(RacingKey("new value")));
+            let tb = s.spawn(|| RACE_INTERNER.observed_intern(RacingKey("new value")));
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        assert_eq!(a.0, b.0);
+        assert_eq!(RACE_INTERNER.iter().count(), 1);
+        let computed = [&a.1, &b.1]
+            .iter()
+            .filter(|d| matches!(d, InternDisposition::Computed))
+            .count();
+        assert_eq!(computed, 1);
+    }
+
     #[test]
     fn test_disposition() {
         let (val, disposition) = TEST_DISPOSITION_INTERNER.observed_intern("hello".to_owned());
@@ -500,7 +569,6 @@ mod tests {
     #[test]
     fn test_pointer_roundtrip() {
         let one = TEST_POINTER_INTERNER.intern("one");
-        let one_p = one.deref_static() as *const _;
-        assert_eq!(one, unsafe { Intern::from_ptr(one_p) });
+        assert_eq!(one, unsafe { Intern::from_ptr(one.as_ptr()) });
     }
 }

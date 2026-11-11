@@ -2461,6 +2461,7 @@ mod tests {
         report(
             CommandExecutionStatus::Failure {
                 execution_kind: local_kind(),
+                missing_materialized_inputs: false,
             },
             Some(101),
             b"failed\0\xff",
@@ -2965,8 +2966,8 @@ mod tests {
                 None,
             )
             .unwrap();
-            let mut env = sorted_vector_map::SortedVectorMap::new();
-            env.insert("PATH".to_owned(), store.clone());
+            let env: buck2_hash::BuckFixedSortedMap<String, String> =
+                [("PATH".to_owned(), store.clone())].into_iter().collect();
             CommandExecutionRequest::new(
                 vec![],
                 args.into_iter().map(str::to_owned).collect(),
@@ -3119,9 +3120,8 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let mut env: sorted_vector_map::SortedVectorMap<String, String> =
-                    sorted_vector_map::SortedVectorMap::new();
-                env.insert("PATH".to_owned(), store.clone());
+                let env: buck2_hash::BuckFixedSortedMap<String, String> =
+                    [("PATH".to_owned(), store.clone())].into_iter().collect();
                 CommandExecutionRequest::new(
                     vec![],
                     vec![script.to_owned(), "module::case".to_owned()],

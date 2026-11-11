@@ -87,7 +87,7 @@ pub(crate) fn convert_test_result(
 
 fn convert_test_result_origin(
     origin: buck2_test_api::data::TestResultOrigin,
-) -> Option<buck2_data::TestResultReuse> {
+) -> Option<Box<buck2_data::TestResultReuse>> {
     match origin {
         buck2_test_api::data::TestResultOrigin::Fresh => None,
         buck2_test_api::data::TestResultOrigin::Reused(
@@ -97,12 +97,12 @@ fn convert_test_result_origin(
                 current_attempt,
                 current_execution_time,
             },
-        ) => Some(buck2_data::TestResultReuse {
+        ) => Some(Box::new(buck2_data::TestResultReuse {
             origin_attempt,
             entry_manifest,
             current_attempt,
             current_execution_time: current_execution_time.try_into().ok(),
-        }),
+        })),
     }
 }
 
@@ -238,12 +238,12 @@ mod tests {
         assert_eq!(fresh.reuse, None);
         assert_eq!(
             reused.reuse,
-            Some(buck2_data::TestResultReuse {
+            Some(Box::new(buck2_data::TestResultReuse {
                 origin_attempt: "origin-attempt".to_owned(),
                 entry_manifest: "entry-manifest".to_owned(),
                 current_attempt: "current-attempt".to_owned(),
                 current_execution_time: Some(Duration::ZERO.try_into()?),
-            })
+            }))
         );
         // Everything but the provenance is the parsed entry, unchanged.
         assert_eq!(

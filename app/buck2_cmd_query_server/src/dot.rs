@@ -24,9 +24,9 @@ use std::fmt::Display;
 use std::io::Write;
 use std::sync::LazyLock;
 
+use buck2_hash::BuckMutInsertionMap;
 use buck2_hash::BuckMutMap;
 use regex::Regex;
-use starlark_map::small_map::SmallMap;
 
 pub(crate) mod targets;
 
@@ -35,7 +35,7 @@ pub(crate) struct DotNodeAttrs {
     pub(crate) style: Option<String>,
     pub(crate) color: Option<String>,
     pub(crate) label: Option<String>,
-    pub(crate) extra: SmallMap<String, String>,
+    pub(crate) extra: BuckMutInsertionMap<String, String>,
 }
 
 impl Display for DotNodeAttrs {
@@ -103,13 +103,14 @@ fn escape_id(value: &str) -> String {
     static RE_STRING: LazyLock<Regex> =
         LazyLock::new(|| Regex::new("^[a-zA-Z_][a-zA-Z_0-9]*$").unwrap());
     static RE_NUMBER: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new("^-?(.[0-9]+ | [0-9]+.[0-9]*)$").unwrap());
+        LazyLock::new(|| Regex::new("^-?(\\.[0-9]+|[0-9]+(\\.[0-9]*)?)$").unwrap());
 
     if RE_STRING.is_match(value) || RE_NUMBER.is_match(value) {
         return value.to_owned();
     }
 
-    format!("\"{}\"", value.replace('"', "\\\""))
+    // Backslashes first: a trailing `\` would otherwise escape the closing quote.
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 pub(crate) struct Dot {}
@@ -180,5 +181,78 @@ impl DotCompact {
         })?;
         writeln!(w, "}}")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct OneNode(&'static str);
+    struct N(&'static str);
+
+    impl DotNode for N {
+        fn attrs(&self) -> buck2_error::Result<DotNodeAttrs> {
+            let mut extra = BuckMutInsertionMap::new();
+            extra.insert("buck_description".to_owned(), self.0.to_owned());
+            Ok(DotNodeAttrs {
+                extra,
+                ..DotNodeAttrs::default()
+            })
+        }
+
+        fn id(&self) -> String {
+            "root//escapes:q".to_owned()
+        }
+    }
+
+    impl<'a> DotDigraph<'a> for OneNode {
+        type Node = N;
+
+        fn name(&self) -> &str {
+            "result_graph"
+        }
+
+        fn for_each_node<F: FnMut(&N) -> buck2_error::Result<()>>(
+            &'a self,
+            mut f: F,
+        ) -> buck2_error::Result<()> {
+            f(&N(self.0))
+        }
+
+        fn for_each_edge<F: FnMut(&DotEdge) -> buck2_error::Result<()>>(
+            &'a self,
+            _node: &N,
+            _f: F,
+        ) -> buck2_error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn render(value: &'static str) -> String {
+        let mut out = Vec::new();
+        Dot::render(&OneNode(value), &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// An attribute value ending in a backslash is escaped, so the quoted DOT string ends where it should.
+    #[test]
+    fn test_attr_value_with_trailing_backslash() {
+        assert_eq!(
+            render("C:\\dir\\"),
+            "digraph result_graph {\n  \"root//escapes:q\" [buck_description=\"C:\\\\dir\\\\\"];\n}\n"
+        );
+    }
+
+    /// The number pattern of `escape_id` matches DOT numerals and nothing else, so other values are quoted.
+    #[test]
+    fn test_attr_value_against_the_number_pattern() {
+        assert_eq!(
+            render("-O2 "),
+            "digraph result_graph {\n  \"root//escapes:q\" [buck_description=\"-O2 \"];\n}\n"
+        );
+        assert_eq!(escape_id("1.5"), "1.5");
+        assert_eq!(escape_id("-7"), "-7");
+        assert_eq!(escape_id(".5"), ".5");
     }
 }

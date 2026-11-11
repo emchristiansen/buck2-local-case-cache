@@ -19,11 +19,10 @@ use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::target::name::TargetName;
 use buck2_error::BuckErrorContext;
-use buck2_hash::BuckIndexMap;
+use buck2_hash::BuckMutInsertionMap;
 use dice::DiceComputations;
 use dupe::Dupe;
 use futures::FutureExt;
-use gazebo::prelude::VecExt;
 
 use crate::file_ops::trait_::DiceFileOps;
 use crate::file_ops::trait_::FileOps;
@@ -33,7 +32,7 @@ use crate::pattern::package_roots::find_package_roots;
 /// Targets are not validated yet, and `:` is not yet expanded.
 #[derive(Debug)]
 pub struct ResolvedPattern<T: PatternType> {
-    pub specs: BuckIndexMap<PackageLabelWithModifiers, PackageSpec<T>>,
+    pub specs: BuckMutInsertionMap<PackageLabelWithModifiers, PackageSpec<T>>,
 }
 
 impl<T> ResolvedPattern<T>
@@ -42,7 +41,7 @@ where
 {
     pub fn new() -> Self {
         Self {
-            specs: BuckIndexMap::default(),
+            specs: BuckMutInsertionMap::default(),
         }
     }
 
@@ -78,26 +77,29 @@ where
 
 impl ResolvedPattern<ConfiguredProvidersPatternExtra> {
     pub fn convert_pattern<U: PatternType>(self) -> buck2_error::Result<ResolvedPattern<U>> {
-        let mut specs = BuckIndexMap::with_capacity(self.specs.len());
+        let mut specs = BuckMutInsertionMap::with_capacity(self.specs.len());
         for (package_with_modifiers, spec) in self.specs {
             let spec = match spec {
-                PackageSpec::Targets(targets) => {
-                    PackageSpec::Targets(targets.into_try_map(|(target_name, extra)| {
-                        let extra = U::from_configured_providers(extra.clone())
-                            .with_buck_error_context(|| {
-                                format!(
-                                    "Expecting {} pattern, got `{}`",
-                                    U::NAME,
-                                    display_precise_pattern(
-                                        &package_with_modifiers.package,
-                                        target_name.as_ref(),
-                                        &extra,
-                                    ),
-                                )
-                            })?;
-                        buck2_error::Ok((target_name, extra))
-                    })?)
-                }
+                PackageSpec::Targets(targets) => PackageSpec::Targets(
+                    targets
+                        .into_iter()
+                        .map(|(target_name, extra)| {
+                            let extra = U::from_configured_providers(extra.clone())
+                                .with_buck_error_context(|| {
+                                    format!(
+                                        "Expecting {} pattern, got `{}`",
+                                        U::NAME,
+                                        display_precise_pattern(
+                                            &package_with_modifiers.package,
+                                            target_name.as_ref(),
+                                            &extra,
+                                        ),
+                                    )
+                                })?;
+                            buck2_error::Ok((target_name, extra))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
                 PackageSpec::All() => PackageSpec::All(),
             };
             specs.insert(package_with_modifiers, spec);
@@ -154,7 +156,7 @@ async fn resolve_target_patterns_impl<P: PatternType>(
                 resolved.add_package(package.dupe(), Modifiers::new(None));
             }
             ParsedPattern::Recursive(cell_path) => {
-                let roots = find_package_roots(cell_path.clone(), file_ops)
+                let roots = find_package_roots(*cell_path, file_ops)
                     .await
                     .buck_error_context("Error resolving recursive target pattern.")?;
                 for package in roots {
@@ -186,7 +188,7 @@ async fn resolve_target_patterns_with_modifiers_impl<P: PatternType>(
                 resolved.add_package(package.dupe(), pattern.modifiers.clone());
             }
             ParsedPattern::Recursive(cell_path) => {
-                let roots = find_package_roots(cell_path.clone(), file_ops)
+                let roots = find_package_roots(*cell_path, file_ops)
                     .await
                     .buck_error_context("Error resolving recursive target pattern.")?;
                 for package in roots {
@@ -224,7 +226,6 @@ mod tests {
     use buck2_core::provider::label::ProvidersName;
     use buck2_core::target::name::TargetName;
     use dupe::Dupe;
-    use gazebo::prelude::*;
     use test_case::test_case;
 
     use crate::file_ops::testing::TestFileOps;
@@ -274,15 +275,18 @@ mod tests {
         where
             T: PatternType,
         {
-            let patterns: Vec<_> = patterns.map(|p| {
-                ParsedPattern::<T>::parse_precise(
-                    p,
-                    CellName::testing_new("root"),
-                    &self.resolver,
-                    self.resolver.root_cell_cell_alias_resolver(),
-                )
-                .unwrap()
-            });
+            let patterns: Vec<_> = patterns
+                .iter()
+                .map(|p| {
+                    ParsedPattern::<T>::parse_precise(
+                        p,
+                        CellName::testing_new("root"),
+                        &self.resolver,
+                        self.resolver.root_cell_cell_alias_resolver(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
 
             resolve_target_patterns_impl(&patterns, &*self.file_ops).await
         }

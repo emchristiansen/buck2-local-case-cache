@@ -215,6 +215,7 @@ CxxInternalTools = provider(
         make_comp_db = RunInfo,
         remap_cwd = RunInfo,
         serialized_diagnostics_to_json_wrapper = RunInfo,
+        shlib_interface_link_wrapper = RunInfo,
         stderr_to_file = RunInfo,
         stub_header_unit = RunInfo,
     )
@@ -266,6 +267,9 @@ RuntimeDependencyHandling = enum(
 # only depend on the compilers it actually needs.
 CxxToolchainInfo = provider(
     fields = {
+        # Upload remote dep-file cache entries for compile actions that declare
+        # dep files (and look them up on a regular action-cache miss).
+        "allow_dep_file_cache_upload": provider_field(bool, default = False),
         "as_compiler_info": provider_field(typing.Any, default = None),
         "asm_compiler_info": provider_field(typing.Any, default = None),
         "binary_utilities_info": provider_field(typing.Any, default = None),
@@ -367,6 +371,7 @@ def cxx_toolchain_infos(
     object_format = CxxObjectFormat("native"),
     use_distributed_thinlto = False,
     use_dep_files = False,
+    allow_dep_file_cache_upload = False,
     clang_remarks = None,
     clang_llvm_statistics = False,
     gcno_files = None,
@@ -458,6 +463,7 @@ def cxx_toolchain_infos(
         strip_flags_info = strip_flags_info,
         minimum_os_version = minimum_os_version,
         use_dep_files = use_dep_files,
+        allow_dep_file_cache_upload = allow_dep_file_cache_upload,
         use_distributed_thinlto = use_distributed_thinlto,
         cxx_error_handler = cxx_error_handler,
         supported_compile_flavors = supported_compile_flavors,

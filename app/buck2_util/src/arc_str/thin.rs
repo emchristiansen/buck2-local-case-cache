@@ -32,7 +32,6 @@ use strong_hash::StrongHash;
 
 use crate::arc_str::base::ArcStrBase;
 use crate::arc_str::base::ArcStrBaseInner;
-use crate::arc_str::base::ArcStrBaseInnerConst;
 use crate::arc_str::base::ArcStrLenStrategy;
 use crate::size_assert;
 
@@ -54,7 +53,7 @@ unsafe impl ArcStrLenStrategy for ThinArcStrProperties {
     }
 
     #[inline]
-    fn inner_empty() -> &'static ArcStrBaseInnerConst<Self> {
+    fn inner_empty() -> &'static ArcStrBaseInner<Self> {
         &INNER_EMPTY
     }
 }
@@ -84,6 +83,10 @@ impl ArcErase for ThinArcStr {
 
     fn downgrade(&self) -> Option<Self::Weak> {
         None
+    }
+
+    fn is_unique(&self) -> bool {
+        self.base.is_unique()
     }
 
     fn serialize_inner(
@@ -118,7 +121,7 @@ impl<'de> PagableDeserialize<'de> for ThinArcStr {
 size_assert::words_of_type!(ThinArcStr, 1);
 size_assert::words_of_type!(Option<ThinArcStr>, 1);
 
-static INNER_EMPTY: ArcStrBaseInnerConst<ThinArcStrProperties> = ArcStrBaseInner::EMPTY;
+static INNER_EMPTY: ArcStrBaseInner<ThinArcStrProperties> = ArcStrBaseInner::empty();
 
 impl ThinArcStr {
     #[inline]
@@ -247,16 +250,111 @@ mod tests {
 
     #[test]
     fn test_little_stress_test() {
-        for i in 0..100 {
+        // Interpreted, a string costs milliseconds on the Windows CI hosts.
+        let (rounds, churn) = if cfg!(miri) { (20, 100) } else { (100, 1000) };
+        for i in 0..rounds {
             let strings = (0..i)
                 .map(|i| ThinArcStr::from(i.to_string()))
                 .collect::<Vec<_>>();
-            for j in 0..1000 {
+            for j in 0..churn {
                 let _ignore = ThinArcStr::from(j.to_string());
             }
             for (k, s) in strings.iter().enumerate() {
                 assert_eq!(k.to_string(), s.as_str());
             }
+        }
+    }
+
+    // Re-runs the test binary as a subprocess, which Miri cannot.
+    #[cfg(all(unix, not(miri)))]
+    mod allocation_failure {
+        use std::alloc::GlobalAlloc;
+        use std::alloc::Layout;
+        use std::alloc::System;
+        use std::ffi::CStr;
+        use std::mem;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+
+        use crate::arc_str::base::ArcStrBaseInner;
+        use crate::arc_str::thin::ThinArcStr;
+        use crate::arc_str::thin::ThinArcStrProperties;
+
+        const LEN: usize = 1_234_567;
+        const HELPER_ENV: &CStr = c"BUCK2_UTIL_ARC_STR_ALLOCATION_FAILURE_HELPER";
+
+        /// The size of the heap block behind a `LEN`-byte `ThinArcStr`.
+        fn failing_size() -> usize {
+            mem::size_of::<ArcStrBaseInner<ThinArcStrProperties>>() + LEN
+        }
+
+        /// `System`, except that in the helper subprocess an allocation of exactly
+        /// `failing_size()` bytes fails. The decision reads only the layout and the environment:
+        /// the optimizer assumes that allocator calls do not touch program memory, so a flag in
+        /// a static would not be reliable here.
+        struct FailStringAllocation;
+
+        unsafe impl GlobalAlloc for FailStringAllocation {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                if layout.size() == failing_size()
+                    && !unsafe { libc::getenv(HELPER_ENV.as_ptr()) }.is_null()
+                {
+                    return std::ptr::null_mut();
+                }
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: FailStringAllocation = FailStringAllocation;
+
+        /// Does the work only in the subprocess spawned by `is_reported`.
+        #[test]
+        fn helper() {
+            if std::env::var_os(HELPER_ENV.to_str().unwrap()).is_none() {
+                return;
+            }
+            let s = "a".repeat(LEN);
+            std::hint::black_box(ThinArcStr::from(s.as_str()));
+        }
+
+        #[test]
+        fn is_reported() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "arc_str::thin::tests::allocation_failure::helper",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV.to_str().unwrap(), "1")
+                .output()
+                .unwrap();
+            // The test harness may run the helper in a child of its own and report the child's
+            // fate in its own output, so look at everything.
+            let report = format!(
+                "{:?}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The failed allocation is reported by `handle_alloc_error`, which aborts.
+            assert!(
+                report.contains(&format!(
+                    "memory allocation of {} bytes failed",
+                    failing_size()
+                )),
+                "{report}"
+            );
+            assert!(
+                output.status.signal() != Some(libc::SIGSEGV)
+                    && !report.contains("signal 11")
+                    && !report.contains("SIGSEGV"),
+                "{report}"
+            );
         }
     }
 }

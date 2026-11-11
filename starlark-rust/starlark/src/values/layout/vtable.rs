@@ -104,9 +104,11 @@ impl StarlarkValueRawPtr {
 
         // `self.ptr` is a pointer to the end of `AValueHeader`.
         // Align it up to `T` by adding padding between `AValueRepr` fields.
-        let ptr = self.ptr as usize + AValueRepr::<T>::padding_after_header();
-        debug_assert!(ptr.is_multiple_of(mem::align_of::<T>()));
-        ptr as *mut T
+        let ptr = self
+            .ptr
+            .wrapping_byte_add(AValueRepr::<T>::padding_after_header());
+        debug_assert!(ptr.addr().is_multiple_of(mem::align_of::<T>()));
+        ptr.cast::<T>().cast_mut()
     }
 
     #[inline]
@@ -320,16 +322,16 @@ impl AValueVTable {
 
     #[inline]
     pub(crate) fn type_value(&'static self) -> StringValue<'static> {
-        (self.starlark_value.get_type_value_static)()
+        (self.starlark_value.ty.get_type_value_static)()
     }
 
     pub(crate) fn type_starlark_repr(&'static self) -> Ty {
-        (self.starlark_value.get_type_starlark_repr)()
+        (self.starlark_value.ty.get_type_starlark_repr)()
     }
 
     #[inline]
     pub(crate) fn methods(&'static self) -> Option<&'static Methods> {
-        (self.starlark_value.get_methods)()
+        (self.starlark_value.ty.get_methods)()
     }
 
     pub(crate) fn drop_in_place(&'static self, value: StarlarkValueRawPtr) {
@@ -342,7 +344,8 @@ impl AValueVTable {
 pub(crate) struct AValueDyn<'v> {
     pub(crate) value: StarlarkValueRawPtr,
     vtable: &'static AValueVTable,
-    _marker: PhantomData<&'v ()>,
+    // Invariant in the brand, like every carrier of one.
+    _marker: PhantomData<fn(&'v ()) -> &'v ()>,
 }
 
 impl<'v> Debug for AValueDyn<'v> {

@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -54,6 +55,7 @@ INHERITED_ENV = [
     "SESSION_ID",
     "ACTION_DIGEST",
     "RE_PLATFORM",
+    "BUDGET_ENTITY",
     "CAS_DAEMON_PORT",
     "CAS_DAEMON_ADDR",
     # Required by Dotslash, which is how the Rust toolchain is shipped on Mac.
@@ -103,16 +105,39 @@ if sys.version_info[:2] < (3, 7):
 
 
 def key_value_arg(s: str) -> tuple[str, str]:
-    s = arg_eval(s)
+    return plain_key_value_arg(arg_eval(s))
+
+
+def plain_key_value_arg(s: str) -> tuple[str, str]:
+    """Splits without evaluating `$(`: `--env` values are decoded and evaluated in `main`."""
     key_value = s.split("=", maxsplit=1)
     if len(key_value) == 2:
         return (key_value[0], key_value[1])
     raise argparse.ArgumentTypeError(f"expected the form `key=value` for `{s}`")
 
 
+_ENV_ESCAPE_RE = re.compile(r"\\(?:[\\nrvf]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4})")
+_ENV_ESCAPES = {"\\": "\\", "n": "\n", "r": "\r", "v": "\x0b", "f": "\x0c"}
+
+
+def _decode_env_escape(match: re.Match[str]) -> str:
+    escape = match.group()[1:]
+    if escape[0] in "xu":
+        return chr(int(escape[1:], 16))
+    return _ENV_ESCAPES[escape]
+
+
+def unescape_env_value(value: str) -> str:
+    """Undo the escaping `process_env` in build.bzl applies so that a value fits on one line
+    of the argfile: `\\\\`, `\\n`, `\\r`, `\\v`, `\\f`, `\\xHH` and `\\uHHHH`, decoded in one
+    left-to-right pass. A backslash that starts no such escape is kept as it is."""
+    return _ENV_ESCAPE_RE.sub(_decode_env_escape, value)
+
+
 class Args(NamedTuple):
     diag_json: Optional[IO[bytes]]
     diag_txt: Optional[IO[bytes]]
+    passthrough_stderr: bool
     env: Optional[list[tuple[str, str]]]
     path_env: Optional[list[tuple[str, str]]]
     remap_cwd_prefix: Optional[str]
@@ -120,6 +145,7 @@ class Args(NamedTuple):
     buck_target: Optional[str]
     failure_filter: Optional[IO[bytes]]
     required_output: Optional[list[tuple[str, str]]]
+    keep_outputs_on_error: bool
     echo: Optional[IO[bytes]]
     strip_dwo_members: Optional[str]
     archiver: Optional[list[str]]
@@ -127,7 +153,7 @@ class Args(NamedTuple):
     rustc: list[str]
 
 
-def arg_parse() -> Args:
+def arg_parse(argv: Optional[list[str]] = None) -> Args:
     # Command line is <action.py> [args] -- rustc command line
     parser = argparse.ArgumentParser(fromfile_prefix_chars="@")
     parser.add_argument(
@@ -142,9 +168,15 @@ def arg_parse() -> Args:
         help="Rendered text diagnostic output (also streamed to stderr)",
     )
     parser.add_argument(
+        "--passthrough-stderr",
+        action="store_true",
+        help="Copy stderr through verbatim without diagnostic parsing "
+        "(for commands whose output is not rustc JSON diagnostics)",
+    )
+    parser.add_argument(
         "--env",
         action="append",
-        type=key_value_arg,
+        type=plain_key_value_arg,
         metavar="NAME=VALUE",
         help="Set environment",
     )
@@ -185,6 +217,12 @@ def arg_parse() -> Args:
         "(and filled with a placeholder on a filtered failure)",
     )
     parser.add_argument(
+        "--keep-outputs-on-error",
+        action="store_true",
+        help="Count the required outputs rustc writes even when it reports errors "
+        "(an expansion is usable even if the expanded crate does not compile)",
+    )
+    parser.add_argument(
         "--echo",
         type=argparse.FileType("wb"),
         help="Write the input command line to this file, without running it",
@@ -209,11 +247,10 @@ def arg_parse() -> Args:
     parser.add_argument(
         "rustc",
         nargs=argparse.REMAINDER,
-        type=arg_eval,
         help="Compiler command line",
     )
 
-    args = Args(**vars(parser.parse_args()))
+    args = Args(**vars(parser.parse_args(argv)))
     if args.strip_dwo_members is not None and not args.archiver:
         parser.error("--strip-dwo-members requires --archiver")
     return args
@@ -337,6 +374,10 @@ async def handle_output(  # noqa: C901
         if line is None or line == b"":
             break
 
+        if args.passthrough_stderr:
+            sys.stderr.buffer.write(line)
+            continue
+
         try:
             diag = json.loads(line)
         except json.JSONDecodeError:
@@ -403,20 +444,39 @@ async def handle_output(  # noqa: C901
 
 
 async def main() -> int:  # noqa: C901
-    args = arg_parse()
+    # `--program-args` is a raw argv boundary, split off before argparse's
+    # response-file expansion so the tail is never inspected or rewritten.
+    # First raw occurrence wins; absence (None) means ordinary behavior,
+    # while an empty tail still emits a literal `--`. No wrapper option
+    # takes a separate value that could equal this token.
+    raw_argv = sys.argv[1:]
+    program_args = None
+    if "--program-args" in raw_argv:
+        split = raw_argv.index("--program-args")
+        program_args = raw_argv[split + 1 :]
+        raw_argv = raw_argv[:split]
+    args = arg_parse(raw_argv)
+
+    if program_args is None:
+        # No boundary: historical behavior; expand everything.
+        positional = [arg_eval(arg) for arg in args.rustc]
+    else:
+        # With a boundary only compiler arguments expand; the prefix stays
+        # raw apart from OUT_DIR resolution below.
+        positional = list(args.rustc)
+    args = args._replace(rustc=positional)
 
     if args.echo:
-        args.echo.write("".join(arg + "\n" for arg in args.rustc).encode("utf-8"))
+        echo_argv = list(args.rustc)
+        if program_args is not None:
+            echo_argv += ["--program-args"] + program_args
+        args.echo.write("".join(arg + "\n" for arg in echo_argv).encode("utf-8"))
         return 0
 
     # Inherit a very limited initial environment, then add the new things
     env = inherited_env()
     if args.env:
-        # Unescape previously escaped newlines.
-        # Example: \\\\n\\n -> \\\n\n -> \\n\n
-        env.update(
-            {k: v.replace("\\n", "\n").replace("\\\n", "\\n") for k, v in args.env}
-        )
+        env.update({k: arg_eval(unescape_env_value(v)) for k, v in args.env})
     if args.path_env:
         env.update({k: os.path.abspath(v) for k, v in args.path_env})
 
@@ -425,10 +485,20 @@ async def main() -> int:  # noqa: C901
     if DEBUG:
         print(f"args {repr(args)} env {env} crate_map {crate_map}", end="\n")
 
+    out_dir = env.get("OUT_DIR")
+
     separator = args.rustc.index("--rustc-action-separator")
     rustc_cmd, rustc_args_orig = args.rustc[:separator], args.rustc[separator + 1 :]
-
-    out_dir = env.get("OUT_DIR")
+    if program_args is not None:
+        # Expansion applies to compiler arguments only.
+        rustc_args_orig = [arg_eval(arg) for arg in rustc_args_orig]
+        if out_dir is not None:
+            rustc_cmd = [
+                arg.replace(OUT_DIR_SENTINEL, out_dir)
+                if OUT_DIR_SENTINEL in arg
+                else arg
+                for arg in rustc_cmd
+            ]
 
     rustc_args = []
     for arg in rustc_args_orig:
@@ -469,6 +539,17 @@ async def main() -> int:  # noqa: C901
             )
         )
 
+    # The tail travels as raw argv past the response file; Miri scans raw
+    # argv itself, so the separator must not hide inside the file.
+    prog_tail_argv = []
+    if program_args is not None:
+        prog_tail_argv = ["--", *program_args]
+
+    if args.failure_filter and args.keep_outputs_on_error:
+        for _short, path in args.required_output or []:
+            if Path(path).exists():
+                Path(path).unlink()
+
     with tempfile.NamedTemporaryFile(
         mode="wb",
         prefix="rustc-args-",
@@ -485,6 +566,7 @@ async def main() -> int:  # noqa: C901
         proc = await asyncio.create_subprocess_exec(
             *rustc_cmd,
             "@" + args_file.name,
+            *prog_tail_argv,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=None,  # Inherit
@@ -534,9 +616,16 @@ async def main() -> int:  # noqa: C901
         # files which were *actuallyq* created. We use the short paths as the
         # logical filename rather than the actual full path, since that won't
         # mean much to a downstream action.
+        # An output at its path is only this run's when rustc succeeded: an action that keeps
+        # its outputs (incremental compiles) starts with the previous run's, and a filtered
+        # failure leaves a placeholder behind. `--keep-outputs-on-error` deletes them first.
         build_status = {
             "status": res,
-            "files": [short for short, path in required_output if Path(path).exists()],
+            "files": [
+                short
+                for short, path in required_output
+                if (res == 0 or args.keep_outputs_on_error) and Path(path).exists()
+            ],
         }
         args.failure_filter.write(
             json.dumps(build_status, separators=(",", ":")).encode() + b"\n"
@@ -554,4 +643,5 @@ async def main() -> int:  # noqa: C901
     return res
 
 
-sys.exit(asyncio.run(main()))
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

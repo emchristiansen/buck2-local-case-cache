@@ -121,7 +121,13 @@ pub(crate) fn to_project_json(
         let info = target_index.get(target).unwrap();
 
         let dep_targets = resolve_aliases(&info.deps, &aliases, &proc_macros);
-        let deps = as_deps(&dep_targets, info, &targets_to_ids, &target_index);
+        let overridden_names = resolve_named_deps(&info.named_deps, &aliases, &proc_macros);
+        let deps = as_deps(
+            &dep_targets,
+            overridden_names,
+            &targets_to_ids,
+            &target_index,
+        );
 
         let edition = match &info.edition {
             Some(edition) => edition.clone(),
@@ -220,12 +226,37 @@ pub(crate) fn to_project_json(
             None
         };
 
+        // Should this target be considered part of rust-analyzer's workspace?
+        //
+        // When rust-analyzer monitors files for changes, it only considers files
+        // in the workspace. This only applies when rust-analyzer.files.watcher is
+        // set to "server", the default is "client" (i.e. VS Code watches the
+        // files).
+        //
+        // <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/rust-analyzer/src/reload.rs#L722>
+        //
+        // The only other (minor) effect of rust-analyzer's workspaces is that it can
+        // affect the values of cfg(rust_analyzer) and cfg(test).
+        //
+        // <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/project-model/src/workspace.rs#L1129>
+        //
+        // ---
+        //
+        // For comparison, rust-analyzer uses is_local in cargo projects similarly
+        // to workspaces, to decide which directories to watch. This effectively
+        // means that it watches files in the current repository, but not files
+        // from dependencies.
+        //
+        // <https://github.com/rust-lang/cargo/blob/01e42b9bf1776d78d1714c63b927154539c741b4/src/cargo/core/features.rs#L440>
+        // <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/load-cargo/src/lib.rs#L308-L309>
+        let is_workspace_member = info.in_workspace;
+
         let crate_info = Crate {
             display_name: Some(info.display_name()),
             root_module,
             edition,
             deps,
-            is_workspace_member: info.is_workspace_member(),
+            is_workspace_member,
             source: Some(Source {
                 include_dirs,
                 exclude_dirs: vec![],
@@ -375,15 +406,31 @@ fn resolve_aliases(
     resolved_targets
 }
 
+/// `named_deps` is a mapping from names used in Rust source code for imports to
+/// target names. Return the reverse mapping target->name, but ensure target
+/// names are fully resolved (not aliases).
+fn resolve_named_deps(
+    named_deps: &FxHashMap<String, Target>,
+    aliases: &FxHashMap<Target, AliasedTargetInfo>,
+    proc_macros: &FxHashMap<Target, MacroOutput>,
+) -> FxHashMap<Target, String> {
+    named_deps
+        .iter()
+        .flat_map(|(name, target)| {
+            resolve_aliases(std::slice::from_ref(target), aliases, proc_macros)
+                .into_iter()
+                .map(|resolved| (resolved, name.to_owned()))
+        })
+        .collect()
+}
+
 /// Convert `dep_targets` to `Dep` values.
 fn as_deps(
     dep_targets: &[Target],
-    info: &TargetInfo,
+    overridden_names: FxHashMap<Target, String>,
     target_to_ids: &FxHashMap<&Target, usize>,
     target_index: &FxHashMap<Target, TargetInfo>,
 ) -> Vec<Dep> {
-    let overridden_names = info.overridden_dep_names();
-
     let mut seen_targets = FxHashSet::default();
 
     let mut deps = vec![];
@@ -570,7 +617,7 @@ impl Buck {
         Ok(stdout.into())
     }
 
-    pub(crate) fn resolve_sysroot_src(&self) -> Result<PathBuf, anyhow::Error> {
+    pub(crate) fn resolve_sysroot_src(&self) -> Result<Option<PathBuf>, anyhow::Error> {
         let mut command = self.command(["audit", "config"]);
         command.args(["--json", "--", "rust.sysroot_src_path"]);
         command
@@ -585,7 +632,7 @@ impl Buck {
         #[derive(Deserialize)]
         struct BuckConfig {
             #[serde(rename = "rust.sysroot_src_path")]
-            sysroot_src_path: PathBuf,
+            sysroot_src_path: Option<PathBuf>,
         }
         let cfg: BuckConfig = deserialize_output(child.wait_with_output(), &command)?;
         Ok(cfg.sysroot_src_path)
@@ -716,7 +763,7 @@ impl Buck {
         Ok(alias_map)
     }
 
-    /// Work out which items in `sysroot_package` (e.g. `fbsource//xplat/rust/toolchain/sysroot/1.93.0:`) are
+    /// Work out which items in `sysroot_package` (e.g. `fbsource//third-party/rust-toolchain/1.98.1/rust:`) are
     /// visible to `universe_targets` (e.g. `fbcode//your/wonderful:project`).
     pub(crate) fn query_sysroot_targets(
         &self,
@@ -1515,7 +1562,17 @@ fn named_deps_underscores() {
     targets_to_ids.insert(&bar_target, 0);
 
     let dep_targets = resolve_aliases(&info.deps, &FxHashMap::default(), &FxHashMap::default());
-    let deps = as_deps(&dep_targets, &info, &targets_to_ids, &target_index);
+    let overridden_names = resolve_named_deps(
+        &info.named_deps,
+        &FxHashMap::default(),
+        &FxHashMap::default(),
+    );
+    let deps = as_deps(
+        &dep_targets,
+        overridden_names,
+        &targets_to_ids,
+        &target_index,
+    );
 
     assert_eq!(
         deps,

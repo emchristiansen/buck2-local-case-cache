@@ -24,7 +24,7 @@ use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
-use buck2_hash::buck_indexmap;
+use buck2_hash::buck_mut_insertion_map;
 use buck2_interpreter::file_loader::LoadedModule;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::paths::module::StarlarkModulePath;
@@ -46,7 +46,6 @@ use dupe::Dupe;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use gazebo::prelude::*;
 use itertools::Itertools;
 use ref_cast::RefCast;
 use serde::Serialize;
@@ -139,7 +138,11 @@ async fn get_transitive_includes(
 
             async_depth_first_postorder_traversal(
                 &lookup,
-                load_result.imports().map(NodeRef::ref_cast),
+                load_result
+                    .imports()
+                    .iter()
+                    .map(NodeRef::ref_cast)
+                    .collect::<Vec<_>>(),
                 Delegate,
                 visit,
                 false, // allow_partial_graph
@@ -158,7 +161,7 @@ async fn load_and_collect_includes(
 ) -> buck2_error::Result<Vec<ImportPath>> {
     let parent = path
         .parent()
-        .ok_or_else(|| AuditIncludesError::InvalidPath(path.clone()))?;
+        .ok_or_else(|| AuditIncludesError::InvalidPath(*path))?;
     let package = PackageLabel::from_cell_path(parent)?;
     let load_result = ctx.get_interpreter_results(package).await?;
 
@@ -169,11 +172,9 @@ async fn load_and_collect_includes(
             .file_name()
             .expect("checked that this has a parent above")
     {
-        return Err(AuditIncludesError::WrongBuildfilePath(
-            path.clone(),
-            buildfile_name.to_owned(),
-        )
-        .into());
+        return Err(
+            AuditIncludesError::WrongBuildfilePath(*path, buildfile_name.to_owned()).into(),
+        );
     }
 
     get_transitive_includes(ctx, load_result).await
@@ -244,10 +245,15 @@ impl ServerAuditSubcommand for AuditIncludesCommand {
                 };
                 let absolutize_paths =
                     |paths: Vec<ImportPath>| -> buck2_error::Result<Vec<AbsNormPathBuf>> {
-                        paths.into_try_map(&to_absolute_path)
+                        paths
+                            .into_iter()
+                            .map(&to_absolute_path)
+                            .collect::<Result<Vec<_>, _>>()
                     };
                 let results: Vec<(String, buck2_error::Result<Vec<AbsNormPathBuf>>)> = results
-                    .into_map(|(path, includes)| (path, includes.and_then(absolutize_paths)));
+                    .into_iter()
+                    .map(|(path, includes)| (path, includes.and_then(absolutize_paths)))
+                    .collect::<Vec<_>>();
 
                 let mut stdout = stdout.as_writer();
 
@@ -259,7 +265,7 @@ impl ServerAuditSubcommand for AuditIncludesCommand {
                     // it also, sadly, prints just a single list of outputs for that case. we match
                     // buck1's behavior for 1 successful file and print a dictionary for multiple. This is
                     // unfortunate, but we hope that users can migrate to the equivalent query commands instead.
-                    if let Some((_path, Ok(includes))) = results.as_singleton() {
+                    if let [(_path, Ok(includes))] = results.as_slice() {
                         includes.serialize(&mut ser)?
                     } else {
                         let mut map = ser.serialize_map(Some(results.len()))?;
@@ -267,11 +273,11 @@ impl ServerAuditSubcommand for AuditIncludesCommand {
                             match includes {
                                 Ok(includes) => map.serialize_entry(
                                     path,
-                                    &buck_indexmap! {"includes" => &includes},
+                                    &buck_mut_insertion_map! {"includes" => &includes},
                                 )?,
                                 Err(e) => map.serialize_entry(
                                     path,
-                                    &buck_indexmap! {"$error" => format!("{:#}", e)},
+                                    &buck_mut_insertion_map! {"$error" => format!("{:#}", e)},
                                 )?,
                             }
                         }

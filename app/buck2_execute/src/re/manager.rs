@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::async_once_cell::AsyncOnceCell;
 use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
@@ -46,7 +47,6 @@ use remote_execution::TActionResult2;
 use remote_execution::TDigest;
 use remote_execution::WriteActionResultResponse;
 
-use crate::digest_config::DigestConfig;
 use crate::directory::ActionImmutableDirectory;
 use crate::execute::action_digest::ActionDigest;
 use crate::execute::blobs::ActionBlobs;
@@ -59,6 +59,9 @@ use crate::re::client::ActionCacheWriteType;
 use crate::re::client::ExecuteResponseOrCancelled;
 use crate::re::client::RemoteExecutionClient;
 use crate::re::metadata::RemoteExecutionMetadataExt;
+use crate::re::presence::CasPresence;
+use crate::re::presence::NegativeCache;
+use crate::re::presence::Presence;
 use crate::re::re_get_session_id::ReGetSessionId;
 use crate::re::stats::RemoteExecutionClientStats;
 use crate::re::uploader::UploadStats;
@@ -262,6 +265,8 @@ impl ReConnectionManager {
             .fill_from_re_client_metrics(&client_stats.upload_storage_stats);
         res.download_stats
             .fill_from_re_client_metrics(&client_stats.download_storage_stats);
+        // Process-wide, so it is available whether or not a connection is open.
+        res.presence = CasPresence::global_stats().unwrap_or_default();
 
         // The rest of the fields are known to be their default value if we don't have a client, so
         // we ask the client to fill them iff we have one.
@@ -406,8 +411,6 @@ impl ManagedRemoteExecutionClient {
         dir_path: &ProjectRelativePath,
         input_dir: &ActionImmutableDirectory,
         identity: Option<&ReActionIdentity<'_>>,
-        digest_config: DigestConfig,
-        deduplicate_get_digests_ttl_calls: bool,
     ) -> buck2_error::Result<UploadStats> {
         self.lock()?
             .get()
@@ -420,9 +423,15 @@ impl ManagedRemoteExecutionClient {
                 input_dir,
                 self.use_case,
                 identity,
-                digest_config,
-                deduplicate_get_digests_ttl_calls,
             )
+            .await
+    }
+
+    pub async fn upload_blobs(&self, blobs: &ActionBlobs) -> buck2_error::Result<UploadStats> {
+        self.lock()?
+            .get()
+            .await?
+            .upload_blobs(blobs, self.use_case)
             .await
     }
 
@@ -527,6 +536,23 @@ impl ManagedRemoteExecutionClient {
             .await?
             .upload_blob(blob, &self.no_action_metadata)
             .await
+    }
+
+    /// See [`RemoteExecutionClient::check_presence`]; misses and failures are classified per
+    /// `info`, whose use case must be this client's.
+    pub async fn check_presence(
+        &self,
+        digests: Vec<TrackedFileDigest>,
+        negative_cache: NegativeCache,
+        info: &CasDownloadInfo,
+    ) -> buck2_error::Result<Vec<Presence>> {
+        let result = self
+            .lock()?
+            .get()
+            .await?
+            .check_presence(self.use_case, digests, negative_cache)
+            .await;
+        self.classify_cas_result(info, result)
     }
 
     pub async fn get_digest_expirations(

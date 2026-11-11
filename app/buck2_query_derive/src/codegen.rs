@@ -269,6 +269,13 @@ fn gen_for_method(parsed: &Parsed, method: &Method) -> syn::Result<MethodCodegen
                         evaluator: &QueryEvaluator<#env_ident>,
                         args: &[SpannedExpr<'_>],
                     ) -> Result<QueryValue<#env_target>, QueryError> {
+                        if args.len() > #max_args {
+                            return Err(QueryError::TooManyArgs {
+                                function: self.name().to_owned(),
+                                max: #max_args,
+                                actual: args.len(),
+                            });
+                        }
                         self.0.#func_ident(
                             #pass_ctx
                             #(#pass_args,)*
@@ -349,7 +356,7 @@ pub(crate) fn codegen(parsed: Parsed) -> syn::Result<TokenStream> {
 
             use ::buck2_query::__derive_refs::ref_cast::RefCast;
             use ::buck2_query::__derive_refs::buck2_query_parser::{BinaryOp, SpannedExpr};
-            use ::buck2_query::__derive_refs::indexmap::indexmap;
+            use ::buck2_query::__derive_refs::buck2_hash::buck_mut_insertion_map;
             use ::buck2_query::__derive_refs::async_trait::async_trait;
 
             use super::*;
@@ -387,7 +394,7 @@ pub(crate) fn codegen(parsed: Parsed) -> syn::Result<TokenStream> {
             impl #impl_generics HasModuleDescription for #self_ty #where_clause {
                 fn describe() -> ModuleDescription {
                     ModuleDescription {
-                        functions: indexmap! {
+                        functions: buck_mut_insertion_map! {
                                 #(#method_describe,)*
                         },
                         #module_docs,

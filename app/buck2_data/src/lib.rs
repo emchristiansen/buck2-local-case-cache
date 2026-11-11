@@ -8,6 +8,9 @@
  * above-listed licenses.
  */
 
+// prost represents proto `map` fields as `std::collections::HashMap`.
+#![allow(clippy::disallowed_types)]
+
 use std::borrow::Cow;
 use std::fmt;
 
@@ -68,9 +71,74 @@ mod serialize_action_kind {
 
 tonic::include_proto!("buck.data");
 
+impl CallerKind {
+    /// Stable lowercase label for caller telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Agent => "agent",
+            Self::CommandShell => "command_shell",
+            Self::Other => "other",
+            Self::Wrapper => "wrapper",
+        }
+    }
+}
+
+impl AgentDetectionStopReason {
+    /// Stable lowercase label for caller telemetry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Agent => "agent",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+            Self::NoParent => "no_parent",
+            Self::ClientUnavailable => "client_unavailable",
+            Self::ParentUnavailable => "parent_unavailable",
+            Self::NewerParent => "newer_parent",
+            Self::Cycle => "cycle",
+            Self::DepthLimit => "depth_limit",
+        }
+    }
+}
+
+// Millions of these can be queued. Keep rare large payloads boxed so they
+// do not increase the allocation size of every common event.
+mini_vec::size_assert::words_of_expr!(BuckEvent::default(), ~40);
+
 pub mod error {
     tonic::include_proto!("buck.data.error");
 }
+
+// Preserve the event producers' `Into<Data>` conversions when a large variant is
+// boxed. The generated derives also provide conversions from the boxed payloads.
+macro_rules! impl_from_boxed_event {
+    ($data:ident, $($variant:ident($event:ident)),+ $(,)?) => {
+        $(
+            impl From<$event> for $data::Data {
+                fn from(event: $event) -> Self {
+                    Self::$variant(Box::new(event))
+                }
+            }
+        )+
+    };
+}
+
+impl_from_boxed_event!(
+    span_end_event,
+    DepFileUpload(DepFileUploadEnd),
+    TestDiscovery(TestDiscoveryEnd),
+    TestRun(TestRunEnd),
+);
+impl_from_boxed_event!(
+    instant_event,
+    ActionError(ActionError),
+    CleanStaleResult(CleanStaleResult),
+    PageOutSummary(PageOutSummary),
+    PagingSummary(PagingSummary),
+    RageResult(RageResult),
+    ResourceControlEvent(ResourceControlEvent),
+);
 
 /// Extract action digest from a list of command executions.
 /// Returns the action digest from the last command execution if available.

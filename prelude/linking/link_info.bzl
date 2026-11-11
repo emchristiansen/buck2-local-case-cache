@@ -49,8 +49,10 @@ ArchiveContentsType = enum(
 Archive = record(
     archive_contents_type = field(ArchiveContentsType, default = ArchiveContentsType("normal")),
     artifact = field(Artifact),
-    # For a thin archive, this contains all the referenced .o files
+    # Object files used to create the archive.
     external_objects = field(list[Artifact], []),
+    # Inputs required when a consumer links external_objects instead of artifact.
+    hidden = field(list[Artifact], []),
 )
 
 # The different strategies that are used to determine sharedlib/executable
@@ -290,6 +292,8 @@ def append_linkable_args(args: cmd_args, linkable: LinkableTypes):
 
             if not linkable.link_whole:
                 args.add("-Wl,--end-lib")
+
+            args.add(cmd_args(hidden = linkable.archive.hidden))
         elif linkable.link_whole:
             args.add(get_link_whole_args(linkable.linker_type, [linkable.archive.artifact]))
         else:
@@ -325,14 +329,38 @@ def append_linkable_args(args: cmd_args, linkable: LinkableTypes):
     else:
         fail("Encountered unhandled linkable {}".format(str(linkable)))
 
+# The artifacts `append_linkable_args` puts on the link line for `value`, in
+# order: an archive, or the objects of a virtual archive; a shared library, or
+# the interface the toolchain links against instead; every object of an
+# objects linkable. Frameworks and swiftmodules contribute none. Kept next to
+# `append_linkable_args` so the two agree.
+def link_info_outputs(value: LinkInfo) -> list[Artifact]:
+    outputs = []
+    for linkable in value.linkables:
+        if isinstance(linkable, ArchiveLinkable):
+            if linkable.archive.archive_contents_type == ArchiveContentsType("virtual"):
+                outputs.extend(linkable.archive.external_objects)
+            else:
+                outputs.append(linkable.archive.artifact)
+        elif isinstance(linkable, SharedLibLinkable):
+            outputs.append(linkable.lib)
+        elif isinstance(linkable, ObjectsLinkable):
+            outputs.extend(linkable.objects or [])
+        elif isinstance(linkable, FrameworksLinkable) or isinstance(linkable, SwiftmoduleLinkable):
+            pass
+        else:
+            fail("Encountered unhandled linkable {}".format(str(linkable)))
+    return outputs
+
 LinkInfoArgumentFilter = enum(
     "all",
     "object_files_and_lazy_archives_only",
     "exclude_object_files_and_lazy_archives",
 )
 
-def link_info_to_args(value: LinkInfo, argument_type_filter: LinkInfoArgumentFilter = LinkInfoArgumentFilter("all")) -> cmd_args:
-    result = cmd_args()
+def link_info_to_args(value: LinkInfo, argument_type_filter: LinkInfoArgumentFilter = LinkInfoArgumentFilter("all"), args: cmd_args | None = None) -> cmd_args:
+    """Append selected link arguments to args, or create a new command line, and return it."""
+    result = args if args != None else cmd_args()
 
     do_pre_post_flags = argument_type_filter == LinkInfoArgumentFilter("all") or argument_type_filter == LinkInfoArgumentFilter(
         "exclude_object_files_and_lazy_archives"
@@ -362,11 +390,13 @@ def link_info_to_args(value: LinkInfo, argument_type_filter: LinkInfoArgumentFil
 def _link_info_to_tbd_creation_args(value: LinkInfo) -> cmd_args:
     result = cmd_args()
     for linkable in value.linkables:
-        if isinstance(linkable, ArchiveLinkable) and linkable.archive.external_objects:
-            for object in linkable.archive.external_objects:
-                result.add(object)
-        elif isinstance(linkable, ArchiveLinkable):
-            result.add(linkable.archive.artifact)
+        if isinstance(linkable, ArchiveLinkable):
+            if linkable.archive.external_objects:
+                for object in linkable.archive.external_objects:
+                    result.add(object)
+            else:
+                result.add(linkable.archive.artifact)
+            result.add(cmd_args(hidden = linkable.archive.hidden))
         if isinstance(linkable, ObjectsLinkable):
             for object in linkable.objects:
                 result.add(object)
@@ -756,7 +786,8 @@ def unpack_link_args(args: LinkArgs, link_ordering: [LinkOrdering, None] = None,
         return cmd
 
     if args.infos != None:
-        cmd.add([link_info_to_args(info) for info in args.infos])
+        for info in args.infos:
+            link_info_to_args(info, args = cmd)
         return cmd
 
     if args.flags != None:

@@ -13,8 +13,8 @@ use std::mem;
 use std::sync::LazyLock;
 
 use buck2_core::provider::label::ProvidersLabel;
-use buck2_core::soft_error;
 use buck2_hash::BuckMutSet;
+use buck2_node::attrs::arena::AttrToken;
 use buck2_node::attrs::attr_type::arg::ArgAttrType;
 use buck2_node::attrs::attr_type::arg::MacroBase;
 use buck2_node::attrs::attr_type::arg::MacroDepKind;
@@ -22,13 +22,11 @@ use buck2_node::attrs::attr_type::arg::QueryExpansion;
 use buck2_node::attrs::attr_type::arg::StringWithMacrosPart;
 use buck2_node::attrs::attr_type::arg::UnconfiguredMacro;
 use buck2_node::attrs::attr_type::arg::UnconfiguredStringWithMacros;
-use buck2_node::attrs::attr_type::arg::UnrecognizedMacro;
 use buck2_node::attrs::attr_type::arg::parser;
 use buck2_node::attrs::attr_type::arg::parser::ParsedMacro;
 use buck2_node::attrs::attr_type::arg::parser::parse_macros;
 use buck2_node::attrs::attr_type::query::QueryAttrType;
 use buck2_node::attrs::attr_type::query::QueryMacroBase;
-use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::coercion_context::AttrCoercionContext;
 use buck2_node::attrs::configurable::AttrIsConfigurable;
 use starlark::typing::Ty;
@@ -64,20 +62,19 @@ enum MacroError {
 }
 
 impl AttrTypeCoerce for ArgAttrType {
-    fn coerce_item(
+    fn coerce_item<'v>(
         &self,
         _configurable: AttrIsConfigurable,
-        ctx: &dyn AttrCoercionContext,
-        value: Value,
-    ) -> buck2_error::Result<CoercedAttr> {
+        ctx: &dyn AttrCoercionContext<'v>,
+        value: Value<'v>,
+    ) -> buck2_error::Result<AttrToken> {
         let value = value.unpack_str_err()?;
 
         let mut items = parse_macros(value)?.into_items();
         if let [parser::ArgItem::String(val)] = items.as_mut_slice() {
             // Specialize single-item StringWithMacros, which are in fact the common case.
-            return Ok(CoercedAttr::Arg(UnconfiguredStringWithMacros::StringPart(
-                ctx.intern_str(&mem::take(val)),
-            )));
+            let arg = UnconfiguredStringWithMacros::StringPart(ctx.intern_str(&mem::take(val)));
+            return ctx.attr_arena().encode_arg(&arg);
         }
 
         let mut parts = Vec::with_capacity(items.len());
@@ -117,25 +114,9 @@ impl AttrTypeCoerce for ArgAttrType {
                             UnconfiguredMacro::new_user_keyed_placeholder(ctx, macro_type, args)?
                         }
                         _ => {
-                            // TODO(jtbraun): Remove the remaining generation sites and turn
-                            // this into a load-time error.
-                            // The macro name is arbitrary user input; the logview key must
-                            // stay low-cardinality, so only known names pass through.
-                            let logview_key = if UNIMPLEMENTED_MACROS.contains(macro_type.as_str())
-                            {
-                                macro_type.clone()
-                            } else {
-                                "other".to_owned()
-                            };
-                            soft_error!(
-                                "unrecognized_arg_macro",
-                                MacroError::UnrecognizedMacro(macro_type.clone(), args.len())
-                                    .into(),
-                                deprecation: true,
-                                low_cardinality_key_for_additional_logview_samples:
-                                    Some(Box::new(logview_key))
-                            )?;
-                            UnconfiguredMacro::new_unrecognized(macro_type, args)
+                            return Err(
+                                MacroError::UnrecognizedMacro(macro_type, args.len()).into()
+                            );
                         }
                     };
                     parts.push(StringWithMacrosPart::Macro(write_to_file, part));
@@ -143,9 +124,8 @@ impl AttrTypeCoerce for ArgAttrType {
             }
         }
 
-        Ok(CoercedAttr::Arg(UnconfiguredStringWithMacros::ManyParts(
-            parts.into_boxed_slice(),
-        )))
+        let arg = UnconfiguredStringWithMacros::ManyParts(parts.into_boxed_slice());
+        ctx.attr_arena().encode_arg(&arg)
     }
 
     fn starlark_type(&self) -> TyMaybeSelect {
@@ -154,9 +134,9 @@ impl AttrTypeCoerce for ArgAttrType {
 }
 
 /// A simple helper for a macro that accepts a single target argument (the most common case, by far).
-fn get_single_target_arg(
+fn get_single_target_arg<'v>(
     args: Vec<String>,
-    ctx: &dyn AttrCoercionContext,
+    ctx: &dyn AttrCoercionContext<'v>,
 ) -> buck2_error::Result<ProvidersLabel> {
     if args.len() != 1 {
         return Err(MacroError::ExpectedSingleTargetArgument(args).into());
@@ -165,8 +145,8 @@ fn get_single_target_arg(
 }
 
 pub trait UnconfiguredMacroExt {
-    fn new_location(
-        ctx: &dyn AttrCoercionContext,
+    fn new_location<'v>(
+        ctx: &dyn AttrCoercionContext<'v>,
         args: Vec<String>,
         dep_kind: MacroDepKind,
     ) -> buck2_error::Result<UnconfiguredMacro> {
@@ -176,8 +156,8 @@ pub trait UnconfiguredMacroExt {
         })
     }
 
-    fn new_exe(
-        ctx: &dyn AttrCoercionContext,
+    fn new_exe<'v>(
+        ctx: &dyn AttrCoercionContext<'v>,
         args: Vec<String>,
         exec_dep: bool,
     ) -> buck2_error::Result<UnconfiguredMacro> {
@@ -187,8 +167,8 @@ pub trait UnconfiguredMacroExt {
         })
     }
 
-    fn new_source(
-        ctx: &dyn AttrCoercionContext,
+    fn new_source<'v>(
+        ctx: &dyn AttrCoercionContext<'v>,
         args: Vec<String>,
     ) -> buck2_error::Result<UnconfiguredMacro> {
         if args.len() != 1 {
@@ -199,8 +179,8 @@ pub trait UnconfiguredMacroExt {
             .map(UnconfiguredMacro::Source)
     }
 
-    fn new_user_keyed_placeholder(
-        ctx: &dyn AttrCoercionContext,
+    fn new_user_keyed_placeholder<'v>(
+        ctx: &dyn AttrCoercionContext<'v>,
         var_name: String,
         mut args: Vec<String>,
     ) -> buck2_error::Result<UnconfiguredMacro> {
@@ -217,8 +197,8 @@ pub trait UnconfiguredMacroExt {
         ))))
     }
 
-    fn new_query(
-        ctx: &dyn AttrCoercionContext,
+    fn new_query<'v>(
+        ctx: &dyn AttrCoercionContext<'v>,
         expansion_type: &str,
         args: Vec<String>,
     ) -> buck2_error::Result<UnconfiguredMacro> {
@@ -252,13 +232,6 @@ pub trait UnconfiguredMacroExt {
     fn new_user_unkeyed_placeholder(var_name: String) -> UnconfiguredMacro {
         UnconfiguredMacro::UserUnkeyedPlaceholder(var_name.into_boxed_str())
     }
-
-    fn new_unrecognized(macro_type: String, args: Vec<String>) -> UnconfiguredMacro {
-        UnconfiguredMacro::UnrecognizedMacro(Box::new(UnrecognizedMacro {
-            macro_type: macro_type.into_boxed_str(),
-            args: args.into_boxed_slice(),
-        }))
-    }
 }
 
 impl UnconfiguredMacroExt for UnconfiguredMacro {}
@@ -269,21 +242,21 @@ mod tests {
     use buck2_core::package::PackageLabel;
     use buck2_core::target::label::label::TargetLabel;
     use buck2_error::buck2_error;
+    use buck2_hash::buck_mut_insertion_set;
     use buck2_node::attrs::attr_type::AttrType;
     use buck2_node::attrs::attr_type::arg::MacroBase;
+    use buck2_node::attrs::coerced::CoercedAttrRefKind;
     use buck2_node::attrs::coerced_deps_collector::CoercedDepsCollector;
     use buck2_node::attrs::configuration_context::AttrConfigurationContext;
     use buck2_node::attrs::configured_attr_info_for_tests::ConfiguredAttrInfoForTests;
     use buck2_node::attrs::display::AttrDisplayWithContextExt;
     use buck2_node::attrs::testing::configuration_ctx;
     use dupe::Dupe;
-    use gazebo::prelude::SliceExt;
     use starlark::environment::GlobalsBuilder;
     use starlark::environment::Module;
-    use starlark_map::smallset;
 
     use super::*;
-    use crate::attrs::coerce::attr_type::AttrTypeExt;
+    use crate::attrs::coerce::testing::CoerceSealed;
     use crate::attrs::coerce::testing::coercion_ctx;
     use crate::attrs::coerce::testing::to_value;
     use crate::interpreter::selector::register_select;
@@ -325,8 +298,9 @@ mod tests {
                 r#""$(exe //:foo) " + select({"DEFAULT": "$(location //:bar)"})"#,
             );
 
-            let coerced = attr.coerce(AttrIsConfigurable::Yes, &coercion_ctx(), value)?;
+            let coerced = coercion_ctx().coerce_sealed(&attr, value)?;
             let configured = coerced
+                .as_ref()
                 .configure(&attr, &configuration_ctx(), None)
                 .require_compatible()?;
             assert_eq!(
@@ -343,32 +317,65 @@ mod tests {
     }
 
     #[test]
-    fn test_unrecognized_macro_coerces() -> buck2_error::Result<()> {
+    fn test_unrecognized_macro_fails_coercion() {
         // ast-grep-ignore: rust/buck2-no-starlark-module
         Module::with_temp_heap(|env| {
-            let globals = GlobalsBuilder::standard().with(register_select).build();
             let attr = AttrType::arg(true);
-            let value = to_value(&env, &globals, r#""$(output foo.yaml)""#);
-
-            let coerced = attr.coerce(AttrIsConfigurable::Yes, &coercion_ctx(), value)?;
-            match coerced {
-                CoercedAttr::Arg(UnconfiguredStringWithMacros::ManyParts(parts)) => {
-                    assert!(matches!(
-                        &*parts,
-                        [StringWithMacrosPart::Macro(
-                            false,
-                            MacroBase::UnrecognizedMacro(..)
-                        )]
-                    ));
-                }
-                _ => {
-                    return Err(buck2_error!(
-                        buck2_error::ErrorTag::Input,
-                        "Expected single-part arg"
-                    ));
-                }
+            for (input, name, arg_count) in [
+                ("$(output foo.yaml)", "output", 1),
+                ("$(@output foo.yaml)", "output", 1),
+                ("$(classpath_abi //:foo)", "classpath_abi", 1),
+                ("$(maven_coords //:foo)", "maven_coords", 1),
+                ("$(query_paths 'deps(//:foo)')", "query_paths", 1),
+                ("$(find . -name foo)", "find", 3),
+            ] {
+                let value = env.heap().alloc(input);
+                let error = coercion_ctx().coerce_sealed(&attr, value).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(&format!(
+                        "Unrecognized macro `{name}` (with {arg_count} args). If this is shell command substitution rather than a buck macro, escape it as `\\$({name} ...)`"
+                    )),
+                    "{input}: {error:#}",
+                );
             }
+        })
+    }
 
+    #[test]
+    fn test_escaped_macro_coerces_as_string() -> buck2_error::Result<()> {
+        // ast-grep-ignore: rust/buck2-no-starlark-module
+        Module::with_temp_heap(|env| {
+            let attr = AttrType::arg(true);
+            let value = env.heap().alloc(r"\$(find . -name foo)");
+            let coerced = coercion_ctx().coerce_sealed(&attr, value)?;
+            let CoercedAttrRefKind::ArgSimple(part) = coerced.as_ref().kind() else {
+                panic!("expected a plain-string arg");
+            };
+            assert_eq!("$(find . -name foo)", part);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_user_defined_macros_coerce() -> buck2_error::Result<()> {
+        // ast-grep-ignore: rust/buck2-no-starlark-module
+        Module::with_temp_heap(|env| {
+            let attr = AttrType::arg(true);
+            for (input, expected) in [
+                ("$(CXX)", "$(CXX)"),
+                ("$(cxxppflags //:foo)", "$(cxxppflags root//:foo)"),
+                (
+                    "$(cxxppflags //:foo shared)",
+                    "$(cxxppflags root//:foo shared)",
+                ),
+            ] {
+                let value = env.heap().alloc(input);
+                let coerced = coercion_ctx().coerce_sealed(&attr, value)?;
+                assert_eq!(
+                    coerced.as_ref().as_display_no_ctx().to_string(),
+                    format!(r#""{expected}""#)
+                );
+            }
             Ok(())
         })
     }
@@ -381,10 +388,14 @@ mod tests {
             vec!["//some:target".to_owned()],
             MacroDepKind::Regular,
         )?;
-        let deps = location.get_deps()?.map(|t| t.to_string());
+        let deps = location
+            .get_deps()?
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(vec!["root//some:target".to_owned()], deps);
 
-        let configured = location.configure(&configuration_ctx())?;
+        let configured = location.configure(&configuration_ctx(), None)?;
 
         if let MacroBase::Location {
             label: target,
@@ -393,7 +404,7 @@ mod tests {
         {
             let mut info = ConfiguredAttrInfoForTests::new();
             configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
-            assert_eq!(smallset![target.dupe()], info.deps);
+            assert_eq!(buck_mut_insertion_set![target.dupe()], info.deps);
         } else {
             return Err(buck2_error!(
                 buck2_error::ErrorTag::Input,
@@ -412,19 +423,23 @@ mod tests {
             vec!["//some:target".to_owned()],
             MacroDepKind::Exec,
         )?;
-        let deps = location.get_deps()?.map(|t| t.to_string());
+        let deps = location
+            .get_deps()?
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(vec!["root//some:target".to_owned()], deps);
         assert_eq!("location_exec root//some:target", &location.to_string());
 
         let config_ctx = configuration_ctx();
-        let configured = location.configure(&config_ctx)?;
+        let configured = location.configure(&config_ctx, None)?;
 
         if let MacroBase::Location { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
             configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
             assert_eq!(label.cfg(), config_ctx.base_exec_cfg()?.cfg());
-            assert_eq!(smallset![label.dupe()], info.execution_deps);
-            assert_eq!(smallset![], info.deps);
+            assert_eq!(buck_mut_insertion_set![label.dupe()], info.execution_deps);
+            assert_eq!(buck_mut_insertion_set![], info.deps);
         } else {
             return Err(buck2_error!(
                 buck2_error::ErrorTag::Input,
@@ -443,7 +458,11 @@ mod tests {
             vec!["//some:target".to_owned()],
             MacroDepKind::Toolchain,
         )?;
-        let deps = location.get_deps()?.map(|t| t.to_string());
+        let deps = location
+            .get_deps()?
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(vec!["root//some:target".to_owned()], deps);
         assert_eq!(
             "location_toolchain root//some:target",
@@ -451,15 +470,15 @@ mod tests {
         );
 
         let config_ctx = configuration_ctx();
-        let configured = location.configure(&config_ctx)?;
+        let configured = location.configure(&config_ctx, None)?;
 
         if let MacroBase::Location { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
             configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
             assert_eq!(label.cfg(), config_ctx.toolchain_cfg().cfg());
-            assert_eq!(smallset![label.dupe()], info.toolchain_deps);
-            assert_eq!(smallset![], info.deps);
-            assert_eq!(smallset![], info.execution_deps);
+            assert_eq!(buck_mut_insertion_set![label.dupe()], info.toolchain_deps);
+            assert_eq!(buck_mut_insertion_set![], info.deps);
+            assert_eq!(buck_mut_insertion_set![], info.execution_deps);
         } else {
             return Err(buck2_error!(
                 buck2_error::ErrorTag::Input,
@@ -474,19 +493,23 @@ mod tests {
     fn test_exe() -> buck2_error::Result<()> {
         let ctx = coercion_ctx();
         let exe = UnconfiguredMacro::new_exe(&ctx, vec!["//some:target".to_owned()], true)?;
-        let deps = exe.get_deps()?.map(|t| t.to_string());
+        let deps = exe
+            .get_deps()?
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(vec!["root//some:target".to_owned()], deps);
         assert_eq!("exe root//some:target", &exe.to_string());
 
         let config_ctx = configuration_ctx();
-        let configured = exe.configure(&config_ctx)?;
+        let configured = exe.configure(&config_ctx, None)?;
 
         if let MacroBase::Exe { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
             configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
             assert_eq!(label.cfg(), config_ctx.base_exec_cfg()?.cfg());
-            assert_eq!(smallset![label.dupe()], info.execution_deps);
-            assert_eq!(smallset![], info.deps);
+            assert_eq!(buck_mut_insertion_set![label.dupe()], info.execution_deps);
+            assert_eq!(buck_mut_insertion_set![], info.deps);
         } else {
             return Err(buck2_error!(buck2_error::ErrorTag::Input, "Expected Exe"));
         }
@@ -498,19 +521,23 @@ mod tests {
     fn test_exe_target() -> buck2_error::Result<()> {
         let ctx = coercion_ctx();
         let exe = UnconfiguredMacro::new_exe(&ctx, vec!["//some:target".to_owned()], false)?;
-        let deps = exe.get_deps()?.map(|t| t.to_string());
+        let deps = exe
+            .get_deps()?
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>();
         assert_eq!(vec!["root//some:target".to_owned()], deps);
         assert_eq!("exe_target root//some:target", &exe.to_string());
 
         let config_ctx = configuration_ctx();
-        let configured = exe.configure(&config_ctx)?;
+        let configured = exe.configure(&config_ctx, None)?;
 
         if let MacroBase::Exe { label, .. } = &configured {
             let mut info = ConfiguredAttrInfoForTests::new();
             configured.traverse(&mut info, PackageLabel::testing_new("root", ""))?;
             assert_eq!(label.cfg(), config_ctx.cfg().cfg());
-            assert_eq!(smallset![], info.execution_deps);
-            assert_eq!(smallset![label.dupe()], info.deps);
+            assert_eq!(buck_mut_insertion_set![], info.execution_deps);
+            assert_eq!(buck_mut_insertion_set![label.dupe()], info.deps);
         } else {
             return Err(buck2_error!(buck2_error::ErrorTag::Input, "Expected Exe"));
         }

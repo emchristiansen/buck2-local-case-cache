@@ -29,11 +29,11 @@ use buck2_data::span_start_event::Data;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
 use buck2_events::BuckEvent;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_test_api::data::TestStatus;
 use buck2_util::commas::commas;
 use buck2_util::truncate::truncate;
 use dupe::Dupe;
-use starlark_map::ordered_set::OrderedSet;
 use superconsole::Line;
 use superconsole::Lines;
 use superconsole::Span;
@@ -408,8 +408,8 @@ pub fn display_event(
                     .stage
                     .as_ref()
                     .internal_error("executor stage is missing")?;
-                let stage =
-                    display_executor_stage(stage).internal_error("unknown executor stage")?;
+                let stage = display_executor_stage_detail(stage)
+                    .internal_error("unknown executor stage")?;
                 Ok(EventDisplay::bare(stage))
             }
             Data::TestDiscovery(discovery) => Ok(EventDisplay::labeled(
@@ -519,6 +519,7 @@ pub fn display_event(
             ))),
             Data::BxlDiceInvocation(..) => Ok(EventDisplay::bare("Waiting for graph computations")),
             Data::ReUpload(..) => Ok(EventDisplay::bare("re_upload")),
+            Data::ReSubmit(..) => Ok(EventDisplay::bare("re_submit")),
             Data::ConnectToInstaller(buck2_data::ConnectToInstallerStart { tcp_port }) => Ok(
                 EventDisplay::bare(format!("Connecting to installer on port {tcp_port}")),
             ),
@@ -582,7 +583,7 @@ pub fn display_file_watcher_end(file_watcher_end: &buck2_data::FileWatcherEnd) -
 
         let is_fresh_instance = stats.fresh_instance;
 
-        let mut to_print = OrderedSet::new();
+        let mut to_print = BuckMutInsertionSet::new();
         for x in &stats.events {
             to_print.insert((&x.path, x.kind()));
         }
@@ -640,6 +641,26 @@ pub fn display_file_watcher_end(file_watcher_end: &buck2_data::FileWatcherEnd) -
     res
 }
 
+/// Like `display_executor_stage`, but names the exceeded quotas when RE reports
+/// the action as over quota.
+fn display_executor_stage_detail(
+    stage: &buck2_data::executor_stage_start::Stage,
+) -> Option<String> {
+    use buck2_data::executor_stage_start::Stage;
+
+    if let Stage::Re(re) = stage
+        && let Some(buck2_data::re_stage::Stage::QueueOverQuota(over_quota)) = &re.stage
+        && !over_quota.exceeded_quotas.is_empty()
+    {
+        return Some(format!(
+            "re_queued(over_quota: {})",
+            over_quota.exceeded_quotas.join(", ")
+        ));
+    }
+
+    display_executor_stage(stage).map(str::to_owned)
+}
+
 pub fn display_executor_stage(
     stage: &buck2_data::executor_stage_start::Stage,
 ) -> Option<&'static str> {
@@ -647,6 +668,17 @@ pub fn display_executor_stage(
 
     let label = match stage {
         Stage::Prepare(..) => "prepare",
+        Stage::CasArtifact(cas) => {
+            use buck2_data::cas_artifact_stage::Phase;
+            match Phase::try_from(cas.phase) {
+                Ok(Phase::CheckExpiration) => "cas_check_expiration",
+                Ok(Phase::ExtendExpiration) => "cas_extend_expiration",
+                Ok(Phase::RecheckExpiration) => "cas_recheck_expiration",
+                Ok(Phase::TreeMetadata) => "cas_tree_metadata",
+                Ok(Phase::DeclareOutputs) => "cas_declare_outputs",
+                Ok(Phase::Unspecified) | Err(_) => "cas_artifact",
+            }
+        }
         Stage::CacheQuery(cache_query) => {
             match buck2_data::CacheType::try_from(cache_query.cache_type).unwrap() {
                 buck2_data::CacheType::ActionCache => "re_action_cache",
@@ -683,6 +715,7 @@ pub fn display_executor_stage(
                 Stage::Execute(..) => "local_execute",
                 Stage::MaterializeInputs(..) => "local_materialize_inputs",
                 Stage::PrepareOutputs(_) => "local_prepare_outputs",
+                Stage::FinalizeOutputs(_) => "local_finalize_outputs",
                 Stage::AcquireLocalResource(_) => "acquire_local_resource",
                 Stage::WorkerInit(_) => "initialize_worker",
                 Stage::WorkerExecute(_) => "worker_execute",
@@ -720,6 +753,7 @@ pub fn is_active_execution_stage(event: &BuckEvent) -> bool {
                 Some(Local::Queued(..))
                 | Some(Local::MaterializeInputs(..))
                 | Some(Local::PrepareOutputs(..))
+                | Some(Local::FinalizeOutputs(..))
                 | Some(Local::AcquireLocalResource(..))
                 | Some(Local::WorkerInit(..))
                 | Some(Local::WorkerQueued(..))
@@ -749,6 +783,7 @@ pub fn is_active_execution_stage(event: &BuckEvent) -> bool {
         Stage::Prepare(..)
         | Stage::CacheQuery(..)
         | Stage::CacheHit(..)
+        | Stage::CasArtifact(..)
         | Stage::LocalTestResultCacheQuery(..)
         | Stage::LocalTestResultCache(..) => false,
     }
@@ -968,10 +1003,18 @@ impl ActionErrorDisplay<'_> {
                     } else {
                         append!(
                             "Remote action{}, reproduce with: `frecli cas download-action {}`",
-                            if remote_command.cache_hit {
-                                " cache hit"
-                            } else {
-                                ""
+                            match remote_command.cache_hit_type() {
+                                buck2_data::RemoteCommandOrigin::ActionCache
+                                | buck2_data::RemoteCommandOrigin::RemoteDepFileCache => {
+                                    " cache hit"
+                                }
+                                buck2_data::RemoteCommandOrigin::Executed => "",
+                                buck2_data::RemoteCommandOrigin::ReServedFromCache => {
+                                    " served from the remote execution cache"
+                                }
+                                buck2_data::RemoteCommandOrigin::ReDeduplicated => {
+                                    " deduplicated by remote execution"
+                                }
                             },
                             remote_command.action_digest
                         );
@@ -1126,7 +1169,7 @@ fn failure_reason_for_command_execution(
 
     Ok(match status {
         Status::Success(Success {}) => "Unexpected command status".to_owned(),
-        Status::Failure(Failure {}) | Status::WorkerFailure(WorkerFailure {}) => {
+        Status::Failure(Failure { .. }) | Status::WorkerFailure(WorkerFailure {}) => {
             struct OptionalExitCode {
                 code: Option<i32>,
             }
@@ -1356,6 +1399,13 @@ impl<'a> CriticalPathEntryDisplay<'a> {
                 };
                 ("test-listing", name, None, None, None)
             }
+            Entry::Install(install) => {
+                let name = match install.target_labels.first() {
+                    Some(t) => display_configured_target_label(t, opts)?,
+                    None => "unknown".to_owned(),
+                };
+                ("install", name, None, None, None)
+            }
             Entry::EnsureTransitiveSetProjection(..) => (
                 "ensure-transitive-set-projection",
                 String::new(),
@@ -1403,6 +1453,51 @@ mod tests {
 
     use super::*;
 
+    fn executor_stage_event(stage: buck2_data::executor_stage_start::Stage) -> BuckEvent {
+        BuckEvent::new(
+            UNIX_EPOCH,
+            TraceId::new(),
+            Some(SpanId::next()),
+            None,
+            SpanStartEvent {
+                data: Some(buck2_data::ExecutorStageStart { stage: Some(stage) }.into()),
+            }
+            .into(),
+        )
+    }
+
+    #[test]
+    fn test_cas_artifact_stages_are_labelled_and_not_execution() {
+        use buck2_data::cas_artifact_stage::Phase;
+
+        for (phase, expected) in [
+            (Phase::CheckExpiration as i32, "cas_check_expiration"),
+            (Phase::ExtendExpiration as i32, "cas_extend_expiration"),
+            (Phase::RecheckExpiration as i32, "cas_recheck_expiration"),
+            (Phase::TreeMetadata as i32, "cas_tree_metadata"),
+            (Phase::DeclareOutputs as i32, "cas_declare_outputs"),
+            (Phase::Unspecified as i32, "cas_artifact"),
+            (i32::MAX, "cas_artifact"),
+        ] {
+            let stage = buck2_data::CasArtifactStage { phase }.into();
+            assert_eq!(display_executor_stage(&stage), Some(expected));
+            assert!(!is_active_execution_stage(&executor_stage_event(stage)));
+        }
+    }
+
+    #[test]
+    fn test_local_finalize_outputs_is_not_execution() {
+        let stage = buck2_data::LocalStage {
+            stage: Some(buck2_data::LocalFinalizeOutputs {}.into()),
+        }
+        .into();
+        assert_eq!(
+            display_executor_stage(&stage),
+            Some("local_finalize_outputs")
+        );
+        assert!(!is_active_execution_stage(&executor_stage_event(stage)));
+    }
+
     fn action_execution_event(identifier: &str) -> BuckEvent {
         BuckEvent::new(
             UNIX_EPOCH,
@@ -1439,6 +1534,34 @@ mod tests {
             }
             .into(),
         )
+    }
+
+    fn over_quota_stage(exceeded_quotas: &[&str]) -> buck2_data::executor_stage_start::Stage {
+        buck2_data::executor_stage_start::Stage::Re(buck2_data::ReStage {
+            stage: Some(buck2_data::re_stage::Stage::QueueOverQuota(
+                buck2_data::ReQueueOverQuota {
+                    queue_info: None,
+                    exceeded_quotas: exceeded_quotas.iter().map(|q| (*q).to_owned()).collect(),
+                },
+            )),
+        })
+    }
+
+    #[test]
+    fn over_quota_stage_names_exceeded_quotas() {
+        assert_eq!(
+            display_executor_stage_detail(&over_quota_stage(&["worker_units:pool:linux"])),
+            Some("re_queued(over_quota: worker_units:pool:linux)".to_owned()),
+        );
+        assert_eq!(
+            display_executor_stage_detail(&over_quota_stage(&["a", "b"])),
+            Some("re_queued(over_quota: a, b)".to_owned()),
+        );
+        assert_eq!(
+            display_executor_stage_detail(&over_quota_stage(&[])),
+            Some("re_queued(over_quota)".to_owned()),
+            "Without exceeded quotas the label should fall back to the plain stage",
+        );
     }
 
     #[test]
@@ -1528,7 +1651,7 @@ mod tests {
             details: "test case ... ok".to_owned(),
             target_label: None,
             max_memory_used_bytes: None,
-            reuse,
+            reuse: reuse.map(Box::new),
         }
     }
 

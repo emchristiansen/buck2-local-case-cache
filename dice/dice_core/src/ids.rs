@@ -87,14 +87,18 @@ impl EpsilonToken {
 }
 
 /// A branch: a line of versions extended by commits at its head (§2.1, "Versions and branches").
+/// A branch with no parent is a root; a state may have any number of them.
+///
+/// Ids are allocated in creation order and never reused, so they increase along any chain of
+/// branches: a branch is created after the one it was forked from, and deleting a branch hands its
+/// children to an older one. Visiting branches by id therefore visits parents before children,
+/// and versions of one chain order by `(branch, seq)` ([`Version::cmp_on_chain`]).
 #[derive(
     Copy, Clone, Dupe, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative
 )]
 pub struct BranchId(u32);
 
 impl BranchId {
-    pub(crate) const ROOT: BranchId = BranchId(0);
-
     pub(crate) fn index(self) -> usize {
         self.0 as usize
     }
@@ -137,26 +141,23 @@ impl Seq {
 
 /// A version: the immutable name of the state reached by a chain of commits, `(branch, seq)`.
 ///
-/// The derived order compares branches first and is only meaningful between versions of one
-/// branch; it exists so that versions can be used as ordered map keys and compared by callers
-/// that know they are looking at one branch.
-#[derive(
-    Copy, Clone, Dupe, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative
-)]
+/// Versions have no total order; two of one chain compare by [`Version::cmp_on_chain`].
+#[derive(Copy, Clone, Dupe, Debug, PartialEq, Eq, Hash, Allocative)]
 pub struct Version {
     branch: BranchId,
     seq: Seq,
 }
 
 impl Version {
-    /// The initial version of the root branch.
-    pub const FIRST: Version = Version {
-        branch: BranchId::ROOT,
-        seq: Seq::FIRST,
-    };
-
     pub(crate) fn new(branch: BranchId, seq: Seq) -> Self {
         Version { branch, seq }
+    }
+
+    /// Orders two versions of one chain, that is, versions of which one is an ancestor of or
+    /// equal to the other, earlier first. Along a chain `(branch, seq)` increases lexicographically
+    /// (see [`BranchId`]). For versions of different chains the result means nothing.
+    pub fn cmp_on_chain(self, other: Version) -> std::cmp::Ordering {
+        (self.branch, self.seq).cmp(&(other.branch, other.seq))
     }
 
     pub fn branch(self) -> BranchId {
@@ -167,10 +168,10 @@ impl Version {
         self.seq
     }
 
-    /// The version at `seq` on the root branch. Panics on 0.
+    /// The version at `seq` on the first root a state makes. Panics on 0.
     #[doc(hidden)]
     pub fn testing_new(seq: u32) -> Self {
-        Version::new(BranchId::ROOT, Seq::testing_new(seq))
+        Version::new(BranchId(0), Seq::testing_new(seq))
     }
 
     /// The seq, for tests that compare versions numerically.
@@ -182,7 +183,8 @@ impl Version {
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.branch == BranchId::ROOT {
+        // The first root a state makes prints bare.
+        if self.branch.0 == 0 {
             write!(f, "v{}", self.seq.get())
         } else {
             write!(f, "v{}.{}", self.branch.0, self.seq.get())

@@ -20,6 +20,7 @@ use buck2_core::provider::label::NonDefaultProvidersName;
 use buck2_core::provider::label::ProviderName;
 use buck2_core::provider::label::ProvidersName;
 use buck2_error::internal_error;
+use buck2_hash::BuckMutInsertionMap;
 use buck2_interpreter::starlark_promise::StarlarkPromise;
 use buck2_interpreter::types::provider::callable::ValueAsProviderCallableLike;
 use display_container::fmt_container;
@@ -28,7 +29,6 @@ use either::Either;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
@@ -39,6 +39,7 @@ use starlark::static_starlark_value;
 use starlark::typing::Ty;
 use starlark::values::AllocFrozenValue;
 use starlark::values::AllocValue;
+use starlark::values::Deferred;
 use starlark::values::Freeze;
 use starlark::values::FreezeResult;
 use starlark::values::Freezer;
@@ -63,6 +64,7 @@ use starlark::values::starlark_value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark_map::Hashed;
 
+use crate::actions::impls::json::SerializeOrFail;
 use crate::interpreter::rule_defs::provider::DefaultInfo;
 use crate::interpreter::rule_defs::provider::DefaultInfoCallable;
 use crate::interpreter::rule_defs::provider::FrozenBuiltinProviderLike;
@@ -118,13 +120,14 @@ enum ProviderCollectionError {
 #[derive(Debug, ProvidesStaticType, Allocative, StarlarkPagable)]
 #[repr(C)]
 pub struct ProviderCollection<'v> {
-    pub(crate) providers: SmallMap<CollectionKey, Value<'v>>,
+    /// Keys and map structure stay resident independently of provider values.
+    pub(crate) providers: BuckMutInsertionMap<CollectionKey, Deferred<Value<'v>>>,
 }
 
 /// Newtype wrapper around `Arc<ProviderId>` used as the key type of
 /// `ProviderCollection::providers`. Wraps because `Arc<ProviderId>` is
 /// pagable-only (`buck2_core` cannot depend on `starlark`), so the
-/// `SmallMap<K, V>: StarlarkSerialize/Deserialize` blanket can't apply
+/// `BuckMutInsertionMap<K, V>: StarlarkSerialize/Deserialize` blanket can't apply
 /// directly to the inner type. The newtype gets `StarlarkPagable` via
 /// `StarlarkPagableViaPagable` and provides the matching
 /// [`SmallMapKeyDeserialize`] impl.
@@ -146,7 +149,7 @@ impl std::ops::Deref for CollectionKey {
     }
 }
 
-/// Lets `SmallMap<CollectionKey, _>::get`/`contains_key` be called with a
+/// Lets `BuckMutInsertionMap<CollectionKey, _>::get`/`contains_key` be called with a
 /// borrowed `&ProviderId` directly, avoiding a cloned `Arc<ProviderId>` and a
 /// `CollectionKey` wrapper at every lookup site.
 impl starlark_map::Equivalent<CollectionKey> for ProviderId {
@@ -165,7 +168,7 @@ impl<'fv> SmallMapKeyDeserialize<'fv> for CollectionKey {
 }
 
 static_starlark_value!(EMPTY_PROVIDER_COLLECTION: ProviderCollection<'static> = ProviderCollection {
-    providers: SmallMap::new(),
+    providers: BuckMutInsertionMap::new(),
 });
 
 /// Type of a frozen provider collection.
@@ -215,13 +218,25 @@ impl<'v> UnpackValue<'v> for &'v ProviderCollection<'v> {
     }
 }
 
+/// A provider entry for display: an unreadable one shows its error in place.
+struct DisplayProvider<'a, 'v>(&'a Deferred<Value<'v>>);
+
+impl Display for DisplayProvider<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.read() {
+            Ok(v) => Display::fmt(v, f),
+            Err(e) => write!(f, "<unreadable provider: {e:#}>"),
+        }
+    }
+}
+
 impl<'v> Display for ProviderCollection<'v> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt_container(
             f,
             "Providers([",
             "])",
-            self.providers.iter().map(|(_, v)| v),
+            self.providers.iter().map(|(_, v)| DisplayProvider(v)),
         )
     }
 }
@@ -231,7 +246,12 @@ impl<'v> Serialize for ProviderCollection<'v> {
     where
         S: Serializer,
     {
-        s.collect_map(self.providers.iter().map(|(id, v)| (id.name(), v)))
+        s.collect_map(self.providers.iter().map(|(id, v)| {
+            (
+                id.name(),
+                SerializeOrFail(v.read().map_err(buck2_error::Error::from)),
+            )
+        }))
     }
 }
 
@@ -251,7 +271,7 @@ impl<'v> ProviderCollection<'v> {
     /// This is an internal detail
     fn try_from_value_impl(
         mut value: Value<'v>,
-    ) -> buck2_error::Result<SmallMap<CollectionKey, Value<'v>>> {
+    ) -> buck2_error::Result<BuckMutInsertionMap<CollectionKey, Deferred<Value<'v>>>> {
         // Sometimes we might have a resolved promise here, in which case see through that
         value = StarlarkPromise::get_recursive(value);
 
@@ -265,16 +285,16 @@ impl<'v> ProviderCollection<'v> {
             }
         };
 
-        let mut providers = SmallMap::with_capacity(list.len());
+        let mut providers = BuckMutInsertionMap::with_capacity(list.len());
         for value in list.iter() {
             match ValueAsProviderLike::unpack_value(value)? {
                 Some(provider) => {
-                    if let Some(existing_value) =
-                        providers.insert(CollectionKey(provider.0.id().dupe()), value)
+                    if let Some(existing_value) = providers
+                        .insert(CollectionKey(provider.0.id().dupe()), Deferred::new(value))
                     {
                         return Err(ProviderCollectionError::CollectionSpecifiedProviderTwice {
                             provider_name: provider.0.id().name.clone(),
-                            original_repr: existing_value.to_repr(),
+                            original_repr: existing_value.read()?.to_repr(),
                             new_repr: value.to_repr(),
                         }
                         .into());
@@ -307,7 +327,7 @@ impl<'v> ProviderCollection<'v> {
             .into());
         }
 
-        Ok(ProviderCollection::<'v> { providers })
+        Ok(ProviderCollection { providers })
     }
 
     /// Takes a value, e.g. a value passed to `DefaultInfo(subtargets)`, and builds a `ProviderCollection` from it.
@@ -326,10 +346,10 @@ impl<'v> ProviderCollection<'v> {
         if !providers.contains_key(DefaultInfoCallable::provider_id().as_ref()) {
             providers.insert(
                 CollectionKey(DefaultInfoCallable::provider_id().dupe()),
-                heap.alloc(DefaultInfo::empty(heap)),
+                Deferred::new(heap.alloc(DefaultInfo::empty(heap))),
             );
         }
-        Ok(ProviderCollection::<'v> { providers })
+        Ok(ProviderCollection { providers })
     }
 
     /// Takes a value, e.g. a return from a `dynamic_output` function, and builds a `ProviderCollection` from it.
@@ -342,7 +362,7 @@ impl<'v> ProviderCollection<'v> {
     ) -> buck2_error::Result<ProviderCollection<'v>> {
         let providers = Self::try_from_value_impl(value)?;
 
-        Ok(ProviderCollection::<'v> { providers })
+        Ok(ProviderCollection { providers })
     }
 
     /// Common implementation of `[]`, `in`, and `.get`.
@@ -350,12 +370,12 @@ impl<'v> ProviderCollection<'v> {
         &self,
         index: Value<'v>,
         op: GetOp,
-    ) -> buck2_error::Result<Either<Value<'v>, Arc<ProviderId>>> {
+    ) -> buck2_error::Result<Either<Value<'v>, &'v ProviderId>> {
         match index.as_provider_callable() {
             Some(callable) => {
-                let provider_id = callable.id()?.dupe();
-                match self.providers.get(provider_id.as_ref()) {
-                    Some(v) => Ok(Either::Left(v.to_value())),
+                let provider_id = callable.id()?.as_ref();
+                match self.providers.get(provider_id) {
+                    Some(v) => Ok(Either::Left(v.read()?.to_value())),
                     None => Ok(Either::Right(provider_id)),
                 }
             }
@@ -378,9 +398,9 @@ impl<'v> ProviderCollection<'v> {
 impl ProviderCollection<'static> {
     pub fn testing_new_default<'v>(heap: FrozenHeap<'v>) -> ValueTyped<'v, ProviderCollection<'v>> {
         heap.alloc_typed(ProviderCollection {
-            providers: SmallMap::from_iter([(
+            providers: BuckMutInsertionMap::from_iter([(
                 CollectionKey(DefaultInfoCallable::provider_id().dupe()),
-                DefaultInfo::testing_empty(heap).to_value(),
+                Deferred::new(DefaultInfo::testing_empty(heap).to_value()),
             )]),
         })
     }
@@ -436,7 +456,7 @@ starlark::methods_static!(PROVIDER_COLLECTION_METHODS = provider_collection_meth
 
 unsafe impl<'v> Trace<'v> for ProviderCollection<'v> {
     fn trace(&mut self, tracer: &Tracer<'v>) {
-        self.providers.values_mut().for_each(|v| tracer.trace(v))
+        self.providers.values_mut().for_each(|v| v.trace(tracer))
     }
 }
 
@@ -445,9 +465,9 @@ impl<'v> Freeze<'v> for ProviderCollection<'v> {
     fn freeze<'fv>(self, freezer: &Freezer<'v, 'fv>) -> FreezeResult<Self::Frozen<'fv>> {
         // N.B. collect::<Result<_>> sets the lower bound to zero,
         // which can cause over-allocations in frozen containers.
-        let mut providers = SmallMap::with_capacity(self.providers.len());
+        let mut providers = BuckMutInsertionMap::with_capacity(self.providers.len());
         for (k, v) in self.providers {
-            providers.insert(k, freezer.freeze(v)?);
+            providers.insert(k, v.freeze(freezer)?);
         }
 
         Ok(ProviderCollection { providers })
@@ -456,7 +476,7 @@ impl<'v> Freeze<'v> for ProviderCollection<'v> {
 
 impl<'v> ProviderCollection<'v> {
     pub fn default_info(&self) -> buck2_error::Result<ValueTyped<'v, DefaultInfo<'v>>> {
-        self.builtin_provider::<DefaultInfo>().ok_or_else(|| {
+        self.builtin_provider::<DefaultInfo>()?.ok_or_else(|| {
             internal_error!(
                 "DefaultInfo should always be set for providers returned from rule function"
             )
@@ -469,16 +489,27 @@ impl<'v> ProviderCollection<'v> {
 
     pub fn builtin_provider<T: FrozenBuiltinProviderLike>(
         &self,
-    ) -> Option<ValueTyped<'v, T::Reinfect<'v>>>
+    ) -> buck2_error::Result<Option<ValueTyped<'v, T::Reinfect<'v>>>>
     where
         T::Reinfect<'v>: StarlarkValue<'v> + Sized,
     {
-        let provider = self.get_provider_raw(T::builtin_provider_id())?;
-        Some(ValueTyped::new(provider).expect("Incorrect provider type"))
+        let Some(provider) = self.get_provider_raw(T::builtin_provider_id())? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ValueTyped::new(provider).expect("Incorrect provider type"),
+        ))
     }
 
-    pub fn get_provider_raw(&self, provider_id: &ProviderId) -> Option<Value<'v>> {
-        self.providers.get(provider_id).copied()
+    /// The provider under `provider_id`, read if it was deferred.
+    pub fn get_provider_raw(
+        &self,
+        provider_id: &ProviderId,
+    ) -> buck2_error::Result<Option<Value<'v>>> {
+        match self.providers.get(provider_id) {
+            Some(v) => Ok(Some(*v.read()?)),
+            None => Ok(None),
+        }
     }
 
     pub fn provider_names(&self) -> Vec<String> {
@@ -489,9 +520,12 @@ impl<'v> ProviderCollection<'v> {
         self.providers.keys().map(|k| &***k).collect()
     }
 
-    /// Iterate over `(ProviderId, Value)` pairs in this collection.
-    pub fn iter_providers(&self) -> impl Iterator<Item = (&ProviderId, Value<'v>)> {
-        self.providers.iter().map(|(k, v)| (&***k, *v))
+    /// Iterate over `(ProviderId, Value)` pairs in this collection, reading
+    /// each deferred value as it is reached.
+    pub fn iter_providers(
+        &self,
+    ) -> impl Iterator<Item = buck2_error::Result<(&ProviderId, Value<'v>)>> {
+        self.providers.iter().map(|(k, v)| Ok((&***k, *v.read()?)))
     }
 }
 
@@ -559,16 +593,25 @@ impl FrozenProviderCollectionValue {
     /// Get a provider from the collection, keeping it alive by its owner heap.
     pub fn builtin_provider_value<T: FrozenBuiltinProviderLike>(
         &self,
-    ) -> Option<OwnedFrozen<ValueTyped<'static, T>>>
+    ) -> buck2_error::Result<Option<OwnedFrozen<ValueTyped<'static, T>>>>
     where
         for<'x> T::Reinfect<'x>: StarlarkValue<'x> + Sized,
         for<'x> ValueTyped<'x, T::Reinfect<'x>>: HeapSendable<'x> + HeapSyncable<'x>,
     {
-        let v = self
+        // `Err(None)` stands for an absent provider, so a read error is kept apart from it.
+        match self
             .value
-            .as_ref()
-            .maybe_map::<ValueTyped<'static, T>, _>(|v| v.as_ref().builtin_provider::<T>())?;
-        Some(v.to_owned())
+            .dupe()
+            .try_map::<ValueTyped<'static, T>, Option<buck2_error::Error>, _>(|v| {
+                v.as_ref()
+                    .builtin_provider::<T>()
+                    .map_err(Some)?
+                    .ok_or(None)
+            }) {
+            Ok(v) => Ok(Some(v)),
+            Err(None) => Ok(None),
+            Err(Some(e)) => Err(e),
+        }
     }
 }
 

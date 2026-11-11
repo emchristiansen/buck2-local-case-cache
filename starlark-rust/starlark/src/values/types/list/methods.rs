@@ -266,12 +266,20 @@ pub(crate) fn list_methods(builder: &mut MethodsBuilder) {
     fn remove<'v>(
         this: Value<'v>,
         #[starlark(require = pos)] needle: Value<'v>,
-    ) -> anyhow::Result<NoneType> {
+    ) -> starlark::Result<NoneType> {
         // Written in two separate blocks so we ensure we give up the
         // immutable borrow before making the mutable borrow.
         let position = {
             let this = ListRef::from_value(this).unwrap();
-            let position = this.iter().position(|v| v == needle);
+            let mut position = None;
+            for (i, v) in this.iter().enumerate() {
+                // Starlark equality can fail (e.g. on recursive values); report that rather
+                // than treating the element as unequal.
+                if v.equals(needle)? {
+                    position = Some(i);
+                    break;
+                }
+            }
             match position {
                 Some(i) => i,
                 None => {
@@ -279,7 +287,8 @@ pub(crate) fn list_methods(builder: &mut MethodsBuilder) {
                         "Element '{}' not found in list '{}'",
                         needle,
                         this
-                    ));
+                    )
+                    .into());
                 }
             }
         };
@@ -295,6 +304,19 @@ pub(crate) fn list_methods(builder: &mut MethodsBuilder) {
 #[cfg(test)]
 mod tests {
     use crate::assert;
+
+    /// `L.remove(x)` compares with the fallible Starlark equality, so an element whose
+    /// comparison fails reports the error, like `index` and `in`.
+    #[test]
+    fn test_remove_equality_error() {
+        let prog = "a = []\na.append(a)\nb = []\nb.append(b)\nl = [a, b]\n";
+        assert::fail(&format!("{prog}l.remove(b)"), "Too many recursion levels");
+        assert::fail(&format!("{prog}l.index(b)"), "Too many recursion levels");
+        assert::fail(
+            "a = []\na.append(a)\nb = []\nb.append(b)\n[a].remove(b)",
+            "Too many recursion levels",
+        );
+    }
 
     #[test]
     fn test_error_codes() {

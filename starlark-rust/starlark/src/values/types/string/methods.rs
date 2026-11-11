@@ -104,6 +104,49 @@ enum StringOrTuple<'v> {
     Tuple(UnpackTuple<&'v str>),
 }
 
+/// A letter with a case: upper, lower, or titlecase such as `ǅ`, which is neither but maps to
+/// a different letter in each case.
+fn is_cased(c: char) -> bool {
+    c.is_uppercase()
+        || c.is_lowercase()
+        || c.to_uppercase().ne(std::iter::once(c))
+        || c.to_lowercase().ne(std::iter::once(c))
+}
+
+/// The `chars` argument of `strip`, `lstrip` and `rstrip` as a set. Testing each character with
+/// `chars.contains(c)` scans all of `chars` every time, which makes stripping quadratic.
+struct StripChars {
+    /// Bit `i` is set if the ASCII character `i` is in `chars`.
+    ascii: u128,
+    /// The other characters of `chars`, sorted and deduplicated.
+    non_ascii: Vec<char>,
+}
+
+impl StripChars {
+    fn new(chars: &str) -> StripChars {
+        let mut ascii = 0;
+        let mut non_ascii = Vec::new();
+        for c in chars.chars() {
+            if c.is_ascii() {
+                ascii |= 1u128 << (c as u32);
+            } else {
+                non_ascii.push(c);
+            }
+        }
+        non_ascii.sort_unstable();
+        non_ascii.dedup();
+        StripChars { ascii, non_ascii }
+    }
+
+    fn contains(&self, c: char) -> bool {
+        if c.is_ascii() {
+            self.ascii & (1u128 << (c as u32)) != 0
+        } else {
+            self.non_ascii.binary_search(&c).is_ok()
+        }
+    }
+}
+
 #[starlark_module]
 pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// [string.elems](
@@ -490,10 +533,10 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn islower(this: &str) -> anyhow::Result<bool> {
         let mut result = false;
         for c in this.chars() {
-            if c.is_uppercase() {
-                return Ok(false);
-            } else if c.is_lowercase() {
+            if c.is_lowercase() {
                 result = true;
+            } else if is_cased(c) {
+                return Ok(false);
             }
         }
         Ok(result)
@@ -544,24 +587,25 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// ```
     #[starlark(speculative_exec_safe)]
     fn istitle(this: &str) -> anyhow::Result<bool> {
-        let mut last_space = true;
+        // Upper and titlecase letters may only follow uncased characters, lowercase letters only
+        // cased ones, and there must be at least one cased letter.
+        let mut previous_is_cased = false;
         let mut result = false;
-
         for c in this.chars() {
-            if !c.is_alphabetic() {
-                last_space = true;
-            } else {
-                if last_space {
-                    if c.is_lowercase() {
-                        return Ok(false);
-                    }
-                } else if c.is_uppercase() {
+            if c.is_lowercase() {
+                if !previous_is_cased {
                     return Ok(false);
                 }
-                if c.is_alphabetic() {
-                    result = true;
+                result = true;
+                previous_is_cased = true;
+            } else if is_cased(c) {
+                if previous_is_cased {
+                    return Ok(false);
                 }
-                last_space = false;
+                result = true;
+                previous_is_cased = true;
+            } else {
+                previous_is_cased = false;
             }
         }
         Ok(result)
@@ -585,10 +629,10 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn isupper(this: &str) -> anyhow::Result<bool> {
         let mut result = false;
         for c in this.chars() {
-            if c.is_lowercase() {
-                return Ok(false);
-            } else if c.is_uppercase() {
+            if c.is_uppercase() {
                 result = true;
+            } else if is_cased(c) {
+                return Ok(false);
             }
         }
         Ok(result)
@@ -692,7 +736,10 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim_start(),
-            Some(s) => this.trim_start_matches(|c| s.contains(c)),
+            Some(s) => {
+                let s = StripChars::new(s);
+                this.trim_start_matches(|c| s.contains(c))
+            }
         };
         if res.len() == this.len() {
             Ok(this)
@@ -932,13 +979,18 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
         heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
+        if sep.into_option() == Some("") {
+            return Err(anyhow::anyhow!(
+                "Empty separator cannot be used for splitting"
+            ));
+        }
         let maxsplit = match maxsplit.into_option() {
             None => None,
             Some(v) => {
                 if v < 0 {
                     None
                 } else {
-                    Some((v + 1) as usize)
+                    Some(v as usize + 1)
                 }
             }
         };
@@ -983,7 +1035,10 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim_end(),
-            Some(s) => this.trim_end_matches(|c| s.contains(c)),
+            Some(s) => {
+                let s = StripChars::new(s);
+                this.trim_end_matches(|c| s.contains(c))
+            }
         };
         if res.len() == this.len() {
             Ok(this)
@@ -1031,13 +1086,18 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
         heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
+        if sep.into_option() == Some("") {
+            return Err(anyhow::anyhow!(
+                "Empty separator cannot be used for splitting"
+            ));
+        }
         let maxsplit = match maxsplit.into_option() {
             None => None,
             Some(v) => {
                 if v < 0 {
                     None
                 } else {
-                    Some((v + 1) as usize)
+                    Some(v as usize + 1)
                 }
             }
         };
@@ -1183,7 +1243,10 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim(),
-            Some(s) => this.trim_matches(|c| s.contains(c)),
+            Some(s) => {
+                let s = StripChars::new(s);
+                this.trim_matches(|c| s.contains(c))
+            }
         };
         if res.len() == this.len() {
             Ok(this)
@@ -1310,6 +1373,77 @@ mod tests {
         assert::fail(r#""bonbon".index("on", 2, 5)"#, "not found in");
         assert::fail(r#"("banana".replace("a", "o", -2))"#, "negative");
         assert::fail(r#""bonbon".rindex("on", 2, 5)"#, "not found in");
+    }
+
+    /// `start` and `end` are both negative with `start > end`, and both clamp to 0, so the
+    /// range is the empty slice at 0, where an empty needle is found, as in Python.
+    #[test]
+    fn test_search_with_two_negative_indices_clamped_to_zero() {
+        assert::eq(r#""abc".find("", -4, -5)"#, "0");
+        assert::eq(r#""abc".rfind("", -4, -5)"#, "0");
+        assert::eq(r#""abc".count("", -4, -5)"#, "1");
+        assert::eq(r#""abc".startswith("", -4, -5)"#, "True");
+        assert::eq(r#""abc".endswith("", -4, -5)"#, "True");
+        assert::eq(r#""abc".index("", -3, -4)"#, "0");
+        assert::eq(r#""abc"[-4:-5]"#, r#""""#);
+        // Indices that do not both clamp still give an empty range.
+        assert::eq(r#""abc".find("", -1, -2)"#, "-1");
+        assert::eq(r#""abc".find("c", -1, -2)"#, "-1");
+    }
+
+    /// The spec says `split` fails on an empty separator.
+    #[test]
+    fn test_split_empty_separator() {
+        assert::fail(r#""abc".split("")"#, "Empty separator");
+        assert::fail(r#""abc".rsplit("")"#, "Empty separator");
+        assert::fail(r#""abc".split("", 1)"#, "Empty separator");
+        assert::fail(r#""abc".rsplit("", 1)"#, "Empty separator");
+        assert::fail(r#""".split("")"#, "Empty separator");
+        assert::eq(r#""a,b".split(",")"#, r#"["a", "b"]"#);
+    }
+
+    /// `maxsplit` is one less than the number of parts, so `i32::MAX` must not overflow.
+    #[test]
+    fn test_split_max_maxsplit() {
+        assert::eq(r#""a b c".split(None, 2147483647)"#, r#"["a", "b", "c"]"#);
+        assert::eq(r#""a b c".rsplit(None, 2147483647)"#, r#"["a", "b", "c"]"#);
+        assert::eq(r#""a,b,c".split(",", 2147483647)"#, r#"["a", "b", "c"]"#);
+        assert::eq(r#""a,b,c".rsplit(",", 2147483647)"#, r#"["a", "b", "c"]"#);
+    }
+
+    /// `istitle`, `isupper` and `islower` are defined over cased characters: a letter with no
+    /// case (CJK) is not a title-cased word and does not start one, and a titlecase letter such
+    /// as `ǅ` is cased but neither upper nor lower.
+    #[test]
+    fn test_case_predicates_with_uncased_and_titlecase_letters() {
+        assert::eq(r#""中".istitle()"#, "False");
+        assert::eq(r#""中A".istitle()"#, "True");
+        assert::eq(r#""ǅa".istitle()"#, "True");
+        assert::eq(r#""Hello World".istitle()"#, "True");
+        assert::eq(r#""HELLO".istitle()"#, "False");
+        assert::eq(r#""Aǅ".isupper()"#, "False");
+        assert::eq(r#""A中".isupper()"#, "True");
+        assert::eq(r#""中".isupper()"#, "False");
+        assert::eq(r#""aǅ".islower()"#, "False");
+        assert::eq(r#""a中".islower()"#, "True");
+    }
+
+    /// `chars` is a set of characters: ASCII at both ends of the range, non-ASCII, and
+    /// duplicates, in any order.
+    #[test]
+    fn test_strip_chars() {
+        assert::all_true(
+            r#"
+"\x00\x7fab\x7f\x00".strip("\x7f\x00") == "ab"
+"éaĩbéĩ".strip("ĩéĩé") == "aĩb"
+"éaĩbéĩ".lstrip("ĩéĩé") == "aĩbéĩ"
+"éaĩbéĩ".rstrip("ĩéĩé") == "éaĩb"
+"x!éx".strip("é!x") == ""
+"abc".strip("") == "abc"
+"".strip("abc") == ""
+("é" * 1000).strip("ĩ" * 1000 + "é") == ""
+"#,
+        );
     }
 
     #[test]

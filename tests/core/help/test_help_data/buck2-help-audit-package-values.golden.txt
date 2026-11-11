@@ -1,9 +1,11 @@
 # This file is @generated, regenerate by re-running test with `-- --env BUCK2_UPDATE_GOLDEN=1` appended to the test command
 
-Inspect package values, visibility, within_view, visibility_cap and within_view_cap.
+Inspect package values, visibility, within_view, visibility_cap, within_view_cap and
+visibility_intersection.
 
 Package values are set with `write_package_value` function from `PACKAGE` files. Visibility and
-within_view come from the `package()` function in `PACKAGE` files. Visibility_cap comes from
+within_view come from the `package()` function in `PACKAGE` files. Visibility_cap (legacy collapsed
+shape, without exemptions) and visibility_intersection (per-layer shape) come from
 `enforce_visibility_intersection()` and within_view_cap from `enforce_within_view_intersection()` in
 `PACKAGE` files.
 
@@ -223,6 +225,6 @@ Universal Options:
 
       --agent-context <AGENT_CONTEXT>
           Agent context key=value pairs for telemetry. Used by AI agents to pass structured
-          metadata. Schema is defined via buckconfig. Entries can be comma-separated or passed as
-          separate flags. Examples: --agent-context intent=fix,attempt=2,prior_error=missing_target
-          --agent-context intent=build --agent-context attempt=1
+          metadata. Schema is defined via buckconfig. Examples: --agent-context
+          intent=fix,attempt=2,prior_error=missing_target --agent-context intent=build
+          --agent-context attempt=1 --agent-context "reason=fix the build, then test"

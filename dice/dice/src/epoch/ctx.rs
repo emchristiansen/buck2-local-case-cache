@@ -11,7 +11,12 @@
 use std::any::Any;
 use std::future::Future;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::Arc as StdArc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use dice_error::DiceError;
 use dice_error::DiceResult;
@@ -24,10 +29,10 @@ use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use itertools::Either;
 use parking_lot::Mutex;
+use pin_project::pin_project;
 
 use crate::ActivationData;
 use crate::LinearRecomputeDiceComputations;
-use crate::UserCycleDetectorGuard;
 use crate::api::computations::DiceComputations;
 use crate::api::computations::DiceComputationsData;
 use crate::api::data::DiceData;
@@ -35,26 +40,24 @@ use crate::api::invalidation_tracking::DiceKeyTrackedInvalidationPaths;
 use crate::api::key::Key;
 use crate::api::projection::ProjectionKey;
 use crate::api::user_data::UserComputationData;
-use crate::arc::Arc;
 use crate::core::graph::revision::Revision;
 use crate::deps::LinearDepsTracker;
 use crate::deps::RecordedDeps;
 use crate::deps::RecordingDepsTracker;
 use crate::deps::graph::DepEdge;
-use crate::dice::Dice;
 use crate::epoch::branches::BranchEntry;
 use crate::epoch::branches::LinearRecomputeArena;
 use crate::epoch::branches::ParallelArena;
 use crate::epoch::branches::ParallelBranchFuture;
 use crate::epoch::evaluator::TransactionData;
-use crate::epoch::evaluator::VersionEpochState;
+use crate::epoch::evaluator::ValueDemand;
+use crate::epoch::task::promise::DicePromise;
 use crate::key::CowDiceKeyHashed;
 use crate::key::DiceKey;
 use crate::key::ParentKey;
 use crate::opaque::OpaqueValue;
 use crate::updater::ActiveTransactionGuard;
-use crate::user_cycle::KeyComputingUserCycleDetectorData;
-use crate::value::DiceComputedValue;
+use crate::value::MaybeResidentComputedValue;
 use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
 
@@ -70,8 +73,8 @@ impl Clone for TransactionCtx {
             ctx: ComputeCtx {
                 transaction_data: self.ctx.transaction_data.dupe(),
                 parent_key: ParentKey::None,
-                cycles: KeyComputingUserCycleDetectorData::Untracked,
                 evaluation_data: Mutex::new(EvaluationData::none()),
+                dependency_failed: AtomicBool::new(false),
             },
             live_version_guard: self.live_version_guard.dupe(),
         }
@@ -82,21 +85,15 @@ impl Dupe for TransactionCtx {}
 
 impl TransactionCtx {
     pub(crate) fn new(
-        per_live_version_ctx: VersionEpochState,
-        user_data: Arc<UserComputationData>,
-        dice: StdArc<Dice>,
+        transaction_data: TransactionData,
         live_version_guard: ActiveTransactionGuard,
     ) -> Self {
         Self {
             ctx: ComputeCtx {
-                transaction_data: TransactionData {
-                    epoch_state: per_live_version_ctx,
-                    user_data,
-                    dice,
-                },
+                transaction_data,
                 parent_key: ParentKey::None,
-                cycles: KeyComputingUserCycleDetectorData::Untracked,
                 evaluation_data: Mutex::new(EvaluationData::none()),
+                dependency_failed: AtomicBool::new(false),
             },
             live_version_guard,
         }
@@ -302,14 +299,13 @@ impl<'d> TrackedComputations<'d> {
         let inner_core_ctx = ComputeCtx {
             transaction_data: ctx_data.transaction_data.dupe(),
             parent_key: ctx_data.parent_key.dupe(),
-            // FIXME(JakobDegen): These are never looked at again below, seems bad?
-            cycles: ctx_data.cycles.clone(),
             evaluation_data: Mutex::new(EvaluationData::none()),
+            dependency_failed: AtomicBool::new(false),
         };
 
         let user_data = ctx_data.per_transaction_data();
         let spawner = user_data.spawner.dupe();
-        let ctx_data = user_data.dupe();
+        let spawner_data = user_data.dupe();
 
         let task = spawn_dropcancel(
             |cancellation| {
@@ -321,15 +317,18 @@ impl<'d> TrackedComputations<'d> {
                     .into();
                     let res = closure(&mut ctx, cancellation).await;
                     let deps = ctx.0.finalize();
-                    (res, deps)
+                    (res, deps, inner_core_ctx.dependency_failed.into_inner())
                 }
                 .boxed()
             },
             &*spawner,
-            ctx_data,
+            spawner_data,
         );
 
-        task.map(move |(res, deps)| {
+        task.map(move |(res, deps, dependency_failed)| {
+            if dependency_failed {
+                ctx_data.record_dependency_failure();
+            }
             let validity = deps.deps_validity;
             let mut self_dep_trackers = self_dep_trackers;
             for edge in deps.deps.iter_edges() {
@@ -449,7 +448,7 @@ pub struct ModernDiceComputationsData(TransactionData);
 
 impl ModernDiceComputationsData {
     pub fn global_data(&self) -> &DiceData {
-        &self.0.dice.global_data
+        &self.0.global_data
     }
 
     pub fn per_transaction_data(&self) -> &UserComputationData {
@@ -602,8 +601,7 @@ impl<'d> TrackedComputations<'d> {
             .dupe())
     }
 
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
+    /// Untracked data that is static for the lifetime of this branch tree.
     pub(crate) fn global_data(&self) -> &'d DiceData {
         self.ctx_data().global_data()
     }
@@ -627,10 +625,6 @@ impl<'d> TrackedComputations<'d> {
     ) -> DiceResult<()> {
         self.ctx_data().store_evaluation_data(value)
     }
-
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<StdArc<T>>> {
-        self.ctx_data().cycle_guard()
-    }
 }
 
 /// The base type that provides access to `.compute()` operations and stores the state needed to
@@ -640,12 +634,19 @@ impl<'d> TrackedComputations<'d> {
 pub(crate) struct ComputeCtx {
     pub(crate) transaction_data: TransactionData,
     pub(crate) parent_key: ParentKey,
-    pub(crate) cycles: KeyComputingUserCycleDetectorData,
     // data for the entire compute of a Key, including parallel computes
     pub(crate) evaluation_data: Mutex<EvaluationData>,
+    /// Whether a dependency failed to produce a value, for example because its paged-out value
+    /// could not be read back. Such a failure reflects storage state rather than the recorded
+    /// deps, so a result computed after observing one must not be reused by later transactions.
+    pub(crate) dependency_failed: AtomicBool,
 }
 
 impl ComputeCtx {
+    fn record_dependency_failure(&self) {
+        self.dependency_failed.store(true, Ordering::Relaxed);
+    }
+
     /// The allocation the key index holds for an already indexed `key`.
     pub(crate) fn canonical_key<K: Key>(&self, key: DiceKey) -> StdArc<K> {
         self.transaction_data
@@ -674,27 +675,39 @@ impl ComputeCtx {
             .key_index
             .index(CowDiceKeyHashed::key_ref(key));
 
-        self.transaction_data
-            .epoch_state
-            .compute_opaque(
-                dice_key,
-                self.parent_key,
-                &self.transaction_data,
-                self.cycles
-                    .subrequest(dice_key, &self.transaction_data.dice.key_index),
-            )
-            .map(move |result| {
-                result.as_ref().into_dice_result().map(|dice_value| {
-                    OpaqueValue::new(
-                        dice_key,
-                        dice_value
-                            .resident_value()
-                            .expect("a task always pages in the value it hands back"),
-                        dice_value.revision(),
-                        dice_value.invalidation_paths(),
-                    )
+        let promise = self
+            .transaction_data
+            .bring_up_to_date(dice_key, self.parent_key);
+        ComputeOpaqueFuture {
+            state: ComputeOpaqueState::UpToDate {
+                promise,
+                compute: self,
+                key: dice_key,
+            },
+        }
+    }
+
+    fn page_in_opaque<'d, K: Key>(
+        &'d self,
+        key: DiceKey,
+    ) -> BoxFuture<'d, DiceResult<OpaqueValue<'d, K>>> {
+        async move {
+            let value = self
+                .transaction_data
+                .page_in(ValueDemand {
+                    key,
+                    parent_key: self.parent_key,
                 })
-            })
+                .await
+                .inspect_err(|_| self.record_dependency_failure())?;
+            Ok(OpaqueValue::new(
+                key,
+                value.value(),
+                value.revision(),
+                value.invalidation_paths(),
+            ))
+        }
+        .boxed()
     }
 
     /// Compute "projection" based on deriving value
@@ -702,30 +715,26 @@ impl ComputeCtx {
         &self,
         key: &K,
         base: &OpaqueValue<B>,
-    ) -> DiceResult<(DiceKey, DiceComputedValue)> {
+    ) -> DiceResult<(DiceKey, MaybeResidentComputedValue)> {
         let dice_key = self
             .transaction_data
             .dice
             .key_index
             .index(CowDiceKeyHashed::proj_ref(base.derive_from_key, key));
 
-        self.transaction_data
-            .epoch_state
-            .compute_projection(
-                dice_key,
-                base.derive_from,
-                base.revision,
-                base.invalidation_paths,
-                &self.transaction_data,
-            )
-            .into_dice_result()
-            .map(|r| (dice_key, r))
+        let value = self.transaction_data.version_state.compute_projection(
+            dice_key,
+            base.derive_from,
+            base.revision,
+            base.invalidation_paths,
+            &self.transaction_data,
+        );
+        Ok((dice_key, value))
     }
 
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
+    /// Untracked data that is static for the lifetime of this branch tree.
     pub(crate) fn global_data(&self) -> &DiceData {
-        &self.transaction_data.dice.global_data
+        &self.transaction_data.global_data
     }
 
     /// Data that is static for the lifetime of the current request context. This lifetime is
@@ -737,7 +746,7 @@ impl ComputeCtx {
     }
 
     pub(crate) fn get_version(&self) -> VersionNumber {
-        self.transaction_data.epoch_state.get_version()
+        self.transaction_data.version_state.get_version()
     }
 
     pub(crate) fn store_evaluation_data<T: Send + Sync + 'static>(
@@ -751,9 +760,65 @@ impl ComputeCtx {
         evaluation_data.0 = Some(Box::new(value) as _);
         Ok(())
     }
+}
 
-    pub(crate) fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<StdArc<T>>> {
-        self.cycles.cycle_guard()
+#[pin_project(project = ComputeOpaqueStateProj)]
+enum ComputeOpaqueState<'d, K: Key> {
+    UpToDate {
+        #[pin]
+        promise: DicePromise<'d>,
+        compute: &'d ComputeCtx,
+        key: DiceKey,
+    },
+    PagingIn {
+        #[pin]
+        future: BoxFuture<'d, DiceResult<OpaqueValue<'d, K>>>,
+    },
+}
+
+#[pin_project]
+struct ComputeOpaqueFuture<'d, K: Key> {
+    #[pin]
+    state: ComputeOpaqueState<'d, K>,
+}
+
+impl<'d, K: Key> Future for ComputeOpaqueFuture<'d, K> {
+    type Output = DiceResult<OpaqueValue<'d, K>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            let mut this = self.as_mut().project();
+            match this.state.as_mut().project() {
+                ComputeOpaqueStateProj::UpToDate {
+                    promise,
+                    compute,
+                    key,
+                } => {
+                    let value = match std::task::ready!(promise.poll(cx)) {
+                        Ok(value) => value,
+                        Err(cycle) => {
+                            // The dep goes unrecorded, as after a failed page-in, and the result
+                            // computed without it must likewise not be reused.
+                            compute.record_dependency_failure();
+                            return Poll::Ready(Err(cycle.into()));
+                        }
+                    };
+                    if let Ok(resident) = value.try_as_resident() {
+                        // Return from the poll that produced the resident value; the hot path
+                        // needs neither a boxed future nor another future state transition.
+                        return Poll::Ready(Ok(OpaqueValue::new(
+                            *key,
+                            resident.value(),
+                            resident.revision(),
+                            resident.invalidation_paths(),
+                        )));
+                    }
+                    let future = compute.page_in_opaque(*key);
+                    this.state.set(ComputeOpaqueState::PagingIn { future });
+                }
+                ComputeOpaqueStateProj::PagingIn { future } => return future.poll(cx),
+            }
+        }
     }
 }
 

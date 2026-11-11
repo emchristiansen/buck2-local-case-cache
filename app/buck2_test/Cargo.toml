@@ -45,7 +45,6 @@ pagable.workspace = true
 remote_execution.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sorted_vector_map.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
@@ -55,10 +54,10 @@ buck2_analysis.workspace = true
 buck2_anon_target.workspace = true
 buck2_configured.workspace = true
 buck2_event_observer.workspace = true
+buck2_settings.workspace = true
 buck2_transition.workspace = true
 indoc.workspace = true
 maplit.workspace = true
-starlark_map.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

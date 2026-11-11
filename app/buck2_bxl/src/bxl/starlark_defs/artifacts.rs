@@ -17,16 +17,14 @@ use std::hash::Hasher;
 use std::iter;
 
 use allocative::Allocative;
-use buck2_artifact::artifact::artifact_type::BaseArtifactKind;
-use buck2_build_api::actions::calculation::ActionCalculation;
+use buck2_artifact::artifact::artifact_path::ArtifactPath;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::artifact_groups::ResolvedArtifactGroup;
 use buck2_build_api::artifact_groups::calculation::ArtifactGroupCalculation;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_declared_artifact::StarlarkDeclaredArtifact;
-use buck2_execute::path::artifact_path::ArtifactPath;
-use buck2_hash::BuckIndexSet;
+use buck2_hash::BuckMutInsertionSet;
 use derive_more::Display;
 use dice::DiceComputations;
 use dupe::Dupe;
@@ -34,7 +32,6 @@ use dupe::IterDupedExt;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallSet;
 use starlark::collections::StarlarkHasher;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
@@ -62,7 +59,7 @@ pub(crate) struct EnsuredArtifact {
     Trace,
     ProvidesStaticType,
     Allocative,
-    starlark::StarlarkPagablePanic
+    starlark::StarlarkPagableUnsupported
 )]
 #[repr(C)]
 pub(crate) struct EnsuredArtifactGroupInner {
@@ -80,10 +77,11 @@ pub(crate) async fn visit_artifact_path_without_associated_deduped(
 
     // `get_projection_sub_inputs()` to iterate through the tset, this is also needed to make
     // sure we aren't re-processing tests.
-    let mut visited = SmallSet::new();
+    let mut visited = BuckMutInsertionSet::new();
 
+    // `todo` is a stack, so push in reverse to visit the groups in command line order.
     let mut todo = Vec::new();
-    todo.extend(ags.iter().duped());
+    todo.extend(ags.iter().rev().duped());
 
     while let Some(ag) = todo.pop() {
         if !visited.insert(ag.dupe()) {
@@ -95,7 +93,11 @@ pub(crate) async fn visit_artifact_path_without_associated_deduped(
             }
             ResolvedArtifactGroup::TransitiveSetProjection(t) => {
                 let set = t.key.lookup(ctx).await?;
-                todo.extend(set.by_ref(|s| s.get_projection_sub_inputs(t.projection))?);
+                todo.extend(
+                    set.by_ref(|s| s.get_projection_sub_inputs(t.projection))?
+                        .into_iter()
+                        .rev(),
+                );
             }
         }
     }
@@ -110,7 +112,7 @@ pub(crate) async fn visit_artifact_path_without_associated_deduped(
     Trace,
     ProvidesStaticType,
     Allocative,
-    starlark::StarlarkPagablePanic
+    starlark::StarlarkPagableUnsupported
 )]
 #[repr(C)]
 pub(crate) struct EnsuredArtifactGroup<'v> {
@@ -473,7 +475,7 @@ fn artifact_group_methods(builder: &mut MethodsBuilder) {
 #[derive(Debug, Allocative)]
 pub(crate) struct LazyBuildArtifact {
     /// The artifacts that are associated with this artifact. This is used to materialize.
-    artifacts_to_build: BuckIndexSet<ArtifactGroup>,
+    artifacts_to_build: BuckMutInsertionSet<ArtifactGroup>,
     artifact: StarlarkArtifact,
 }
 
@@ -489,7 +491,7 @@ impl LazyBuildArtifact {
             .flat_map(|v| v.iter())
             .cloned()
             .chain(iter::once(ArtifactGroup::Artifact(bound_artifact)))
-            .collect::<BuckIndexSet<_>>();
+            .collect::<BuckMutInsertionSet<_>>();
 
         LazyBuildArtifact {
             artifacts_to_build: artifacts,
@@ -505,25 +507,20 @@ impl LazyBuildArtifact {
         &self,
         ctx: &mut DiceComputations<'_>,
     ) -> buck2_error::Result<()> {
-        ctx.try_compute_join(&self.artifacts_to_build, async |ctx, artifact_group| {
-            let artifact_group_values = ctx.ensure_artifact_group(artifact_group).await?;
-            let build_artifacts = artifact_group_values
-                .iter()
-                .filter_map(|(artifact, _value)| {
-                    if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
-                        Some(artifact.dupe())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            ctx.try_compute_join(build_artifacts, async |ctx, build_artifact| {
-                ActionCalculation::build_artifact(ctx, &build_artifact).await?;
-                buck2_error::Ok(())
-            })
-            .await
-        })
-        .await?;
-        Ok(())
+        build_artifact_groups(ctx, &self.artifacts_to_build).await
     }
+}
+
+/// Builds the artifact groups without materializing them.
+async fn build_artifact_groups(
+    ctx: &mut DiceComputations<'_>,
+    artifact_groups: &BuckMutInsertionSet<ArtifactGroup>,
+) -> buck2_error::Result<()> {
+    // `ensure_artifact_group` builds every artifact in the group, including each member of a
+    // transitive set projection.
+    ctx.try_compute_join(artifact_groups, async |ctx, artifact_group| {
+        ctx.ensure_artifact_group(artifact_group).await.map(|_| ())
+    })
+    .await?;
+    Ok(())
 }

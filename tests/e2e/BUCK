@@ -49,3 +49,21 @@ buck2_e2e_test(
         "fbcode//buck2/tests/e2e_util:utils",
     ],
 )
+
+buck2_e2e_test(
+    name = "test_git_fetch",
+    srcs = ["test_git_fetch.py"],
+    data_dir = "test_git_fetch_data",
+)
+
+buck2_e2e_test(
+    name = "test_prelude_rules",
+    srcs = ["test_prelude_rules.py"],
+    data_dir = "test_prelude_rules_data",
+)
+
+buck2_e2e_test(
+    name = "test_prelude_tools",
+    srcs = ["test_prelude_tools.py"],
+    data_dir = "test_prelude_tools_data",
+)

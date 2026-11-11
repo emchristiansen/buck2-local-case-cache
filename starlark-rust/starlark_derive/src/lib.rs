@@ -31,6 +31,7 @@ mod pagable_brand;
 mod serde;
 mod starlark_pagable;
 mod starlark_pagable_panic;
+mod starlark_pagable_unsupported;
 mod starlark_pagable_via_pagable;
 mod starlark_type_repr;
 mod starlark_value;
@@ -69,6 +70,8 @@ mod vtable;
 /// * `#[starlark(require = named)]` - require the parameter to be passed by name, not by position.
 /// * `#[starlark(args)]` - treat the argument as `*args` in Starlark, receiving all additional positional arguments as a tuple.
 /// * `#[starlark(kwargs)]` - treat the argument as `**kwargs` in Starlark, receiving all additional named arguments as a dictionary.
+/// * `#[starlark(doc_hidden)]` - omit the parameter from generated documentation while still accepting it.
+///   Only allowed on named-only parameters.
 ///
 /// There are a number of attributes that can be applied to the entire function by writing attributes
 /// before the `fn` of the function:
@@ -252,6 +255,21 @@ pub fn derive_starlark_pagable(input: proc_macro::TokenStream) -> proc_macro::To
 #[proc_macro_derive(StarlarkPagablePanic, attributes(starlark_pagable))]
 pub fn derive_starlark_pagable_panic(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     starlark_pagable_panic::derive_starlark_pagable_panic(input)
+}
+
+/// Derive `StarlarkSerialize` and `StarlarkDeserialize` impls that fail with an error naming
+/// the type.
+///
+/// Use on types that must satisfy a `StarlarkSerialize + StarlarkDeserialize` bound but cannot
+/// be paged. Unlike `StarlarkPagablePanic`, reaching one during page-out fails that page-out
+/// and leaves the heap resident, rather than aborting the process.
+///
+/// The brand of the `StarlarkDeserialize` impl is chosen as for `StarlarkPagable`.
+#[proc_macro_derive(StarlarkPagableUnsupported, attributes(starlark_pagable))]
+pub fn derive_starlark_pagable_unsupported(
+    input: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    starlark_pagable_unsupported::derive_starlark_pagable_unsupported(input)
 }
 
 /// Derive `StarlarkSerialize` / `StarlarkDeserialize` impls that bridge to the

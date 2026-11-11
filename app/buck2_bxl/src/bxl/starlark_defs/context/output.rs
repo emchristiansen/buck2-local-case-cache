@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use allocative::Allocative;
+use buck2_artifact::artifact::artifact_path::ArtifactPath;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::bxl::build_result::BxlBuildResult;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
@@ -31,8 +32,7 @@ use buck2_core::fs::project::ProjectRoot;
 use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
 use buck2_error::starlark_error::from_starlark_with_options;
-use buck2_execute::path::artifact_path::ArtifactPath;
-use buck2_hash::BuckIndexSet;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_server_ctx::bxl::BxlStreamingTracker;
 use buck2_server_ctx::bxl::GetBxlStreamingTracker;
 use derivative::Derivative;
@@ -40,13 +40,11 @@ use derive_more::Display;
 use dupe::Dupe;
 use either::Either;
 use futures::FutureExt;
-use gazebo::prelude::VecExt;
 use itertools::Itertools;
 use serde::Serialize;
 use serde::Serializer;
 use serde::ser::SerializeSeq;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallSet;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
@@ -64,6 +62,7 @@ use starlark::values::list::ListRef;
 use starlark::values::list::UnpackList;
 use starlark::values::none::NoneType;
 use starlark::values::record::Record;
+use starlark::values::set::SetRef;
 use starlark::values::starlark_value;
 use starlark::values::structs::StructRef;
 use starlark::values::tuple::TupleRef;
@@ -86,7 +85,7 @@ use crate::bxl::streaming_output_writer::StreamingOutputWriter;
 #[derivative(Debug)]
 struct OutputStreamStateInner {
     /// The output string bytes where all non-streaming outputs are written to.
-    artifacts_to_ensure: SmallSet<EnsuredArtifactOrGroup>,
+    artifacts_to_ensure: BuckMutInsertionSet<EnsuredArtifactOrGroup>,
     /// The output string bytes where all non-streaming outputs are written to.
     output: Vec<u8>,
     /// The output streaming string bytes where all streaming outputs that not waiting on anything are written to.
@@ -95,7 +94,7 @@ struct OutputStreamStateInner {
     pub(crate) error: Vec<u8>,
     /// Pairs of artifacts set and their corresponding streaming output string.
     /// Used to track outputs that are waiting for their associated artifacts to be materialized.
-    pending_streaming_outputs: Vec<(SmallSet<EnsuredArtifactOrGroup>, Vec<u8>)>,
+    pending_streaming_outputs: Vec<(BuckMutInsertionSet<EnsuredArtifactOrGroup>, Vec<u8>)>,
 }
 
 #[derive(Derivative, Display, Allocative, Dupe, Clone)]
@@ -120,11 +119,11 @@ pub(crate) struct OutputStreamState {
 pub(crate) struct OutputStreamOutcome {
     /// set of artifacts that need to be materialized, flattened from
     /// the original EnsuredArtifactOrGroup entries.
-    pub(crate) ensured_artifacts: BuckIndexSet<ArtifactGroup>,
+    pub(crate) ensured_artifacts: BuckMutInsertionSet<ArtifactGroup>,
     pub(crate) output: Vec<u8>,
     pub(crate) streaming: Vec<u8>,
     pub(crate) error: Vec<u8>,
-    pub(crate) pending_streaming_outputs: Vec<(BuckIndexSet<ArtifactGroup>, Vec<u8>)>,
+    pub(crate) pending_streaming_outputs: Vec<(BuckMutInsertionSet<ArtifactGroup>, Vec<u8>)>,
 }
 
 #[derive(
@@ -196,7 +195,7 @@ impl OutputStreamState {
             .into_iter()
             .map(EnsuredArtifactOrGroup::into_artifact_groups)
             .flatten_ok()
-            .collect::<buck2_error::Result<BuckIndexSet<ArtifactGroup>>>()?;
+            .collect::<buck2_error::Result<BuckMutInsertionSet<ArtifactGroup>>>()?;
         let pending_streaming_outputs = state
             .pending_streaming_outputs
             .into_iter()
@@ -205,10 +204,10 @@ impl OutputStreamState {
                     .into_iter()
                     .map(|ensured_artifact| ensured_artifact.into_artifact_groups())
                     .flatten_ok()
-                    .collect::<buck2_error::Result<BuckIndexSet<ArtifactGroup>>>()?;
+                    .collect::<buck2_error::Result<BuckMutInsertionSet<ArtifactGroup>>>()?;
                 Ok((artifacts, output_str))
             })
-            .collect::<buck2_error::Result<Vec<(BuckIndexSet<ArtifactGroup>, Vec<u8>)>>>()?;
+            .collect::<buck2_error::Result<Vec<(BuckMutInsertionSet<ArtifactGroup>, Vec<u8>)>>>()?;
         Ok(OutputStreamOutcome {
             ensured_artifacts: artifacts,
             output: state.output,
@@ -255,7 +254,7 @@ impl OutputStreamState {
 
     fn pending_streaming_outputs(
         &self,
-    ) -> MappedMutexGuard<'_, Vec<(SmallSet<EnsuredArtifactOrGroup>, Vec<u8>)>> {
+    ) -> MappedMutexGuard<'_, Vec<(BuckMutInsertionSet<EnsuredArtifactOrGroup>, Vec<u8>)>> {
         MutexGuard::map(self.inner.try_lock().unwrap(), |inner| {
             &mut inner
                 .as_mut()
@@ -280,7 +279,7 @@ impl<'a, T: Write> Write for BufferPrintOutput<'a, T> {
 }
 
 struct StreamingOutput {
-    wait_on_artifacts: SmallSet<EnsuredArtifactOrGroup>,
+    wait_on_artifacts: BuckMutInsertionSet<EnsuredArtifactOrGroup>,
     output_stream_state: OutputStreamState,
     streaming_writer: BxlStreamingWriter,
     buffer: Vec<u8>,
@@ -516,6 +515,8 @@ impl StarlarkOutputStream {
                 } else if let Some(x) = ListRef::from_value(self.value) {
                     serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
                 } else if let Some(x) = TupleRef::from_value(self.value) {
+                    serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
+                } else if let Some(x) = SetRef::from_value(self.value) {
                     serializer.collect_seq(x.iter().map(|v| self.with_value(v)))
                 } else if let Some(x) = DictRef::from_value(self.value) {
                     serializer.collect_map(
@@ -814,14 +815,18 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         match artifacts {
             EnsureMultipleArtifactsArg::None(_) => Ok(heap.alloc(Vec::<EnsuredArtifact>::new())),
             EnsureMultipleArtifactsArg::EnsuredArtifactArgs(list) => {
-                let artifacts: Vec<EnsuredArtifact> = list.items.into_try_map(|artifact| {
-                    let artifact = artifact.into_ensured_artifact()?;
-                    this.populate_ensured_artifacts(EnsuredArtifactOrGroup::Artifact(
-                        artifact.clone(),
-                    ))?;
+                let artifacts: Vec<EnsuredArtifact> = list
+                    .items
+                    .into_iter()
+                    .map(|artifact| {
+                        let artifact = artifact.into_ensured_artifact()?;
+                        this.populate_ensured_artifacts(EnsuredArtifactOrGroup::Artifact(
+                            artifact.clone(),
+                        ))?;
 
-                    Ok::<EnsuredArtifact, buck2_error::Error>(artifact)
-                })?;
+                        Ok::<EnsuredArtifact, buck2_error::Error>(artifact)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 Ok(heap.alloc(artifacts))
             }

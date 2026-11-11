@@ -20,7 +20,8 @@ load(
     "cover_srcs",
 )
 load(":go_error_handler.bzl", "go_build_error_handler")
-load(":go_list.bzl", "GoListOut", "go_list", "parse_go_list_out")
+load(":go_list.bzl", "GoListDynamicValue", "GoListOut", "go_list")
+load(":package_root.bzl", "strip_package_root")
 load(":packages.bzl", "GoPackageInfo", "GoPkg", "GoStdlib", "GoStdlibDynamicValue", "implicit_imports", "make_compile_importcfg", "merge_pkgs")
 load(":toolchain.bzl", "GoToolchainInfo", "get_toolchain_env_vars")
 
@@ -76,7 +77,7 @@ def declare_package_build(
 
     package_root = sources.package_root if sources.package_root != None else infer_package_root(srcs)
 
-    go_list_out = go_list(actions, go_toolchain, pkg_import_path, srcs, package_root, config.build_tags, config.cgo_enabled, with_tests = config.with_tests)
+    go_list_value = go_list(actions, go_toolchain, pkg_import_path, srcs, package_root, config.build_tags, config.cgo_enabled, with_tests = config.with_tests)
 
     test_go_files_argsfile = actions.declare_output(paths.basename(pkg_import_path) + "_test_go_files.go_package_argsfile", has_content_based_path = True)
 
@@ -90,17 +91,14 @@ def declare_package_build(
             target_label = target_label,
             pkg_import_path = pkg_import_path,
             main = main,
-            sources = GoSourceInputs(
-                srcs = srcs,
-                embed_srcs = sources.embed_srcs,
-                package_root = package_root,
-            ),
+            package_root = package_root,
+            embed_srcs = sources.embed_srcs,
             cgo_build_context = cgo_build_context,
             config = config,
             deps_pkgs = all_pkgs,
             go_toolchain = go_toolchain,
             go_stdlib_value = go_stdlib.dynamic_value,
-            go_list_out = go_list_out,
+            go_list_value = go_list_value,
             cgo_gen_dir = cgo_gen_dir.as_output(),
             out_a = out_a.as_output(),
             out_shared_a = out_shared_a.as_output(),
@@ -121,8 +119,7 @@ def declare_package_build(
             build_out = out_x,
             cgo_gen_dir = cgo_gen_dir,
             pkg_import_path = pkg_import_path,
-            package_root = package_root,
-            go_list_out = go_list_out,
+            go_list_value = go_list_value,
             srcs = srcs,
         ),
         test_go_files_argsfile.with_associated_artifacts(srcs),
@@ -133,12 +130,13 @@ def _build_package_action_impl(
     target_label: Label,
     pkg_import_path: str,
     main: bool,
-    sources: GoSourceInputs,
+    package_root: str,
+    embed_srcs: dict[str, Artifact],
     cgo_build_context: None | CGoBuildContext,
     config: GoBuildConfig,
     deps_pkgs: dict[str, GoPkg],
     go_toolchain: GoToolchainInfo,
-    go_list_out: ArtifactValue,
+    go_list_value: ResolvedDynamicValue,
     go_stdlib_value: ResolvedDynamicValue,
     cgo_gen_dir: OutputArtifact,
     out_a: OutputArtifact,
@@ -147,7 +145,7 @@ def _build_package_action_impl(
     out_x: OutputArtifact,
     test_go_files_argsfile: OutputArtifact,
 ):
-    go_list = parse_go_list_out(sources.srcs, sources.package_root, go_list_out)
+    go_list = go_list_value.providers[GoListDynamicValue].go_list_out
 
     if go_list.error != None:
         fail("Invalid go package: {}", go_list.error.err)
@@ -167,8 +165,8 @@ def _build_package_action_impl(
             main = main,
             standard = False,
             pkg_import_path = pkg_import_path,
-            package_root = sources.package_root,
-            embed_srcs = sources.embed_srcs,
+            package_root = package_root,
+            embed_srcs = embed_srcs,
             compiler_flags = config.compiler_flags,
             assembler_flags = config.assembler_flags,
             coverage_enabled = config.coverage_enabled,
@@ -197,14 +195,14 @@ _build_package_action = dynamic_actions(
         "target_label": dynattrs.value(Label),
         "pkg_import_path": dynattrs.value(str),
         "main": dynattrs.value(bool),
-        "sources": dynattrs.value(GoSourceInputs),
+        "package_root": dynattrs.value(str),
+        "embed_srcs": dynattrs.value(dict[str, Artifact]),
         "cgo_build_context": dynattrs.value(CGoBuildContext | None),
         "config": dynattrs.value(GoBuildConfig),
         "deps_pkgs": dynattrs.value(dict[str, GoPkg]),
         "go_toolchain": dynattrs.value(GoToolchainInfo),
-        # Readable Artifacts
-        "go_list_out": dynattrs.artifact_value(),
         # Dynamic Values
+        "go_list_value": dynattrs.dynamic_value(),  # GoListDynamicValue
         "go_stdlib_value": dynattrs.dynamic_value(),  # GoStdlibDynamicValue
         # Outputs
         "cgo_gen_dir": dynattrs.output(),
@@ -632,7 +630,7 @@ def _embedcfg(
 
     srcs_dir = actions.copied_dir(
         "__embed_srcs_dir__",
-        {name.removeprefix(package_root).lstrip("/"): src for name, src in embed_srcs.items()},
+        {strip_package_root(name, package_root): src for name, src in embed_srcs.items()},
         has_content_based_path = True,
     )
 

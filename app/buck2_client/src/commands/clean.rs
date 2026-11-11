@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use buck2_agent_interactive::Advice;
 use buck2_client_ctx::client_ctx::BuckSubcommand;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
 use buck2_client_ctx::common::BuckArgMatches;
@@ -41,7 +42,6 @@ use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_util::threads::directory_mutation_parallelism;
 use dupe::Dupe;
-use gazebo::prelude::SliceExt;
 use superconsole::Line;
 use superconsole::SuperConsole;
 use superconsole::components::Spinner;
@@ -210,7 +210,7 @@ impl BuckSubcommand for InnerCleanCommand {
         self,
         _matches: BuckArgMatches<'_>,
         ctx: ClientCommandContext<'_>,
-        _events_ctx: &mut buck2_client_ctx::events_ctx::EventsCtx,
+        events_ctx: &mut EventsCtx,
     ) -> ExitResult {
         let paths = ctx.paths()?;
         let buck_out_dir = paths.buck_out_path();
@@ -232,6 +232,10 @@ impl BuckSubcommand for InnerCleanCommand {
             .into();
         }
 
+        events_ctx
+            .handle_agent_advice(ctx.trace_id.dupe(), ctx.agent_advice(Advice::Clean)?)
+            .await?;
+
         // Kill the daemon and make sure a new daemon does not spin up while we're performing clean up operations
         // This will ensure we have exclusive access to the directories in question
         let lifecycle_lock = BuckdLifecycleLock::lock_with_timeout(
@@ -240,7 +244,7 @@ impl BuckSubcommand for InnerCleanCommand {
         )
         .await?;
 
-        kill_command_impl(&lifecycle_lock, "`buck2 clean` was invoked").await?;
+        kill_command_impl(&lifecycle_lock, "`buck2 clean` was invoked", false).await?;
 
         clean(
             buck_out_dir,
@@ -270,7 +274,7 @@ async fn clean(
     lifecycle_lock: Option<&BuckdLifecycleLock>,
     background: bool,
 ) -> buck2_error::Result<()> {
-    let paths_to_clean = if background {
+    let paths_to_clean = if background && lifecycle_lock.is_some() {
         let trash_uuid = Uuid::new_v4();
         let trash_target = trash_dir.as_abs_path().join(trash_uuid.to_string());
 
@@ -310,7 +314,9 @@ async fn clean(
         if trash_target_normalized.exists() {
             paths_to_clean.extend(
                 collect_paths_to_clean(&trash_target_normalized)?
-                    .map(|path| path.display().to_string()),
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
             );
             tokio::task::spawn_blocking(move || {
                 clean_buck_out_with_retry(&trash_target_normalized, console_type)
@@ -323,8 +329,10 @@ async fn clean(
         let mut paths_to_clean = Vec::new();
 
         if buck_out_dir.exists() {
-            paths_to_clean =
-                collect_paths_to_clean(&buck_out_dir)?.map(|path| path.display().to_string());
+            paths_to_clean = collect_paths_to_clean(&buck_out_dir)?
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
             if lifecycle_lock.is_some() {
                 tokio::task::spawn_blocking(move || {
                     clean_buck_out_with_retry(&buck_out_dir, console_type)

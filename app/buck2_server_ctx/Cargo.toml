@@ -23,6 +23,7 @@ buck2_execute.workspace = true
 buck2_fs.workspace = true
 buck2_hash.workspace = true
 buck2_node.workspace = true
+buck2_settings.workspace = true
 buck2_util.workspace = true
 buck2_wrapper_common.workspace = true
 const_format.workspace = true
@@ -30,10 +31,8 @@ dice.workspace = true
 dice_futures.workspace = true
 dupe.workspace = true
 futures.workspace = true
-gazebo.workspace = true
 pin-project.workspace = true
 tonic.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

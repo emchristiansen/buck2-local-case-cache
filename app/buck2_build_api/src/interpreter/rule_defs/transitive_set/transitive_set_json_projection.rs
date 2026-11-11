@@ -29,8 +29,8 @@ use starlark::values::StarlarkValue;
 use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
-use starlark::values::ValueOf;
 use starlark::values::ValueOfUnchecked;
+use starlark::values::ValueTyped;
 use starlark::values::starlark_value;
 
 use crate::artifact_groups::TransitiveSetProjectionKey;
@@ -108,15 +108,11 @@ impl<'v> TransitiveSetJsonProjection<'v> {
 }
 
 impl<'v> TransitiveSetJsonProjection<'v> {
-    pub fn iter_values<'a>(
-        &'a self,
-    ) -> buck2_error::Result<Box<dyn Iterator<Item = Value<'v>> + 'a>>
-    where
-        'v: 'a,
-    {
+    /// Every node's projected value. Consumes the whole set.
+    pub fn collect_values(&self) -> buck2_error::Result<Vec<Value<'v>>> {
         let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
             .internal_error("Invalid transitive_set")?;
-        set.iter_projection_values(self.ordering, self.projection)
+        set.collect_projection_values(self.ordering, self.projection)
     }
 }
 
@@ -136,28 +132,28 @@ impl<'v> StarlarkValue<'v> for TransitiveSetJsonProjection<'v> {
 #[starlark_module]
 fn transitive_set_json_projection_methods(builder: &mut MethodsBuilder) {
     fn traverse<'v>(
-        this: ValueOf<'v, &'v TransitiveSetJsonProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetJsonProjection<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<Value<'v>> {
         Ok(heap.alloc(TransitiveSetProjectionTraversal {
-            transitive_set: this.typed.transitive_set,
-            projection: this.typed.projection,
-            ordering: this.typed.ordering,
+            transitive_set: this.transitive_set,
+            projection: this.projection,
+            ordering: this.ordering,
         }))
     }
 
     #[starlark(attribute)]
     fn projection_name<'v>(
-        this: ValueOf<'v, &'v TransitiveSetJsonProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetJsonProjection<'v>>,
         heap: Heap<'v>,
     ) -> starlark::Result<StringValue<'v>> {
-        Ok(heap.alloc_str(this.typed.projection_name()?))
+        Ok(heap.alloc_str(this.projection_name()?))
     }
 
     #[starlark(attribute)]
     fn transitive_set<'v>(
-        this: ValueOf<'v, &'v TransitiveSetJsonProjection<'v>>,
+        this: ValueTyped<'v, TransitiveSetJsonProjection<'v>>,
     ) -> starlark::Result<ValueOfUnchecked<'v, TransitiveSet<'static>>> {
-        Ok(this.typed.transitive_set)
+        Ok(this.transitive_set)
     }
 }

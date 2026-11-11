@@ -191,15 +191,6 @@ impl TargetInfo {
         canonicalize_to_vcs_path(&p, project_root)
     }
 
-    pub(crate) fn overridden_dep_names(&self) -> FxHashMap<Target, String> {
-        let mut overridden = FxHashMap::default();
-        for (name, target) in &self.named_deps {
-            overridden.insert(target.clone(), name.to_owned());
-        }
-
-        overridden
-    }
-
     pub(crate) fn cfg(&self) -> Vec<String> {
         // we need to take the existing features and prefix `feature=`
         let feature_cfgs = self.features.iter().map(|f| format!("feature=\"{f}\""));
@@ -221,52 +212,6 @@ impl TargetInfo {
             .collect::<Vec<String>>()
     }
 
-    /// Should this target be considered part of rust-analyzer's workspace?
-    ///
-    /// When rust-analyzer monitors files for changes, it only considers files
-    /// in the workspace. This only applies when rust-analyzer.files.watcher is
-    /// set to "server", the default is "client" (i.e. VS Code watches the
-    /// files).
-    ///
-    /// <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/rust-analyzer/src/reload.rs#L722>
-    ///
-    /// The only other (minor) affect of rust-analyzer's workspaces is that can
-    /// affect the values of cfg(rust_analyzer) and cfg(test).
-    ///
-    /// <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/project-model/src/workspace.rs#L1129>
-    ///
-    /// ---
-    ///
-    /// For comparison, rust-analyzer uses is_local in cargo projects similarly
-    /// to workspaces, to decide which directories to watch. This effectively
-    /// means that it watches files in the current repository, but not files
-    /// from dependencies.
-    ///
-    /// <https://github.com/rust-lang/cargo/blob/01e42b9bf1776d78d1714c63b927154539c741b4/src/cargo/core/features.rs#L440>
-    /// <https://github.com/rust-lang/rust-analyzer/blob/a8e2add5c74cf4c3b14335eb02afe91061da0e92/crates/load-cargo/src/lib.rs#L308-L309>
-    pub(crate) fn is_workspace_member(&self) -> bool {
-        // Buck workspaces define a set of buck projects that you typically edit
-        // together, e.g. foo-lib and its corresponding foo-bin, see D48096435.
-        //
-        // We definitely want watch all these files for changes. Arguably in a
-        // monorepo we could watch everything except vendored files, but there
-        // might be performance issues.
-        if self.in_workspace {
-            return true;
-        }
-
-        // If this target contains generated code (e.g. Thrift codegen), we also
-        // want to watch those files. Generated files can change on build, they
-        // aren't generally modified in the editor.
-        if self.labels.contains(&"generated".to_owned()) {
-            return true;
-        }
-
-        // Otherwise, don't treat it as part of the workspace. This should
-        // help performance.
-        false
-    }
-
     /// Is this a reindeer-vendored third-party crate?
     ///
     /// Reindeer buckifies vendored crates under a fixed set of package roots,
@@ -285,7 +230,8 @@ impl TargetInfo {
         package == "third-party/rust"
             || package == "third-party/rust/top"
             || package.starts_with("third-party/rust/vendor/")
-            || package.starts_with("xplat/rust/toolchain/sysroot")
+            || package == "third-party/rust-toolchain"
+            || package.starts_with("third-party/rust-toolchain/")
     }
 }
 
@@ -433,7 +379,12 @@ mod tests {
         assert!(with_label("fbsource//third-party/rust:tokio").is_reindeer_third_party());
         assert!(with_label("fbsource//third-party/rust/top:rustc").is_reindeer_third_party());
         assert!(
-            with_label("fbsource//xplat/rust/toolchain/sysroot:core").is_reindeer_third_party()
+            with_label("fbsource//third-party/rust-toolchain:rust_allocator")
+                .is_reindeer_third_party()
+        );
+        assert!(
+            with_label("fbsource//third-party/rust-toolchain/1.98.1/rust:core")
+                .is_reindeer_third_party()
         );
 
         assert!(
@@ -443,6 +394,9 @@ mod tests {
         // A first-party crate that merely lives under a similarly-named path is
         // not a reindeer root.
         assert!(!with_label("fbcode//third-party/rust-tools/foo:foo").is_reindeer_third_party());
+        assert!(
+            !with_label("fbsource//third-party/rust-toolchain-tools:foo").is_reindeer_third_party()
+        );
     }
 
     #[test]

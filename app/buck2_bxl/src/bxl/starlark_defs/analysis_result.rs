@@ -11,10 +11,10 @@
 use std::fmt;
 
 use allocative::Allocative;
-use buck2_build_api::analysis::AnalysisResult;
+use buck2_build_api::analysis::ProvidersLookup;
 use buck2_build_api::interpreter::rule_defs::provider::collection::ProviderCollection;
 use buck2_build_api::interpreter::rule_defs::provider::dependency::Dependency;
-use buck2_core::provider::label::ConfiguredProvidersLabel;
+use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
@@ -35,37 +35,23 @@ use starlark::values::starlark_value;
     Debug,
     NoSerialize,
     Allocative,
-    pagable::Pagable,
-    starlark::StarlarkPagableViaPagable
+    starlark::values::StarlarkPagable
 )]
 pub(crate) struct StarlarkAnalysisResult {
-    // Invariant: The subtarget specified on the label is present in the analysis result.
-    analysis: AnalysisResult,
-    label: ConfiguredProvidersLabel,
+    lookup: ProvidersLookup,
 }
 
 impl fmt::Display for StarlarkAnalysisResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AnalysisResult(")?;
-        fmt::Display::fmt(
-            self.analysis
-                .lookup_inner(&self.label)
-                .unwrap()
-                .provider_collection(),
-            f,
-        )?;
+        fmt::Display::fmt(self.lookup.providers().provider_collection(), f)?;
         write!(f, ")")
     }
 }
 
 impl StarlarkAnalysisResult {
-    pub(crate) fn new(
-        analysis: AnalysisResult,
-        label: ConfiguredProvidersLabel,
-    ) -> buck2_error::Result<Self> {
-        // Check that the specified subtarget actually exists
-        drop(analysis.lookup_inner(&label)?);
-        Ok(Self { analysis, label })
+    pub(crate) fn new(lookup: ProvidersLookup) -> Self {
+        Self { lookup }
     }
 }
 
@@ -99,7 +85,7 @@ fn starlark_analysis_result_methods(builder: &mut MethodsBuilder) {
         this: &'v StarlarkAnalysisResult,
         heap: Heap<'v>,
     ) -> starlark::Result<FrozenValueTyped<'v, ProviderCollection<'v>>> {
-        Ok(this.analysis.lookup_inner(&this.label)?.add_heap_ref(heap))
+        Ok(this.lookup.providers().add_heap_ref(heap))
     }
 
     /// Returns a list of structs describing each provider in the collection.
@@ -127,9 +113,10 @@ fn starlark_analysis_result_methods(builder: &mut MethodsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         let heap = eval.heap();
-        let collection = this.analysis.lookup_inner(&this.label)?.add_heap_ref(heap);
+        let collection = this.lookup.providers().add_heap_ref(heap);
         let mut result = Vec::new();
-        for (id, value) in collection.as_ref().iter_providers() {
+        for entry in collection.as_ref().iter_providers() {
+            let (id, value) = entry?;
             let name = heap.alloc(id.name.as_str());
             let path = match &id.path {
                 Some(p) => heap.alloc(p.to_string()),
@@ -143,6 +130,23 @@ fn starlark_analysis_result_methods(builder: &mut MethodsBuilder) {
             result.push(info);
         }
         Ok(heap.alloc(result))
+    }
+
+    /// Gets the configured providers label for this analysis result.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_label(ctx):
+    ///     actions = ctx.aquery().all_actions("//target")
+    ///     for node in actions:
+    ///         analysis = node.analysis()
+    ///         if analysis:
+    ///             ctx.output.print(analysis.label())
+    /// ```
+    fn label(this: &StarlarkAnalysisResult) -> starlark::Result<StarlarkConfiguredProvidersLabel> {
+        Ok(StarlarkConfiguredProvidersLabel::new(
+            this.lookup.label().dupe(),
+        ))
     }
 
     /// Converts the analysis result into a `Dependency`. Currently, you can only get a `Dependency` without any
@@ -164,9 +168,9 @@ fn starlark_analysis_result_methods(builder: &mut MethodsBuilder) {
     ) -> starlark::Result<ValueTyped<'v, Dependency<'v>>> {
         Ok(eval.heap().alloc_typed(Dependency::new(
             eval.heap(),
-            this.label.dupe(),
-            this.analysis
-                .lookup_inner(&this.label)?
+            this.lookup.label().dupe(),
+            this.lookup
+                .providers()
                 .add_heap_ref(eval.heap())
                 .to_value_typed(),
             None,

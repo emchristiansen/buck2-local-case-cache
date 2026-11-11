@@ -251,4 +251,41 @@ assert_ne(r1(host="test"), diff(host="test"))
         );
         assert::fails("field(True)", &["`True`", "not a valid type"]);
     }
+
+    /// A record type and its records are hashable whatever the field defaults are: record types
+    /// compare by identity, so the type is hashed by its identity.
+    #[test]
+    fn test_record_with_list_default_is_hashable() {
+        assert::eq(
+            "1",
+            "R = record(a = int, b = field(typing.Any, []))\nlen({R(a = 1, b = 2): 1})",
+        );
+        assert::eq(
+            "1",
+            "R = record(a = int, b = field(typing.Any, []))\nlen({R: 1})",
+        );
+        assert::eq(
+            "1",
+            "R = record(a = int, b = field(typing.Any, []))\nd = {}\nd[R(a = 1, b = 2)] = 1\nd[R(a = 1, b = 2)] = 2\nlen(d)",
+        );
+        assert::eq(
+            "1",
+            "R = record(a = int, b = field(typing.Any, None))\nlen({R(a = 1, b = 2): 1})",
+        );
+    }
+
+    /// An omitted field takes its default only if it still matches the field type: a default
+    /// mutated after the `field()` call is rejected like the same value passed explicitly.
+    #[test]
+    fn test_record_mutated_default_is_rechecked() {
+        assert::fail(
+            "d = []\nR = record(xs = field(list[int], d))\nd.append('s')\nR()",
+            "does not match the type annotation",
+        );
+        assert::fail(
+            "R = record(xs = field(list[int], []))\nR(xs = ['s'])",
+            "does not match the type annotation",
+        );
+        assert::eq("[]", "R = record(xs = field(list[int], []))\nR().xs");
+    }
 }

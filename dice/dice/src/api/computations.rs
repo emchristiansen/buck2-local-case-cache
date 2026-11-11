@@ -27,7 +27,6 @@ use crate::DiceKeyTrackedInvalidationPaths;
 use crate::EqualityBehavior;
 use crate::OpaqueValue;
 use crate::ProjectionKey;
-use crate::UserCycleDetectorGuard;
 use crate::api::data::DiceData;
 use crate::api::key::Key;
 use crate::api::key::NoValueSerialize;
@@ -48,9 +47,20 @@ use crate::key::DiceKeyDyn;
 /// owned.
 pub struct DiceComputations<'a>(pub(crate) TrackedComputations<'a>);
 
-fn _test_computations_sync_send() {
-    fn _assert_sync_send<T: Sync + Send>() {}
-    _assert_sync_send::<DiceComputations>();
+// SAFETY: `_assert_send_sync` destructures every field and requires it to be
+// `Send + Sync`, so these impls hold exactly when the derived ones would.
+//
+// They are spelled out because an auto-trait proof for a future recurses into
+// every type held across an await. Nearly every future in buck2 holds a
+// `DiceComputations`, and without these impls each of those proofs, in each
+// downstream crate, walks all of DICE's internals. Stopping the proof here
+// removes a large share of downstream type-checking time.
+unsafe impl Send for DiceComputations<'_> {}
+unsafe impl Sync for DiceComputations<'_> {}
+
+fn _assert_send_sync(DiceComputations(inner): &DiceComputations) {
+    fn assert<T: Send + Sync>(_: &T) {}
+    assert(inner);
 }
 
 impl<'d> DiceComputations<'d> {
@@ -440,8 +450,7 @@ impl<'d> DiceComputations<'d> {
         self.0.data()
     }
 
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
+    /// Untracked data that is static for the lifetime of this branch tree.
     pub fn global_data(&self) -> &'d DiceData {
         self.0.global_data()
     }
@@ -452,11 +461,6 @@ impl<'d> DiceComputations<'d> {
     /// each have their own individual data.
     pub fn per_transaction_data(&self) -> &'d UserComputationData {
         self.0.per_transaction_data()
-    }
-
-    /// Gets the current cycle guard if its set. If it's set but a different type, an error will be returned.
-    pub fn cycle_guard<T: UserCycleDetectorGuard>(&self) -> DiceResult<Option<Arc<T>>> {
-        self.0.cycle_guard()
     }
 
     /// Store some extra data that the ActivationTracker will receive if / when this key finishes
@@ -496,6 +500,17 @@ impl<'d> DiceComputations<'d> {
 #[derive(Copy, Clone, Dupe)]
 pub struct LinearRecomputeDiceComputations<'l, 'a>(pub(crate) &'l LinearShared<'a>);
 
+// SAFETY: as for `DiceComputations`.
+unsafe impl Send for LinearRecomputeDiceComputations<'_, '_> {}
+unsafe impl Sync for LinearRecomputeDiceComputations<'_, '_> {}
+
+fn _assert_linear_send_sync(
+    LinearRecomputeDiceComputations(inner): &LinearRecomputeDiceComputations,
+) {
+    fn assert<T: Send + Sync>(_: &T) {}
+    assert(inner);
+}
+
 impl<'l, 'a> LinearRecomputeDiceComputations<'l, 'a> {
     pub fn get(&self) -> DiceComputations<'l> {
         self.0.get()
@@ -527,8 +542,7 @@ impl<'l, 'a> LinearRecomputeDiceComputations<'l, 'a> {
 pub struct DiceComputationsData(pub(crate) ModernDiceComputationsData);
 
 impl DiceComputationsData {
-    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
-    /// time that Dice is initialized via the constructor.
+    /// Untracked data that is static for the lifetime of this branch tree.
     pub fn global_data(&self) -> &DiceData {
         self.0.global_data()
     }
@@ -576,7 +590,7 @@ fn _assert_dice_compute_future_sizes() {
         }
     }
 
-    mini_vec::size_assert::words_of_async_fn_future!(DiceComputations::compute::<K>, (_, _), 8);
+    mini_vec::size_assert::words_of_async_fn_future!(DiceComputations::compute::<K>, (_, _), 9);
 
     // The future of the canonical async closure mapper - the thing that is stored, unboxed, in the
     // join combinator's slot for each branch of a `compute_join_async`. This is mostly just here to
@@ -588,7 +602,7 @@ fn _assert_dice_compute_future_sizes() {
     mini_vec::size_assert::words_of_expr!(
         (async |ctx: &mut DiceComputations<'static>, k: &K| ctx.compute(k).await)
             .async_call_once((panic!(), panic!())),
-        11
+        12
     );
 
     mini_vec::size_assert::words_of_async_fn_future!(
@@ -609,6 +623,6 @@ fn _assert_dice_compute_future_sizes() {
             async |ctx| ctx.compute(&K(0)).await,
             async |ctx| ctx.compute(&K(1)).await
         ),
-        24
+        26
     );
 }

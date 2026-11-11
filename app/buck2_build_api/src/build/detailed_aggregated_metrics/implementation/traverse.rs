@@ -16,6 +16,7 @@ use buck2_artifact::artifact::artifact_type::OutputArtifact;
 use buck2_core::deferred::key::DeferredHolderKey;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_error::BuckErrorOptionContext;
+use buck2_hash::BuckMutSet;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use dupe::Dupe;
 use starlark::values::OwnedFrozen;
@@ -27,6 +28,7 @@ use crate::deferred::calculation::ActionLookup;
 use crate::deferred::calculation::OwnedDeferredHolder;
 use crate::interpreter::rule_defs::artifact_tagging::ArtifactTag;
 use crate::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
+use crate::interpreter::rule_defs::cmd_args::InputProperties;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSet;
 
 #[derive(Clone, Dupe, Debug, Eq, PartialEq, Hash)]
@@ -152,7 +154,7 @@ impl<'a> Graph<'a> {
                         ResolvedTransitiveSetProjection {
                             projection: proj_node.projection,
                             tset: proj_node.tset.dupe().try_map(|v| {
-                                ValueTyped::new(v.children[idx])
+                                ValueTyped::new(v.children.read()?[idx])
                                     .internal_error("tset children should be tsets")
                             })?,
                         },
@@ -160,7 +162,12 @@ impl<'a> Graph<'a> {
                 }
                 struct Visitor<'a, 'b, F: FnMut(Key)>(F, &'a Graph<'b>, buck2_error::Result<()>);
                 impl<'v, F: FnMut(Key)> CommandLineArtifactVisitor<'v> for Visitor<'_, '_, F> {
-                    fn visit_input(&mut self, input: ArtifactGroup, _tags: Vec<&ArtifactTag>) {
+                    fn visit_input(
+                        &mut self,
+                        input: ArtifactGroup,
+                        _props: InputProperties,
+                        _tags: Vec<&ArtifactTag>,
+                    ) {
                         if self.2.is_err() {
                             return;
                         }
@@ -215,9 +222,17 @@ impl<'a> Graph<'a> {
             state.enqueue(root);
         }
 
+        // Several keys can resolve to one action: each output of a dynamic_output is
+        // its own key bound to the action that produces it.
+        let mut visited_actions = BuckMutSet::default();
         while let Some(item) = state.pop() {
             let node = self.lookup_node(item)?;
             complete = complete && !node.is_missing();
+            if let Node::Action(action) = &node
+                && !visited_actions.insert(action.key().dupe())
+            {
+                continue;
+            }
             visit(self, &node, &mut state)?;
         }
 
@@ -236,14 +251,14 @@ impl<'a> Graph<'a> {
 }
 
 struct TraversalState {
-    visited: buck2_hash::BuckMutSet<Key>,
+    visited: BuckMutSet<Key>,
     queue: Vec<Key>,
 }
 
 impl TraversalState {
     fn new() -> Self {
         Self {
-            visited: buck2_hash::BuckMutSet::default(),
+            visited: BuckMutSet::default(),
             queue: Vec::new(),
         }
     }
@@ -263,8 +278,8 @@ impl TraversalState {
 pub fn traverse_partial_action_graph<'a>(
     root_artifacts: impl IntoIterator<Item = &'a ArtifactGroup>,
     state: &buck2_hash::BuckMutMap<DeferredHolderKey, OwnedDeferredHolder>,
-) -> buck2_error::Result<(bool, buck2_hash::BuckMutSet<ActionKey>)> {
-    let mut actions = buck2_hash::BuckMutSet::default();
+) -> buck2_error::Result<(bool, BuckMutSet<ActionKey>)> {
+    let mut actions = BuckMutSet::default();
 
     let graph = Graph(state);
     let roots = graph.root_keys(root_artifacts)?;
@@ -286,7 +301,7 @@ pub fn traverse_target_graph(
     root: &ConfiguredTargetNode,
     mut visitor: impl FnMut(&ConfiguredTargetLabel),
 ) {
-    let mut visited = buck2_hash::BuckMutSet::default();
+    let mut visited = BuckMutSet::default();
     let mut queue = Vec::new();
     visited.insert(root.label());
     queue.push(root);

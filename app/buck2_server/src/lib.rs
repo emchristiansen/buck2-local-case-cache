@@ -9,9 +9,9 @@
  */
 
 #![feature(try_blocks)]
-#![feature(used_with_arg)]
 
 pub mod active_commands;
+mod agent_config_guard;
 mod agent_context_validation;
 mod agent_host_guard;
 mod clean_stale;
@@ -24,8 +24,6 @@ mod heartbeat_guard;
 mod host_info;
 mod hydration;
 mod jemalloc_stats;
-pub mod lsp;
-mod materialize;
 mod net_io;
 pub(crate) mod new_generic;
 mod paging;

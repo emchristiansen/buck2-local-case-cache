@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
@@ -28,6 +29,7 @@ use buck2_build_api::build::TestArtifacts;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::maybe_stream_build_reports;
+use buck2_build_api::build::build_report::streaming_build_result_channel;
 use buck2_build_api::build::build_report::write_build_report;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
@@ -61,6 +63,7 @@ use buck2_core::pattern::pattern::Modifiers;
 use buck2_core::pattern::pattern::ModifiersError;
 use buck2_core::pattern::pattern::PackageSpec;
 use buck2_core::pattern::pattern::ProvidersLabelWithModifiers;
+use buck2_core::pattern::pattern::TargetLabelWithModifiers;
 use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::ProvidersPatternExtra;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
@@ -77,7 +80,7 @@ use buck2_events::dispatch::with_dispatcher_async;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
-use buck2_hash::BuckIndexSet;
+use buck2_hash::BuckMutInsertionSet;
 use buck2_hash::BuckMutSet;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter_for_build::interpreter::context::HasInterpreterContext;
@@ -85,6 +88,7 @@ use buck2_node::load_patterns::MissingTargetBehavior;
 use buck2_node::nodes::configured_frontend::ConfiguredTargetNodeCalculation;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use buck2_node::target_calculation::ConfiguredTargetCalculation;
+use buck2_server_ctx::commands::send_build_phase_end;
 use buck2_server_ctx::commands::send_target_cfg_event;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::global_cfg_options::global_cfg_options_from_client_context;
@@ -116,6 +120,7 @@ use crate::internal_runner::InternalTestOrchestrator;
 use crate::downward_api::BuckTestDownwardApi;
 use crate::executor_launcher::ExecutorLaunch;
 use crate::executor_launcher::ExecutorLauncher;
+use crate::executor_launcher::ExecutorOutput;
 use crate::executor_launcher::OutOfProcessTestExecutor;
 use crate::executor_launcher::TestExecutorClientWrapper;
 use crate::local_resource_registry::HasLocalResourceRegistry;
@@ -509,16 +514,7 @@ async fn test(
     test_executor_args.extend(extra_tpx_args);
 
     let (streaming_build_result_tx, streaming_build_result_rx) =
-        tokio::sync::mpsc::unbounded_channel();
-    // Avoid streaming intermediary build results unless a streaming build report was requested.
-    let streaming_build_result_tx = if !build_opts
-        .unstable_streaming_build_report_filename
-        .is_empty()
-    {
-        Some(streaming_build_result_tx)
-    } else {
-        None
-    };
+        streaming_build_result_channel(build_opts);
 
     let test_future = test_targets(
         ctx.dupe(),
@@ -735,7 +731,6 @@ async fn test_targets(
     let res = tag_result!(
         "executor_launch_failed",
         res,
-        quiet: true,
         daemon_in_memory_state_is_corrupted: true,
         task: false
     )?;
@@ -845,17 +840,25 @@ async fn test_targets(
                     futures::pin_mut!(alive);
                     match futures::future::select(drive, alive).await {
                         futures::future::Either::Left(..) => {}
-                        futures::future::Either::Right(..) => {
-                            tracing::warn!("Test run was cancelled");
-                        }
+                        futures::future::Either::Right(..) => {}
                     }
                 }
 
                 // Extract data from driver before dropping it so we can
                 // release the internal runner's sender clones.
-                let error_events = std::mem::take(&mut driver.error_events);
+                let error_target_result = driver.errors.build();
+                let first_internal_error = driver.first_internal_error.take();
                 let mut build_target_result =
                     std::mem::replace(&mut driver.build_target_result, BuildTargetResult::new());
+                // A run cancelled while targets were still being built has no build outcome.
+                if driver.pending_build_work == 0 {
+                    send_build_phase_end(
+                        ctx.per_transaction_data().get_dispatcher(),
+                        driver.build_phase_end,
+                        convert_error(&build_target_result).is_empty()
+                            && convert_error(&error_target_result).is_empty(),
+                    );
+                }
                 drop(driver);
 
                 // Drop the internal runner's sender clone so it doesn't keep
@@ -900,13 +903,9 @@ async fn test_targets(
                     .await
                     .buck_error_context("Failed to release local resources")?;
 
-                // Process the build errors we've collected.
-                let mut builder = BuildTargetResultBuilder::new(None, std::time::Instant::now());
-                for event in error_events {
-                    builder.event(event)?;
+                if let Some(e) = first_internal_error {
+                    return Err(e);
                 }
-                let error_target_result = builder.build();
-
                 build_target_result.extend(error_target_result);
 
                 // And finally return our results;
@@ -919,22 +918,8 @@ async fn test_targets(
         .await
         .buck_error_context("Failed to retrieve executor exit code")?;
 
-    if executor_output.signal.is_some() {
-        // The executor was killed by a signal: a crash (e.g. SIGSEGV) or an OOM kill,
-        // as opposed to an orderly non-zero exit.
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::TestExecutorSignaled,
-            "{}",
-            executor_output.termination_message()
-        ));
-    }
-
-    if executor_output.exit_code != Some(0) {
-        return Err(buck2_error::buck2_error!(
-            ErrorTag::TestExecutorNonZeroExit,
-            "{}",
-            executor_output.termination_message()
-        ));
+    if let Some(error) = executor_termination_error(&executor_output) {
+        return Err(error);
     }
 
     // Now that the executor has exited, we notify our results channel. Two things can happen:
@@ -1027,13 +1012,28 @@ struct TestDriverState<'a, 'e> {
     build_run_info: bool,
 }
 
+type DriverWorkResult = ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>;
+
+#[derive(Clone, Copy, Dupe, PartialEq, Eq)]
+enum DriverWorkKind {
+    Build,
+    Test,
+}
+
 /// Maintains the state of an ongoing test execution.
 struct TestDriver<'a, 'e> {
     state: TestDriverState<'a, 'e>,
-    work: FuturesUnordered<BoxFuture<'a, ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>>>,
+    work: FuturesUnordered<BoxFuture<'a, (DriverWorkKind, DriverWorkResult)>>,
+    /// When the last build work item (interpreting, configuring or building a target)
+    /// finished. Test work items don't move it.
+    build_phase_end: SystemTime,
+    pending_build_work: usize,
     labels_configured: BuckMutSet<(ProvidersLabelWithModifiers, bool)>,
     labels_tested: BuckMutSet<ConfiguredProvidersLabel>,
-    error_events: Vec<BuildEvent>,
+    /// Fed the events of every `ControlFlow::Break`.
+    errors: BuildTargetResultBuilder,
+    /// The first error `errors` returned, which fails the run once it has been cleaned up.
+    first_internal_error: Option<buck2_error::Error>,
     build_target_result: BuildTargetResult,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
 }
@@ -1046,12 +1046,25 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         Self {
             state,
             work: FuturesUnordered::new(),
+            build_phase_end: SystemTime::now(),
+            pending_build_work: 0,
             labels_configured: BuckMutSet::default(),
             labels_tested: BuckMutSet::default(),
-            error_events: Vec::new(),
+            errors: BuildTargetResultBuilder::new(
+                streaming_build_result_tx.clone(),
+                std::time::Instant::now(),
+            ),
+            first_internal_error: None,
             build_target_result: BuildTargetResult::new(),
             streaming_build_result_tx,
         }
+    }
+
+    fn push_work(&mut self, kind: DriverWorkKind, fut: BoxFuture<'a, DriverWorkResult>) {
+        if kind == DriverWorkKind::Build {
+            self.pending_build_work += 1;
+        }
+        self.work.push(fut.map(move |res| (kind, res)).boxed());
     }
 
     /// Add new patterns for the test driver to process.
@@ -1070,13 +1083,17 @@ impl<'a, 'e> TestDriver<'a, 'e> {
             ]))
             .boxed();
 
-            self.work.push(fut);
+            self.push_work(DriverWorkKind::Build, fut);
         }
     }
 
     /// Drive the test loop until all work is complete.
     async fn drive_to_completion(&mut self) {
-        while let Some(tasks) = self.work.next().await {
+        while let Some((kind, tasks)) = self.work.next().await {
+            if kind == DriverWorkKind::Build {
+                self.pending_build_work -= 1;
+                self.build_phase_end = SystemTime::now();
+            }
             match tasks {
                 ControlFlow::Continue(tasks) => {
                     for task in tasks {
@@ -1142,7 +1159,13 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                         }
                     }
                 }
-                ControlFlow::Break(events) => self.error_events.extend(events),
+                ControlFlow::Break(events) => {
+                    for event in events {
+                        if let Err(e) = self.errors.event(event) {
+                            self.first_internal_error.get_or_insert(e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1157,7 +1180,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
 
         let PackageLabelWithModifiers { package, modifiers } = package_with_modifiers;
 
-        self.work.push(
+        self.push_work(
+            DriverWorkKind::Build,
             async move {
                 let res = match state
                     .ctx
@@ -1190,7 +1214,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                             }),
                         };
 
-                        return ControlFlow::Break(events);
+                        return ControlFlow::Break(finish_error_only_targets(events));
                     }
                 };
 
@@ -1214,7 +1238,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                                 err: err.into(),
                             }];
 
-                            return ControlFlow::Break(events);
+                            return ControlFlow::Break(finish_error_only_targets(events));
                         }
                         MissingTargetBehavior::Warn => {
                             console_message(missing.missing_targets_warning());
@@ -1319,10 +1343,12 @@ impl<'a, 'e> TestDriver<'a, 'e> {
             {
                 Ok(label) => label,
                 Err(e) => {
-                    return ControlFlow::Break(vec![BuildEvent::OtherError {
-                        label: Some(providers_label),
-                        err: e,
-                    }]);
+                    return ControlFlow::Break(finish_error_only_targets(vec![
+                        BuildEvent::OtherError {
+                            label: Some(providers_label),
+                            err: e,
+                        },
+                    ]));
                 }
             };
 
@@ -1393,7 +1419,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         }
         .boxed();
 
-        self.work.push(fut);
+        self.push_work(DriverWorkKind::Build, fut);
     }
 
     fn build_target(
@@ -1405,7 +1431,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         tenting_acl_names: TentingStatus,
     ) {
         if !self.labels_tested.insert(label.dupe()) {
-            self.work.push(
+            self.push_work(
+                DriverWorkKind::Build,
                 async move {
                     ControlFlow::Break(vec![BuildEvent::new_configured(
                         label,
@@ -1466,7 +1493,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         }
         .boxed();
 
-        self.work.push(fut);
+        self.push_work(DriverWorkKind::Build, fut);
     }
 
     fn test_target(
@@ -1513,7 +1540,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         }
         .boxed();
 
-        self.work.push(fut);
+        self.push_work(DriverWorkKind::Test, fut);
     }
 }
 
@@ -1557,7 +1584,7 @@ async fn build_target_result(
         || build_run_info
             && providers
                 .provider_collection()
-                .builtin_provider::<RunInfo>()
+                .builtin_provider::<RunInfo>()?
                 .is_some())
     {
         return Ok((BuildTargetResult::new(), providers));
@@ -1566,13 +1593,17 @@ async fn build_target_result(
     let materialization_and_upload = MaterializationAndUploadContext::skip();
     let (result_builder, consumer) =
         AsyncBuildTargetResultBuilder::new(streaming_build_result_tx, std::time::Instant::now());
+    let configured_target = label.target().dupe();
+    let target = TargetLabelWithModifiers {
+        target_label: configured_target.unconfigured().dupe(),
+        modifiers: modifiers.dupe(),
+    };
     consumer.consume(BuildEvent::new_configured(
         label.dupe(),
         ConfiguredBuildEventVariant::MapModifiers { modifiers },
     ));
     let build_target_result = result_builder
-        .wait_for(
-            false,
+        .wait_for(false, async {
             build_configured_label(
                 &consumer,
                 ctx,
@@ -1590,8 +1621,16 @@ async fn build_target_result(
                     return_run_args: false,
                 },
                 None, // TODO: is this right?
-            ),
-        )
+            )
+            .await;
+            // Each builder holds one provider label, so a target tested under several provider
+            // labels is reported finished once per label.
+            consumer.consume(BuildEvent::ConfiguredTargetBuildFinished {
+                target: configured_target,
+                modifiers: target.modifiers.dupe(),
+            });
+            consumer.consume(BuildEvent::TargetBuildFinished { target });
+        })
         .await?;
 
     Ok((build_target_result, providers))
@@ -1767,18 +1806,47 @@ fn run_tests<'a, 'b>(
 // TODO(azhang2542): Ideally we would only have to map the `Modifier`` to a `ConfiguredProvidersLabel`
 // just once when we first get the `ConfiguredProvidersLabel`. Refactor the code so that we have to do
 // a call to mapping minimally, potentially by adding the mappings to the `TestDriverState`.
+/// Also finishes the entry that `err` is filed under, since nothing more is built for the label.
 fn create_and_map_configured_build_error(
     label: ConfiguredProvidersLabel,
     err: buck2_error::Error,
     modifiers: Modifiers,
 ) -> Vec<BuildEvent> {
+    let target = TargetLabelWithModifiers {
+        target_label: label.target().unconfigured().dupe(),
+        modifiers: modifiers.dupe(),
+    };
     vec![
         BuildEvent::new_configured(label.dupe(), ConfiguredBuildEventVariant::Error { err }),
         BuildEvent::new_configured(
             label,
             ConfiguredBuildEventVariant::MapModifiers { modifiers },
         ),
+        BuildEvent::TargetBuildFinished { target },
     ]
+}
+
+/// Appends `TargetBuildFinished` for the targets of the `OtherError`s in `events`. These targets
+/// failed before configuring, and the report files their errors under no modifiers.
+fn finish_error_only_targets(mut events: Vec<BuildEvent>) -> Vec<BuildEvent> {
+    let finished: Vec<BuildEvent> = events
+        .iter()
+        .filter_map(|event| match event {
+            BuildEvent::OtherError {
+                label: Some(label), ..
+            } => Some(label.target().dupe()),
+            _ => None,
+        })
+        .unique()
+        .map(|target_label| BuildEvent::TargetBuildFinished {
+            target: TargetLabelWithModifiers {
+                target_label,
+                modifiers: Modifiers::new(None),
+            },
+        })
+        .collect();
+    events.extend(finished);
+    events
 }
 
 struct TestLabelFiltering {
@@ -1789,9 +1857,9 @@ struct TestLabelFiltering {
     /// If positive include label filters are present, then this filter will ONLY match sets of
     /// labels that contains the label filter. Otherwise, if only exclusion filters are present, or
     /// no label filters are present, this will match any set of labels as long as its not excluded.
-    included_labels: BuckIndexSet<String>,
+    included_labels: BuckMutInsertionSet<String>,
     /// Additional excluded labels. These have order of precedence after `included_labels`.
-    excluded_labels: BuckIndexSet<String>,
+    excluded_labels: BuckMutInsertionSet<String>,
     /// If true, ignores order of precedence such that as long as an exclusion filter matches, we
     /// don't match the set of labels.
     always_exclude: bool,
@@ -1801,7 +1869,10 @@ struct TestLabelFiltering {
 
 impl TestLabelFiltering {
     fn is_excluded(&self, labels: Vec<&str>) -> bool {
-        let mut matched = self.included_labels.is_empty();
+        let mut matched = !self
+            .included_labels
+            .iter()
+            .any(|label| !label.starts_with('!'));
         for include_label in &self.included_labels {
             if let Some(include) = include_label.strip_prefix('!') {
                 // exclusion filters
@@ -1998,6 +2069,38 @@ fn ai_agent_tpx_args(agent_context: &[buck2_data::AgentContextEntry]) -> Vec<Str
     args
 }
 
+/// The error for a test executor that did not exit cleanly, or `None` if it did.
+///
+/// The string tags become part of the error's category key, which is the identity
+/// of the Logview MIDs tracking executor deaths: signal deaths are split by signal
+/// and core-dumped bit on purpose; non-zero exits are not split by status, since
+/// nearly all of them are status 1 and the status is already in the message.
+fn executor_termination_error(output: &ExecutorOutput) -> Option<buck2_error::Error> {
+    if let Some(signal) = output.signal {
+        // A crash (e.g. SIGSEGV) or an OOM kill, as opposed to an orderly non-zero exit.
+        let mut error = buck2_error::buck2_error!(
+            ErrorTag::TestExecutorSignaled,
+            "{}",
+            output.termination_message()
+        );
+        error = error.string_tag(&format!("signal({signal})"));
+        if output.core_dumped {
+            error = error.string_tag("core_dumped");
+        }
+        return Some(error);
+    }
+
+    if output.exit_code != Some(0) {
+        return Some(buck2_error::buck2_error!(
+            ErrorTag::TestExecutorNonZeroExit,
+            "{}",
+            output.termination_message()
+        ));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use buck2_cli_proto::RepresentativeConfigFlag;
@@ -2007,7 +2110,57 @@ mod tests {
     use crate::command::InternalRunnerConfig;
     use crate::command::TestLabelFiltering;
     use crate::command::ai_agent_tpx_args;
+    use crate::command::executor_termination_error;
     use crate::command::generate_config_entry_args;
+    use crate::executor_launcher::ExecutorOutput;
+
+    fn executor_output(
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        core_dumped: bool,
+    ) -> ExecutorOutput {
+        ExecutorOutput {
+            exit_code,
+            signal,
+            core_dumped,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    // These category keys identify the Logview MIDs that track executor deaths;
+    // a changed key opens a new regression task.
+    #[test]
+    fn non_zero_exit_category_key_is_not_split_by_status() {
+        let error = executor_termination_error(&executor_output(Some(1), None, false)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_NON_ZERO_EXIT"
+        );
+    }
+
+    #[test]
+    fn signal_death_category_key_includes_signal_and_core_dump() {
+        let error = executor_termination_error(&executor_output(None, Some(11), true)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_SIGNALED:core_dumped:signal(11)"
+        );
+    }
+
+    #[test]
+    fn signal_death_without_core_dump_omits_core_tag() {
+        let error = executor_termination_error(&executor_output(None, Some(9), false)).unwrap();
+        assert_eq!(
+            error.category_key(),
+            "buck2_test/src/command.rs:TEST_EXECUTOR_SIGNALED:signal(9)"
+        );
+    }
+
+    #[test]
+    fn clean_exit_is_not_an_error() {
+        assert!(executor_termination_error(&executor_output(Some(0), None, false)).is_none());
+    }
 
     #[test]
     fn only_include_labels_in_includes() {
@@ -2021,6 +2174,26 @@ mod tests {
         assert!(!filter.is_excluded(vec!["include_me"]));
         assert!(filter.is_excluded(vec!["not_me"]));
         assert!(filter.is_excluded(vec!["blah"]));
+    }
+
+    /// An include list made only of `!` exclusions (`--include '!slow'`) keeps every target that
+    /// is not excluded: without a positive entry there is no allow list.
+    #[test]
+    fn only_negative_includes_keep_unexcluded_targets() {
+        let filter = TestLabelFiltering::new(vec!["!slow".to_owned()], vec![], false, false);
+        assert!(filter.is_excluded(vec!["slow"]));
+        assert!(!filter.is_excluded(vec!["fast"]));
+        assert!(!filter.is_excluded(vec![]));
+
+        let filter = TestLabelFiltering::new(
+            vec!["!slow".to_owned(), "!flaky".to_owned()],
+            vec!["broken".to_owned()],
+            true,
+            false,
+        );
+        assert!(!filter.is_excluded(vec!["fast"]));
+        assert!(filter.is_excluded(vec!["flaky"]));
+        assert!(filter.is_excluded(vec!["broken"]));
     }
 
     #[test]

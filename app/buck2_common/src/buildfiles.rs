@@ -20,8 +20,6 @@ use dice::Key;
 use dice::OkPagableValueSerialize;
 use dice::ValueSerialize;
 use dupe::ResultDupedErrExt;
-use gazebo::prelude::SliceExt as _;
-use gazebo::prelude::VecExt as _;
 use pagable::Pagable;
 use pagable::pagable_typetag;
 
@@ -48,7 +46,10 @@ pub fn parse_buildfile_name(
             section: "buildfile",
             property: "name_v2",
         })? {
-        buildfiles_value.into_try_map(FileNameBuf::try_from)?
+        buildfiles_value
+            .into_iter()
+            .map(FileNameBuf::try_from)
+            .collect::<Result<Vec<_>, _>>()?
     } else if let Some(buildfiles_value) = config.parse_list::<String>(BuckconfigKeyRef {
         section: "buildfile",
         property: "name",
@@ -60,7 +61,10 @@ pub fn parse_buildfile_name(
         }
         buildfiles
     } else {
-        DEFAULT_BUILDFILES.map(|&n| FileNameBuf::try_from(n.to_owned()).unwrap())
+        DEFAULT_BUILDFILES
+            .iter()
+            .map(|&n| FileNameBuf::try_from(n.to_owned()).unwrap())
+            .collect::<Vec<_>>()
     };
 
     if let Some(buildfile) = config.parse::<String>(BuckconfigKeyRef {
@@ -134,7 +138,6 @@ impl<'d> HasBuildfiles<'d> for DiceComputations<'d> {
 #[cfg(test)]
 mod tests {
     use buck2_core::cells::name::CellName;
-    use gazebo::prelude::SliceExt;
     use indoc::indoc;
 
     use crate::buildfiles::parse_buildfile_name;
@@ -188,7 +191,10 @@ mod tests {
             .await?;
         assert_eq!(
             vec!["BUCK.v2", "BUCK"],
-            parse_buildfile_name(&config)?.map(|f| f.as_str()),
+            parse_buildfile_name(&config)?
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>(),
         );
 
         let config = cells
@@ -196,7 +202,10 @@ mod tests {
             .await?;
         assert_eq!(
             vec!["TARGETS.v2", "TARGETS", "TARGETS.test"],
-            parse_buildfile_name(&config)?.map(|f| f.as_str()),
+            parse_buildfile_name(&config)?
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>(),
         );
 
         let config = cells
@@ -204,7 +213,10 @@ mod tests {
             .await?;
         assert_eq!(
             vec!["OKAY"],
-            parse_buildfile_name(&config)?.map(|f| f.as_str()),
+            parse_buildfile_name(&config)?
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>(),
         );
 
         Ok(())

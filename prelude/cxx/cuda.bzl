@@ -532,18 +532,10 @@ def _nvcc_dynamic_compile(
                     bindable = artifact.as_output() if isinstance(artifact, Artifact) else artifact
                     subcmd.add(cmd_args([value[0], bindable, value[1]], delimiter = ""))
                 elif kind == "source_path":
-                    # The contents of the `source_path` files are not actually
-                    # used as inputs to the sub-action, they are used primarily
-                    # to name the actual source path for inclusion in things like
-                    # DWARF information. However, artifacts with content-based-paths
-                    # can't know their paths until their content is known, so they
-                    # cannot be included as ignore_artifacts=True
-                    # TODO(jtbraun): when has_content_based_path is available,
-                    # use that as the condition here
-                    if src.is_source:
-                        subcmd.add(cmd_args([value[0], src, value[1]], delimiter = "", ignore_artifacts = True))
-                    else:
-                        subcmd.add(cmd_args([value[0], src, value[1]], delimiter = ""))
+                    # The source path is a diagnostic stamp (fatbinary --ident,
+                    # DWARF attribution): the sub-action records the path but
+                    # never reads the file.
+                    subcmd.add(cmd_args([value[0], src, value[1]], delimiter = "", ignore_artifacts = True))
                 else:
                     fail("unhandled placeholder kind: {}".format(kind))
 
@@ -577,7 +569,7 @@ def _nvcc_dynamic_compile(
                 identifier = cuda_compile_info.identifier,
                 dep_files = action_dep_files,
                 allow_cache_upload = allow_cache_upload,
-                allow_dep_file_cache_upload = False,
+                allow_dep_file_cache_upload = toolchain.allow_dep_file_cache_upload and bool(action_dep_files),
                 prefer_remote = True if "preproc" in cmd_node["category"] else False,
             )
 

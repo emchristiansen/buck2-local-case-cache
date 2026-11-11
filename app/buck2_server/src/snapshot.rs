@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use buck2_build_api::actions::impls::write_action_cache_stats::WRITE_ACTION_CACHE_STATS;
 use buck2_core::io_counters::IoCounterKey;
 use buck2_error::BuckErrorContext;
 use buck2_events::EventSinkStats;
@@ -209,10 +210,12 @@ impl SnapshotCollector {
         self.add_system_metrics(&mut snapshot);
         self.add_daemon_metrics(&mut snapshot);
         self.add_re_metrics(&mut snapshot);
+        self.add_write_action_cache_metrics(&mut snapshot);
         self.add_http_metrics(&mut snapshot);
         self.add_io_metrics(&mut snapshot);
         self.add_dice_metrics(&mut snapshot);
         self.add_digest_interner_metrics(&mut snapshot);
+        self.add_standalone_ttl_refresh_metrics(&mut snapshot);
         self.add_materializer_metrics(&mut snapshot);
         self.add_sink_metrics(&mut snapshot);
         self.add_net_io_metrics(&mut snapshot);
@@ -242,6 +245,9 @@ impl SnapshotCollector {
     fn add_daemon_metrics(&self, snapshot: &mut buck2_data::Snapshot) {
         snapshot.blocking_executor_io_queue_size =
             self.daemon.blocking_executor_factory.queue_size() as u64;
+        let inline_io = self.daemon.blocking_executor_factory.inline_io_stats();
+        snapshot.blocking_executor_io_inline_in_flight = inline_io.in_flight;
+        snapshot.blocking_executor_io_inline_waiting = inline_io.waiting;
         if let Some(store) = self
             .tenant
             .repo
@@ -330,6 +336,19 @@ impl SnapshotCollector {
         }
     }
 
+    fn add_write_action_cache_metrics(&self, snapshot: &mut buck2_data::Snapshot) {
+        let counts = WRITE_ACTION_CACHE_STATS.counts();
+        snapshot.write_action_cache_hits = counts.hits;
+        snapshot.write_action_cache_misses = counts.misses;
+        snapshot.write_action_cache_lookup_failures = counts.lookup_failures;
+        snapshot.write_action_cache_populated = counts.populated;
+        snapshot.write_action_cache_populate_failures = counts.populate_failures;
+        snapshot.write_action_cache_uploaded = counts.uploaded;
+        snapshot.write_action_cache_written = counts.written;
+        snapshot.write_action_cache_verified = counts.verified;
+        snapshot.write_action_cache_mismatches = counts.mismatches;
+    }
+
     fn add_re_metrics(&self, snapshot: &mut buck2_data::Snapshot) {
         fn inner(
             snapshot: &mut buck2_data::Snapshot,
@@ -368,6 +387,10 @@ impl SnapshotCollector {
                 stats.get_digest_expirations.finished_successfully;
             snapshot.re_get_digest_expirations_finished_with_error =
                 stats.get_digest_expirations.finished_with_error;
+            snapshot.re_presence_check_rpcs = stats.presence.rpcs;
+            snapshot.re_presence_check_digests_queried = stats.presence.digests_queried;
+            snapshot.re_presence_check_digest_answers = stats.presence.digest_answers;
+            snapshot.re_presence_check_largest_batch = stats.presence.largest_batch;
 
             snapshot.zdb_download_queries = stats.download_stats.zdb.queries;
             snapshot.zdb_download_bytes = stats.download_stats.zdb.bytes;
@@ -427,6 +450,20 @@ impl SnapshotCollector {
         snapshot.file_digest_interner_paged_entries = stats.paged;
         snapshot.file_digest_interner_hits = stats.hits;
         snapshot.file_digest_interner_misses = stats.misses;
+    }
+
+    fn add_standalone_ttl_refresh_metrics(&self, snapshot: &mut buck2_data::Snapshot) {
+        let stats = self.daemon.standalone_ttl_refresh.stats();
+        snapshot.standalone_ttl_refresh = Some(buck2_data::StandaloneTtlRefreshStats {
+            passes: stats.passes,
+            errors: stats.errors,
+            last_pass_visited: stats.last_pass_visited,
+            last_pass_swept: stats.last_pass_swept,
+            last_pass_candidates: stats.last_pass_candidates,
+            last_pass_refreshed: stats.last_pass_refreshed,
+            last_pass_gone: stats.last_pass_gone,
+            last_pass_duration_us: stats.last_pass_duration_us,
+        });
     }
 
     fn add_materializer_metrics(&self, snapshot: &mut buck2_data::Snapshot) {

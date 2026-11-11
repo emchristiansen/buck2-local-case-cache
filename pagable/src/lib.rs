@@ -26,6 +26,7 @@ pub use pagable_derive::Pagable;
 pub use pagable_derive::PagableDeserialize;
 pub use pagable_derive::PagablePanic;
 pub use pagable_derive::PagableSerialize;
+pub use pagable_derive::PagableUnsupported;
 pub use pagable_derive::pagable_tagged;
 pub use pagable_derive::pagable_typetag;
 pub use partial_pagable_arc::PartialPagableArc;
@@ -38,13 +39,16 @@ pub use typetag::PagableTypeTag;
 
 pub mod arc_erase;
 pub mod context;
+mod deferred_value;
 pub mod deser_recipe;
 pub mod flavors;
 mod hashers;
 mod impls;
 mod pagable_arc;
-mod page_in_scope;
 mod partial_pagable_arc;
+#[cfg(feature = "tokio")]
+pub mod prepare;
+mod read_failures;
 pub mod storage;
 #[cfg(test)]
 mod test;
@@ -53,15 +57,17 @@ pub mod traits;
 pub mod typetag;
 pub mod value_serialize;
 
+pub use deferred_value::DeferredValue;
 pub use deser_recipe::PagableDeserializerRecipe;
 pub use deser_recipe::PagableDeserializerRecipeImpl;
 pub use impls::StaticStr;
 pub use impls::static_value;
 pub use impls::static_value::StaticBytes;
 pub use impls::static_value::StaticValue;
-pub use page_in_scope::ArcKey;
-pub use page_in_scope::PageInScope;
-pub use page_in_scope::PageInState;
+pub use read_failures::DeferredReadFailures;
+pub use read_failures::ReadRefused;
+pub use read_failures::ReadTimedOut;
+pub use read_failures::is_transient_read_error;
 pub use storage::data::DataKey;
 pub use traits::Pagable;
 pub use traits::PagableBoxDeserialize;

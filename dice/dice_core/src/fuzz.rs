@@ -79,7 +79,8 @@ fn cases() -> u64 {
     std::env::var("DICE_CORE_FUZZ_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(40)
+        // Interpreted, a case takes tens of seconds.
+        .unwrap_or(if cfg!(miri) { 2 } else { 40 })
 }
 
 fn seed() -> u64 {
@@ -125,12 +126,15 @@ struct Run {
 }
 
 impl Run {
-    fn new() -> Self {
-        Run {
+    /// A run with one root.
+    fn new() -> (Self, BranchId) {
+        let mut run = Run {
             state: State::new(),
             model: Model::new(),
             eps_seen: HashMap::new(),
-        }
+        };
+        let root = run.new_root();
+        (run, root)
     }
 
     /// One of the tokens `key` has had, the initial one included.
@@ -182,24 +186,30 @@ impl Run {
         child
     }
 
+    fn new_root(&mut self) -> BranchId {
+        let root = self.state.new_root();
+        self.state.check_invariants();
+        self.model
+            .record_version(self.state.head(root), None, Vec::new());
+        root
+    }
+
+    /// Deletes one of the live branches, chosen by `index`, unless it is the last one. The oracle
+    /// keeps the deleted versions: the facts about them stay true, the surviving branches still
+    /// descend from them there, and they are just never asked about again.
+    fn delete(&mut self, index: usize) {
+        let live: Vec<BranchId> = self.state.branches().collect();
+        if live.len() < 2 {
+            return;
+        }
+        self.state.delete_branch(live[index % live.len()]);
+        self.state.check_invariants();
+    }
+
     fn write(&mut self, cert: &TestCert) {
         self.state.write(cert.clone(), ());
         self.state.check_invariants();
         self.model.record_write(cert);
-    }
-
-    fn take(&mut self) {
-        let heads: Vec<(BranchId, Version)> = self
-            .state
-            .branches()
-            .map(|b| (b, self.state.head(b)))
-            .collect();
-        self.state.take();
-        self.state.check_invariants();
-        for (b, old) in heads {
-            self.model
-                .record_version(self.state.head(b), Some(old), Vec::new());
-        }
     }
 
     /// Soundness of one lookup against the judgment.
@@ -266,7 +276,10 @@ enum Op {
         branch: usize,
         seq: usize,
     },
-    Take,
+    Delete {
+        branch: usize,
+    },
+    NewRoot,
 }
 
 fn gen_ops(rng: &mut Rng, count: usize) -> Vec<Op> {
@@ -289,10 +302,11 @@ fn gen_ops(rng: &mut Rng, count: usize) -> Vec<Op> {
                     })
                     .collect(),
             },
-            25..=31 => Op::Fork {
+            25..=30 => Op::Fork {
                 branch: rng.below(MAX_BRANCHES),
                 seq: rng.below(16),
             },
+            31 => Op::NewRoot,
             32..=71 => Op::Write {
                 key: rng.below(KEYS),
                 revision: 1 + rng.below(3) as u32,
@@ -301,18 +315,20 @@ fn gen_ops(rng: &mut Rng, count: usize) -> Vec<Op> {
                     .collect(),
                 epsilon: rng.below(4),
             },
-            72..=97 => Op::Lookup {
+            72..=95 => Op::Lookup {
                 key: rng.below(KEYS),
                 branch: rng.below(MAX_BRANCHES),
                 seq: rng.below(16),
             },
-            _ => Op::Take,
+            _ => Op::Delete {
+                branch: rng.below(MAX_BRANCHES),
+            },
         })
         .collect()
 }
 
 fn run_ops(_seed: u64, ops: &[Op]) {
-    let mut run = Run::new();
+    let (mut run, _) = Run::new();
     for (i, op) in ops.iter().enumerate() {
         match op {
             Op::Commit { branch, changes } => {
@@ -368,7 +384,12 @@ fn run_ops(_seed: u64, ops: &[Op]) {
                 let v = version_of(&run.state, *branch, *seq);
                 run.check_lookup(any_key(*key), v);
             }
-            Op::Take => run.take(),
+            Op::Delete { branch } => run.delete(*branch),
+            Op::NewRoot => {
+                if run.state.branches().count() < MAX_BRANCHES {
+                    run.new_root();
+                }
+            }
         }
         if i % 8 == 7 {
             run.check_everything();
@@ -401,7 +422,10 @@ enum HonestOp {
         branch: usize,
         seq: usize,
     },
-    Take,
+    Delete {
+        branch: usize,
+    },
+    NewRoot,
 }
 
 fn gen_honest_ops(rng: &mut Rng, count: usize) -> Vec<HonestOp> {
@@ -425,16 +449,19 @@ fn gen_honest_ops(rng: &mut Rng, count: usize) -> Vec<HonestOp> {
                     })
                     .collect(),
             },
-            30..=37 => HonestOp::Fork {
+            30..=36 => HonestOp::Fork {
                 branch: rng.below(MAX_BRANCHES),
                 seq: rng.below(16),
             },
-            38..=97 => HonestOp::Query {
+            37 => HonestOp::NewRoot,
+            38..=95 => HonestOp::Query {
                 key: rng.below(KEYS),
                 branch: rng.below(MAX_BRANCHES),
                 seq: rng.below(16),
             },
-            _ => HonestOp::Take,
+            _ => HonestOp::Delete {
+                branch: rng.below(MAX_BRANCHES),
+            },
         })
         .collect()
 }
@@ -464,26 +491,35 @@ impl Honest {
             key_deps.sort();
             key_deps.dedup();
         }
+        let (run, root) = Run::new();
         let mut honest = Honest {
-            run: Run::new(),
+            run,
             deps,
             next_revision: HashMap::new(),
             revisions: HashMap::new(),
             values: HashMap::new(),
             content: HashMap::new(),
         };
-        // Every injected key is asserted at the root's first commit, so that no lookup ever
-        // asks for a value before there is one.
+        honest.seed(root);
+        honest
+    }
+
+    /// Asserts every injected key at a root's first commit, so that no lookup ever asks for a
+    /// value before there is one.
+    fn seed(&mut self, root: BranchId) {
         let changes = (0..INJECTED)
             .map(|i| Change::Assert {
                 key: injected(i),
-                revision: honest.intern(injected(i), 1),
+                revision: self.intern(injected(i), 1),
                 data: (),
             })
             .collect();
-        let root = honest.run.state.root();
-        honest.run.commit(root, changes);
-        honest
+        self.run.commit(root, changes);
+    }
+
+    /// Whether `v` is the initial version of a root, where no injected key has a value yet.
+    fn is_bare(&self, v: Version) -> bool {
+        self.run.state.parent(v.branch()).is_none() && v.seq() == Seq::FIRST
     }
 
     fn intern(&mut self, key: Key, value: u64) -> Revision {
@@ -680,19 +716,25 @@ fn run_honest_ops(seed: u64, ops: &[HonestOp]) {
             HonestOp::Fork { branch, seq } => {
                 if honest.run.state.branches().count() < MAX_BRANCHES {
                     let from = version_of(&honest.run.state, *branch, *seq);
-                    // The root's initial version has no injected values; never fork it.
-                    if from != Version::FIRST {
+                    // A root's initial version has no injected values; never fork it.
+                    if !honest.is_bare(from) {
                         honest.run.fork(from);
                     }
                 }
             }
             HonestOp::Query { key, branch, seq } => {
                 let v = version_of(&honest.run.state, *branch, *seq);
-                if v != Version::FIRST {
+                if !honest.is_bare(v) {
                     honest.ensure(any_key(*key), v);
                 }
             }
-            HonestOp::Take => honest.run.take(),
+            HonestOp::Delete { branch } => honest.run.delete(*branch),
+            HonestOp::NewRoot => {
+                if honest.run.state.branches().count() < MAX_BRANCHES {
+                    let root = honest.run.new_root();
+                    honest.seed(root);
+                }
+            }
         }
         if i % 8 == 7 {
             honest.run.check_everything();
