@@ -1,0 +1,48 @@
+# The explicit workstation NativeLink mode. It is selected only by passing this file,
+# `buck2 --config-file mode/nativelink.buckconfig ...`, never by autoload: without it the tree builds
+# with the bundled prelude and the shim's system toolchains, the upstream-compatible default.
+#
+# This mode builds and tests the engine remote-only on the workstation's NativeLink service:
+# - the prelude is Muninn's patched prelude, reached through the in-project link
+#   .buck2/prelude-source, whose Rust, http_archive and git_fetch rules implement the NativeLink
+#   worker contract (Nix manifest as hidden input, copied inputs, --closed-nix-env, pinned archive
+#   shell, fetch runtime);
+# - the toolchains are shim/nix/BUCK's exact Nix store tools, each with the closure manifest
+#   shim/nix/nix-manifest.json as a hidden input;
+# - actions run on shim//platforms:remote_linux with {OSFamily: Linux, cpu_count: 2};
+# - the remote execution client names the workstation's NativeLink endpoint.
+# shim/nix/BUCK and shims.bzl refuse to evaluate in this mode if any of these is not in effect.
+# The workstation route launches only through mode/nativelink_preflight.py, which refuses an omitted or
+# partial mode, and an unaccepted prelude, manifest, engine or launcher, before anything starts.
+[cells]
+prelude = .buck2/prelude-source
+# The engine's own prelude source stays a cell of its own, outside the root cell's packages, as it
+# is by default; nothing in this mode refers to it.
+engine_prelude_source = prelude
+
+[cell_aliases]
+toolchains = nix_toolchains
+
+[shim]
+toolchain_mode = nativelink
+
+[build]
+execution_platforms = shim//platforms:remote_linux
+
+[parser]
+target_platform_detector_spec = target:root//...->shim//platforms:linux_x86_64 target:shim//...->shim//platforms:linux_x86_64
+
+# NativeLink client settings, mirroring Muninn's recv-v2/ws/.buckconfig:13-20. The endpoint is the
+# workstation's NativeLink service; this file only declares where a NativeLink run sends actions.
+[buck2_re_client]
+engine_address = grpc://127.0.0.1:50051
+action_cache_address = grpc://127.0.0.1:50051
+cas_address = grpc://127.0.0.1:50051
+tls = false
+
+[buck2]
+digest_algorithms = SHA256
+
+[buck2_resource_control]
+status = off
+status_if_min_daemon_cgroup_version = 2

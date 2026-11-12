@@ -1,14 +1,13 @@
 [cells]
-# NativeLink engine build (decl edition): the prelude is Muninn's patched
-# prelude, the one whose Rust, http_archive and git_fetch rules implement the
-# NativeLink worker contract (Nix manifest as hidden input, copied inputs,
-# --closed-nix-env, pinned archive shell, fetch runtime). It is the exact store
-# path Muninn's recv-v2/ws/.buck2/prelude-source names:
-#   /nix/store/qj3sf0cvm0cqgcfk00awrrd7s83fc6cm-buck2-prelude-87765b7b4ff7762535c5c1529f8d2af871e53b12-muninn-patched
-# reached through the in-project link .buck2/prelude-source, as in Muninn.
-# Upstream instead uses the prelude bundled into the running buck2 binary.
-prelude = .buck2/prelude-source
+# The prelude is the engine's own source in `prelude/`, the tree a buck2 built from this checkout
+# bundles (app/buck2_external_cells_bundled/build.rs). It is declared as a plain cell rather than
+# `[external_cells] prelude = bundled` because a config file cannot unset an external cell origin,
+# and the explicit NativeLink mode (mode/nativelink.buckconfig) must replace this prelude.
+prelude = prelude
 none = none
+# The explicit NativeLink mode's toolchains (shim/nix/BUCK). Declaring the cell selects nothing:
+# `toolchains` below names the shim's system toolchains unless that mode is selected.
+nix_toolchains = shim/nix
 
 [cell_aliases]
 config = prelude
@@ -23,9 +22,7 @@ shim = gh_facebook_buck2_shims_meta
 toolchains = gh_facebook_buck2_shims_meta
 
 [build]
-# NativeLink: build actions run remotely with {OSFamily: Linux, cpu_count: 2};
-# git_fetch runs on the fetch platform. Mirrors Muninn's .buckconfig:33.
-execution_platforms = shim//platforms:remote_linux
+execution_platforms = prelude//platforms:default
 
 # Default Windows compiler identity for the shim's ovr_config//os:windows-*
 # and ovr_config//compiler:* config settings; matches the prelude's default
@@ -34,4 +31,4 @@ execution_platforms = shim//platforms:remote_linux
 windows_compiler_type = windows
 
 [parser]
-target_platform_detector_spec = target:root//...->shim//platforms:linux_x86_64 target:shim//...->shim//platforms:linux_x86_64
+target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default

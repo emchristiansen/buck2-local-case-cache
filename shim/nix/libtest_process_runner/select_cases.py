@@ -53,6 +53,25 @@ def select_cases(options: _RunnerOptions, environment: dict[bytes, bytes]) -> _C
     ):
         raise _ListingError("--declared-skip-substring words leave no listed test")
     declared = set(options.declared_skips)
+    promoted = set(options.declared_ignored)
+    if promoted:
+        # Judged against the binary's whole listing, as the declared skips are, so a
+        # caller's filter never turns a declared name into a refusal, and checked
+        # before any test runs.
+        every_ignored = set(_list_tests(options.binary, ["--ignored"], environment))
+        for problem, names in (
+            ("names no test the binary lists", [n for n in promoted if n not in listed]),
+            (
+                "names tests the binary does not ignore",
+                [n for n in promoted if n in listed and n not in every_ignored],
+            ),
+            (
+                "names tests the declared selection leaves out",
+                [n for n in promoted if n in declared or not _declared_keeps(options, n)],
+            ),
+        ):
+            if names:
+                raise _ListingError(f"--declared-ignored {problem}: {sorted(names)!r}")
     if options.ignored_mode is _IgnoredMode.ONLY:
         to_run, reported_ignored = (
             _list_tests(options.binary, [*selection, "--ignored"], environment),
@@ -65,8 +84,9 @@ def select_cases(options: _RunnerOptions, environment: dict[bytes, bytes]) -> _C
         ignored = set(_list_tests(options.binary, [*selection, "--ignored"], environment))
         if not ignored <= set(selected):
             raise _ListingError("the ignored listing names tests the full listing does not")
-        to_run = [name for name in selected if name not in ignored]
-        reported_ignored = [name for name in selected if name in ignored]
+        # A declared ignored test runs; every other ignored test is reported unrun.
+        to_run = [name for name in selected if name not in ignored or name in promoted]
+        reported_ignored = [name for name in selected if name in ignored and name not in promoted]
     # A declared selection narrows the caller's as a filter would, so the tests it
     # leaves out count as filtered out.
     to_run = [name for name in to_run if name not in declared and _declared_keeps(options, name)]

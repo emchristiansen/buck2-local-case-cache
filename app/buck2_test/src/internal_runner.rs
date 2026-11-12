@@ -46,8 +46,8 @@ use host_sharing::HostSharingRequirements;
 use crate::local_result_cache::ConfirmedPass;
 use crate::local_result_cache::DiscoveryIdentity;
 use crate::local_result_cache::LocalCaseGap;
-use crate::local_result_cache::LocalCaseRequest;
 use crate::local_result_cache::LocalCaseOutcome;
+use crate::local_result_cache::LocalCaseRequest;
 use crate::local_result_cache::LocalCaseResult;
 use crate::local_result_cache::reject_reused;
 use crate::local_result_cache::settle_fresh;
@@ -158,9 +158,7 @@ pub async fn run_internal_test(
         _ => {}
     }
 
-    let listing_bytes = match &listing_result.stdout {
-        ExecutionStream::Inline(bytes) => bytes,
-    };
+    let ExecutionStream::Inline(listing_bytes) = &listing_result.stdout;
     let listing_output = String::from_utf8_lossy(listing_bytes).to_string();
 
     // Step 2: Parse listing output via Starlark callback
@@ -901,7 +899,7 @@ mod tests {
 
         let digest = ActionDigest::empty(DigestConfig::testing_default().cas_digest_config());
         let details = RemoteCommandExecutionDetails {
-            action_digest: digest.clone(),
+            action_digest: digest,
             remote_dep_file_key: None,
             session_id: None,
             use_case: RemoteExecutorUseCase::buck2_default(),

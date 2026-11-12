@@ -84,8 +84,8 @@ use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
 use buck2_core::fs::buck_out_path::BuckOutTestPath;
 use buck2_core::fs::buck_out_path::BuildArtifactPath;
-use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::fs::project::ProjectRoot;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::EndOfTestResults;
@@ -115,9 +115,11 @@ use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
 use buck2_execute::execute::claim::MutexClaimManager;
 use buck2_execute::execute::command_executor::CommandExecutor;
 use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::manager::CommandExecutionManager;
 use buck2_execute::execute::manager::CommandExecutionManagerExt;
+use buck2_execute::execute::output::CommandStdStreams;
 use buck2_execute::execute::prepared::NoOpCommandOptionalExecutor;
 use buck2_execute::execute::prepared::PreparedCommand;
 use buck2_execute::execute::request::ActionMetadataBlob;
@@ -134,8 +136,6 @@ use buck2_execute::execute::result::CommandExecutionMetadata;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
-use buck2_execute::execute::output::CommandStdStreams;
-use buck2_execute::execute::executor_stage_async;
 use buck2_execute::execute::target::CommandExecutionTarget;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute::materialize::materializer::MaterializationPurpose;
@@ -207,20 +207,20 @@ use crate::command::InternalRunnerConfig;
 use crate::internal_runner::InternalTestOrchestrator;
 use crate::local_case_fresh_dirs::FreshDirs;
 use crate::local_case_fresh_dirs::ScratchRoot;
-use crate::local_result_cache::ConstrainedCase;
-use crate::local_result_cache::LocalCaseAdmission;
-use crate::local_result_cache::LocalCaseGap;
-use crate::local_result_cache::LocalCaseOutcome;
-use crate::local_result_cache::LocalCaseResult;
-use crate::local_result_cache::LocalCaseStart;
-use crate::local_result_cache::settle_execution;
-use crate::local_result_cache::LocalCaseRequest;
-use crate::local_result_cache::PreparedFacts;
-use crate::local_result_cache::RequestFacts;
 use crate::local_resource_api::LocalResourcesSetupResult;
 use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::local_resource_setup::TestStageSimple;
 use crate::local_resource_setup::required_providers;
+use crate::local_result_cache::ConstrainedCase;
+use crate::local_result_cache::LocalCaseAdmission;
+use crate::local_result_cache::LocalCaseGap;
+use crate::local_result_cache::LocalCaseOutcome;
+use crate::local_result_cache::LocalCaseRequest;
+use crate::local_result_cache::LocalCaseResult;
+use crate::local_result_cache::LocalCaseStart;
+use crate::local_result_cache::PreparedFacts;
+use crate::local_result_cache::RequestFacts;
+use crate::local_result_cache::settle_execution;
 use crate::remote_storage;
 use crate::session::TestSession;
 use crate::session::TestSessionOptions;
@@ -887,7 +887,10 @@ impl<'a> BuckTestOrchestrator<'a> {
         )?;
         if let Some(fresh_dirs) = &fresh_dirs {
             // The executor sets the variables itself, after every other variable.
-            if let Some(name) = fresh_dirs.names().find(|name| expanded_env.contains_key(*name)) {
+            if let Some(name) = fresh_dirs
+                .names()
+                .find(|name| expanded_env.contains_key(*name))
+            {
                 return Err(ExecuteError::Error(buck2_error::buck2_error!(
                     buck2_error::ErrorTag::Input,
                     "`fresh_dir_env` entry `{}` of {} is also set in the test environment",
@@ -1864,7 +1867,10 @@ impl BuckTestOrchestrator<'_> {
                     },
                 )
                 .await;
-                return (result, LocalCaseOutcome::new(LocalCaseResult::Reused(reused)));
+                return (
+                    result,
+                    LocalCaseOutcome::new(LocalCaseResult::Reused(reused)),
+                );
             }
             LocalCaseStart::Begun(pending) => pending,
         };
@@ -2430,7 +2436,8 @@ impl BuckTestOrchestrator<'_> {
             cache_uploader: _,
             output_trees_download_config: _,
             write_action_cache: _,
-        } = dice.get_command_executor_from_dice(fs, &executor_config, LocalExecution::ByStrategy)?;
+        } =
+            dice.get_command_executor_from_dice(fs, &executor_config, LocalExecution::ByStrategy)?;
         let executor = CommandExecutor::new(
             executor,
             Arc::new(NoOpCommandOptionalExecutor {}),
@@ -4029,6 +4036,7 @@ mod tests {
     /// `ensure_materialized` is deliberately a no-op in that materializer (`v2/core.rs`
     /// `materialize_many`), so it can neither put a cold executable in place nor replace a
     /// stale one.
+    #[cfg(unix)]
     mod launch_check_with_disk_state_materializer {
         use std::path::PathBuf;
         use std::sync::Mutex;
@@ -5678,7 +5686,10 @@ mod tests {
                 )
             }
 
-            fn is_local_execution_possible(&self, _executor_preference: ExecutorPreference) -> bool {
+            fn is_local_execution_possible(
+                &self,
+                _executor_preference: ExecutorPreference,
+            ) -> bool {
                 false
             }
         }

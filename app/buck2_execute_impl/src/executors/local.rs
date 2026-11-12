@@ -1601,7 +1601,9 @@ pub async fn prep_scratch_path(
         builder
             .create(&subdirectory)
             .await
-            .with_buck_error_context(|| format!("creating scratch subdirectory `{subdirectory}`"))?;
+            .with_buck_error_context(|| {
+                format!("creating scratch subdirectory `{subdirectory}`")
+            })?;
     }
     Ok(())
 }
@@ -1616,6 +1618,7 @@ async fn prep_owned_scratch_path(path: &AbsNormPath) -> buck2_error::Result<()> 
         Err(e) => Err(e),
     }
     .with_buck_error_context(|| format!("removing owned scratch path `{path}`"))?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = tokio::fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
@@ -2074,6 +2077,7 @@ mod tests {
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
+    #[cfg(unix)]
     use buck2_execute::execute::request::ScratchDirVariable;
     use buck2_hash::BuckMutMap;
     use host_sharing::HostSharingStrategy;
@@ -2122,13 +2126,14 @@ mod tests {
         Ok((executor, temp.path().root().to_buf(), temp))
     }
 
-    /// The variable that names the declared shell: the exact Nix store path of the pinned bash
-    /// (`shim/nix/pinned_tools.bzl` `PINNED_TOOLS["bash"]`, a root of `shim/nix/nix-manifest.json`),
-    /// the same variable `buck2_test`'s fixtures read. Under Buck, `app/buck2_execute_impl/BUCK`
-    /// supplies it through `test_env` as `$(exe toolchains//:archive_shell)`; under Cargo, the
-    /// caller sets it to the same store path. A bare `sh` or `sleep` would be found through the
-    /// inherited `PATH`, or the C library's or the shell's default search path when there is none,
-    /// all outside the declared closure, so the fixtures below that start a child name neither.
+    /// The variable that names the declared shell, the canonical path of a bash in the Nix store
+    /// whose directory also holds `sh`; the same variable `buck2_test`'s fixtures read. Under
+    /// Buck, `app/buck2_execute_impl/BUCK` supplies it through `test_env` as
+    /// `$(exe toolchains//:archive_shell)`, the pinned bash (`shim/nix/pinned_tools.bzl`
+    /// `PINNED_TOOLS["bash"]`); under Cargo, the caller sets it, and CI uses the flake's
+    /// `ci-test-shell`. A bare `sh` or `sleep` would be found through the inherited `PATH`, or the
+    /// C library's or the shell's default search path when there is none, all outside the
+    /// declared closure, so the fixtures below that start a child name neither.
     #[cfg(unix)]
     const DECLARED_SHELL: &str = "BUCK2_TEST_DECLARED_SHELL";
 
@@ -2414,8 +2419,8 @@ mod tests {
         use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
         use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
         use buck2_execute::execute::request::CommandExecutionPaths;
-        use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
         use buck2_execute::execute::result::CommandExecutionStatus;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
         use buck2_hash::BuckMutInsertionSet;
 
         let (executor, root, _tmpdir) = test_executor()?;
@@ -2500,10 +2505,7 @@ printf ran
                 ),
                 _ => panic!("run {run} has no local streams"),
             }
-            assert_matches!(
-                result.report.status,
-                CommandExecutionStatus::Success { .. }
-            );
+            assert_matches!(result.report.status, CommandExecutionStatus::Success { .. });
             for fresh in [&fresh_a, &fresh_b] {
                 let mode = std::fs::metadata(fresh)?.permissions().mode() & 0o777;
                 assert_eq!(mode, 0o700, "run {run}: {fresh}");
@@ -2813,7 +2815,13 @@ printf ran
         assert_eq!(
             names,
             // A later value of a name replaces the earlier one in place of the latest.
-            ["TMPDIR", "BUCK_BUILD_ID", "BUCK2_DAEMON_UUID", "FRESH_A", "PWD"],
+            [
+                "TMPDIR",
+                "BUCK_BUILD_ID",
+                "BUCK2_DAEMON_UUID",
+                "FRESH_A",
+                "PWD"
+            ],
             "{described:?}"
         );
         let last = |name: &str| {
@@ -2831,8 +2839,8 @@ printf ran
     /// so the execution is refused before its child starts.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_scratch_dir_variable_set_by_a_local_resource_is_refused() -> buck2_error::Result<()>
-    {
+    async fn test_scratch_dir_variable_set_by_a_local_resource_is_refused()
+    -> buck2_error::Result<()> {
         use buck2_common::local_resource_state::EnvironmentVariable;
         use buck2_common::local_resource_state::LocalResource;
         use buck2_common::local_resource_state::LocalResourceState;
@@ -2843,7 +2851,10 @@ printf ran
         let (executor, root, _tmpdir) = test_executor()?;
         let (request, _) = scratch_request(&executor, ": > started", vec![], &[("FRESH_A", "0")])?;
         let pool = LocalResourceState::new(
-            ConfiguredTargetLabel::testing_parse("cell//pkg:resource", ConfigurationData::testing_new()),
+            ConfiguredTargetLabel::testing_parse(
+                "cell//pkg:resource",
+                ConfigurationData::testing_new(),
+            ),
             None,
             vec![LocalResource(vec![EnvironmentVariable {
                 key: "FRESH_A".to_owned(),
@@ -2863,7 +2874,10 @@ printf ran
             &[("FRESH_A", "0")],
         )?;
         let pool = LocalResourceState::new(
-            ConfiguredTargetLabel::testing_parse("cell//pkg:other", ConfigurationData::testing_new()),
+            ConfiguredTargetLabel::testing_parse(
+                "cell//pkg:other",
+                ConfigurationData::testing_new(),
+            ),
             None,
             vec![LocalResource(vec![EnvironmentVariable {
                 key: "OTHER".to_owned(),

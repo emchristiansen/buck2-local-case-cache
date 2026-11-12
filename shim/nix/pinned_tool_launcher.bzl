@@ -15,7 +15,7 @@ def _pinned_tool_launcher_impl(ctx):
         ctx.attrs.name,
         [
             "#!" + PINNED_TOOLS["bash"]["path"],
-            "exec " + ctx.attrs.path + " \"$@\"",
+            "exec " + ctx.attrs.path + ' "$@"',
         ],
         is_executable = True,
     )
@@ -27,8 +27,8 @@ def _pinned_tool_launcher_impl(ctx):
 pinned_tool_launcher = rule(
     impl = _pinned_tool_launcher_impl,
     attrs = {
+        "nix_manifest": attrs.source(),
         # A PINNED_TOOLS executable's exact store path.
         "path": attrs.string(),
-        "nix_manifest": attrs.source(),
     },
 )

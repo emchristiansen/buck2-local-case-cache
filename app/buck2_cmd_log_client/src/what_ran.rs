@@ -2026,7 +2026,7 @@ mod tests {
             assert_eq!(response.origin(), RemoteExecutionOrigin::ServedFromCache);
             let action_digest = ActionDigest::new_sha1([7; 20], 42);
             let execution_kind = response.execution_kind(RemoteCommandExecutionDetails::new(
-                action_digest.clone(),
+                action_digest,
                 None,
                 None,
                 buck2_core::execution_types::executor_config::RemoteExecutorUseCase::new(
@@ -2334,7 +2334,6 @@ mod tests {
                     ..Default::default()
                 };
                 with_dispatcher_async(dispatcher, {
-                    let action_digest = action_digest.clone();
                     async move {
                         span_async(
                             buck2_data::TestRunStart {
@@ -2365,7 +2364,7 @@ mod tests {
                                 };
                                 let kind = response.execution_kind(
                                     RemoteCommandExecutionDetails::new(
-                                        action_digest.clone(),
+                                        action_digest,
                                         None,
                                         None,
                                         buck2_core::execution_types::executor_config::RemoteExecutorUseCase::new(

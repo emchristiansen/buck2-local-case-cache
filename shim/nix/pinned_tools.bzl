@@ -62,49 +62,79 @@ PINNED_ROOTS = [
 ]
 
 PINNED_TOOLS = {
-    "rustc": {"closure": "rust_nightly", "path": _RUST + "/bin/rustc"},
-    "rustdoc": {"closure": "rust_nightly", "path": _RUST + "/bin/rustdoc"},
-    "clippy_driver": {"closure": "rust_nightly", "path": _RUST + "/bin/clippy-driver"},
+    "ar": {"closure": "cxx", "path": _BINT + "/bin/ar"},
+    "as": {"closure": "cxx", "path": _BINT + "/bin/as"},
+    "bash": {"closure": "cxx", "path": _BASH + "/bin/bash"},
     "cargo": {"closure": "rust_nightly", "path": _RUST + "/bin/cargo"},
+    "cc": {"closure": "cxx", "path": _CLANG + "/bin/cc"},
+    # The same wrapper's clang, which hands `-cc1` straight to the compiler with no
+    # wrapper flags (gazebo/hmap's HMAP_TEST_CLANG; shims.bzl _ENV_MACRO_TARGETS).
+    "clang": {"closure": "cxx", "path": _CLANG + "/bin/clang"},
+    "clippy_driver": {"closure": "rust_nightly", "path": _RUST + "/bin/clippy-driver"},
+    "cxx": {"closure": "cxx", "path": _CLANG + "/bin/c++"},
+    "ld": {"closure": "cxx", "path": _NATIVE_BINT + "/bin/ld.lld"},
+    "llvm_link": {"closure": "cxx", "path": _LLVM + "/bin/llvm-link"},
+    # Creates the prost build scripts' $OUT (nix/rust_protobuf_generate.bzl).
+    "mkdir": {"closure": "cxx", "path": _COREUTILS + "/bin/mkdir"},
+    "nm": {"closure": "cxx", "path": _BINT + "/bin/nm"},
+    "objcopy": {"closure": "cxx", "path": _BINT + "/bin/objcopy"},
+    "objdump": {"closure": "cxx", "path": _BINT + "/bin/objdump"},
+    "protobuf_proto": {"closure": "protobuf", "path": _PROTOBUF_PROTO},
+    # prost-build's PROTOC and PROTOC_INCLUDE (shim/third-party/proto). The
+    # include root is the `proto` output: only the twelve well-known-type
+    # .proto files, all regular files (the `out` output's include/ links to them).
+    "protoc": {"closure": "protobuf", "path": _PROTOBUF + "/bin/protoc"},
+    "python": {"closure": "python", "path": _PYTHON + "/bin/python3"},
+    "ranlib": {"closure": "cxx", "path": _BINT + "/bin/ranlib"},
     # Rust links through the Nix cc-wrapper (its ld-wrapper adds the store
     # RUNPATHs a test binary needs on the worker). W's muninn-lld-clang wrapper
     # is not used: it accepts only the -B selectors of W's two Rust toolchains
     # and refuses this nightly's. rustc's self-contained rust-lld is disabled
     # with `-Clinker-features=-lld` in the toolchain (see rust.bzl).
     "rust_linker": {"closure": "cxx", "path": _CLANG + "/bin/cc"},
-    "python": {"closure": "python", "path": _PYTHON + "/bin/python3"},
-    "cc": {"closure": "cxx", "path": _CLANG + "/bin/cc"},
-    # The same wrapper's clang, which hands `-cc1` straight to the compiler with no
-    # wrapper flags (gazebo/hmap's HMAP_TEST_CLANG; shims.bzl _ENV_MACRO_TARGETS).
-    "clang": {"closure": "cxx", "path": _CLANG + "/bin/clang"},
-    "cxx": {"closure": "cxx", "path": _CLANG + "/bin/c++"},
-    "llvm_link": {"closure": "cxx", "path": _LLVM + "/bin/llvm-link"},
-    "ld": {"closure": "cxx", "path": _NATIVE_BINT + "/bin/ld.lld"},
-    "ar": {"closure": "cxx", "path": _BINT + "/bin/ar"},
-    "as": {"closure": "cxx", "path": _BINT + "/bin/as"},
-    "nm": {"closure": "cxx", "path": _BINT + "/bin/nm"},
-    "ranlib": {"closure": "cxx", "path": _BINT + "/bin/ranlib"},
-    "objcopy": {"closure": "cxx", "path": _BINT + "/bin/objcopy"},
-    "objdump": {"closure": "cxx", "path": _BINT + "/bin/objdump"},
+    "rustc": {"closure": "rust_nightly", "path": _RUST + "/bin/rustc"},
+    "rustdoc": {"closure": "rust_nightly", "path": _RUST + "/bin/rustdoc"},
     "strip": {"closure": "cxx", "path": _BINT_WRAPPER + "/bin/strip"},
-    "bash": {"closure": "cxx", "path": _BASH + "/bin/bash"},
-    # Creates the prost build scripts' $OUT (nix/rust_protobuf_generate.bzl).
-    "mkdir": {"closure": "cxx", "path": _COREUTILS + "/bin/mkdir"},
-    # prost-build's PROTOC and PROTOC_INCLUDE (shim/third-party/proto). The
-    # include root is the `proto` output: only the twelve well-known-type
-    # .proto files, all regular files (the `out` output's include/ links to them).
-    "protoc": {"closure": "protobuf", "path": _PROTOBUF + "/bin/protoc"},
-    "protobuf_proto": {"closure": "protobuf", "path": _PROTOBUF_PROTO},
 }
 
-PINNED_NIX_PATH = ":".join([root + "/bin" for root in [
-    _CLANG, _LLVM, _NATIVE_BINT, _BINT_WRAPPER, _BINT, _BASH, _COREUTILS, _GREP, _PYTHON, _RUST,
-]])
+PINNED_NIX_PATH = ":".join([
+    root + "/bin"
+    for root in [
+        _CLANG,
+        _LLVM,
+        _NATIVE_BINT,
+        _BINT_WRAPPER,
+        _BINT,
+        _BASH,
+        _COREUTILS,
+        _GREP,
+        _PYTHON,
+        _RUST,
+    ]
+])
 
 PINNED_CXX_LINK_FLAGS = ["-B" + _NATIVE_BINT + "/bin/", "-fuse-ld=lld"]
 
-PINNED_ARCHIVE_NIX_PATH = ":".join([root + "/bin" for root in [
-    _CLANG, _LLVM, _NATIVE_BINT, _BINT_WRAPPER, _BINT, _BASH, _COREUTILS, _GREP, _PYTHON, _RUST, _GNUTAR, _GZIP, _UNZIP, _BZIP2, _XZ, _ZSTD,
-]])
+PINNED_ARCHIVE_NIX_PATH = ":".join([
+    root + "/bin"
+    for root in [
+        _CLANG,
+        _LLVM,
+        _NATIVE_BINT,
+        _BINT_WRAPPER,
+        _BINT,
+        _BASH,
+        _COREUTILS,
+        _GREP,
+        _PYTHON,
+        _RUST,
+        _GNUTAR,
+        _GZIP,
+        _UNZIP,
+        _BZIP2,
+        _XZ,
+        _ZSTD,
+    ]
+])
 
 PINNED_PYTHON_EXTENSION_LINKER_FLAGS = ["-L" + _PYTHON + "/lib", "-ldl", "-lm"]

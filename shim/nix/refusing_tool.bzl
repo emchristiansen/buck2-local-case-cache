@@ -5,13 +5,15 @@ load(":pinned_tools.bzl", "PINNED_TOOLS")
 def _refusing_tool_impl(ctx):
     return [
         DefaultInfo(),
-        RunInfo(args = cmd_args(
-            PINNED_TOOLS["bash"]["path"],
-            "-c",
-            "echo \"$0\" >&2; exit 1",
-            ctx.attrs.message,
-            hidden = [ctx.attrs.nix_manifest],
-        )),
+        RunInfo(
+            args = cmd_args(
+                PINNED_TOOLS["bash"]["path"],
+                "-c",
+                'echo "$0" >&2; exit 1',
+                ctx.attrs.message,
+                hidden = [ctx.attrs.nix_manifest],
+            )
+        ),
     ]
 
 refusing_tool = rule(

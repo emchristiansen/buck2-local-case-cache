@@ -121,8 +121,8 @@ remote_execution_platform = rule(
     impl = _remote_execution_platform_impl,
     attrs = {
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
-        "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "fetch_platform": attrs.dep(providers = [ExecutionPlatformInfo]),
+        "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
     },
 )
 
@@ -161,7 +161,7 @@ remote_fetch_execution_platform = rule(
     impl = _remote_fetch_execution_platform_impl,
     attrs = {
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
-        "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "fetch_constraint": attrs.dep(providers = [ConfigurationInfo]),
+        "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
     },
 )

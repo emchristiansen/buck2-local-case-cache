@@ -5,33 +5,15 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-load("@prelude//rules.bzl", "export_file", "python_bootstrap_binary", "python_bootstrap_library", "toolchain_alias")
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
-load("@prelude//toolchains:cxx.bzl", "cxx_tools_info_toolchain")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:go.bzl", "system_go_bootstrap_toolchain", "system_go_toolchain")
 load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
 load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
-load("@prelude//toolchains:python.bzl", "python_bootstrap_toolchain", "python_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
-load("//nix:cxx.bzl", "pinned_cxx_tools", "pinned_cxx_toolchain")
-load("//nix:pinned_directory.bzl", "pinned_directory_copy")
-load("//nix:pinned_executable.bzl", "pinned_executable")
-load("//nix:pinned_tool_launcher.bzl", "pinned_tool_launcher")
-load(
-    "//nix:pinned_tools.bzl",
-    "PINNED_ARCHIVE_NIX_PATH",
-    "PINNED_CXX_LINK_FLAGS",
-    "PINNED_PYTHON_EXTENSION_LINKER_FLAGS",
-    "PINNED_TOOLS",
-)
-load("//nix:refusing_tool.bzl", "refusing_tool")
-load("//nix:rust.bzl", "engine_pinned_rust_toolchain")
-load(
-    "//platforms:remote_execution_platform.bzl",
-    "MUNINN_TEST_RUNTIME",
-    "REMOTE_EXECUTION_PROPERTIES",
-)
+load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 
 oncall("open_source")
 
@@ -41,192 +23,43 @@ configuration_alias(
     visibility = ["PUBLIC"],
 )
 
-# NativeLink engine build (decl edition): the C/C++, Rust and Python toolchains
-# name exact Nix store tools, each with //nix:nix-manifest.json as a hidden
-# input, following Muninn's toolchains/BUCK (recv-v2/ws, sha256 a446406f...).
-# The upstream system_* C/C++, Python and Rust toolchains, which run whatever
-# gcc/python3/rustc the executing host has on PATH, are replaced. Go, Haskell
-# and OCaml stay system toolchains: no target of the engine build or of its
-# unit tests uses them.
-
-export_file(
-    name = "nix-manifest.json",
-    src = "nix/nix-manifest.json",
-    mode = "reference",
-    visibility = ["PUBLIC"],
-)
-
-pinned_executable(
-    name = "rust_linker",
-    path = PINNED_TOOLS["rust_linker"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-engine_pinned_rust_toolchain(
-    name = "rust",
-    default_edition = "2024",
-    linker = ":rust_linker",
-    nix_manifest = ":nix-manifest.json",
-    # Unset leaves each test unbounded, as libtest and `buck2 test` are.
-    per_test_timeout_seconds = read_config("test", "per_test_timeout_seconds", None),
-    test_process_runner = ":libtest_process_runner",
-    visibility = ["PUBLIC"],
-)
-
-# Muninn's libtest process runner, byte-for-byte the cumulative R3-P5 runner
-# (r3/p5/tree/toolchains: libtest_process_runner_main.py, libtest_process_runner/*.py,
-# process_environment/*.py; Python stdlib only, run by the pinned interpreter). Its
-# `--raw-one-case` is the transport of the prelude's remote per-case route.
-# The Muninn prelude's portable rust_test contract (rust/rust_binary.bzl
-# _rust_test_re_executors) requires it for the `nativelink_test_result_reuse`
-# profile: it lists and runs each libtest case in its own process, worker-side,
-# with HOME and TMPDIR made project-relative.
-python_bootstrap_library(
-    name = "process_environment",
-    srcs = glob(["process_environment/*.py"]),
-)
-
-python_bootstrap_library(
-    name = "libtest_process_runner_modules",
-    srcs = glob(["libtest_process_runner/*.py"]),
-)
-
-python_bootstrap_binary(
-    name = "libtest_process_runner",
-    main = "libtest_process_runner_main.py",
-    deps = [":libtest_process_runner_modules", ":process_environment"],
-    visibility = ["PUBLIC"],
-)
-
-pinned_executable(
-    name = "python_interpreter",
-    path = PINNED_TOOLS["python"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-python_bootstrap_toolchain(
-    name = "python_bootstrap",
-    interpreter = ":python_interpreter",
-    visibility = ["PUBLIC"],
-)
-
-python_toolchain(
-    name = "python",
-    interpreter = ":python_interpreter",
-    extension_linker_flags = PINNED_PYTHON_EXTENSION_LINKER_FLAGS,
-    visibility = ["PUBLIC"],
-)
-
-# The Muninn-patched prelude's http_archive extracts through this pinned shell
-# (prelude//http_archive:exec_deps.bzl defaults to toolchains//:archive_shell);
-# every non-vendored crate archive in third-party/rust/BUCK goes through it.
-pinned_executable(
-    name = "archive_shell",
-    path = PINNED_TOOLS["bash"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    path_env = PINNED_ARCHIVE_NIX_PATH,
-    visibility = ["PUBLIC"],
-)
-
-[
-    pinned_executable(
-        name = tool,
-        path = PINNED_TOOLS[tool]["path"],
-        nix_manifest = ":nix-manifest.json",
-        visibility = ["PUBLIC"],
-    )
-    for tool in ["cc", "ar", "as", "ld", "llvm_link", "nm", "objcopy", "objdump", "ranlib", "strip"]
-]
-
-# The pinned clang as a file artifact, for test environments that take a compiler's
-# location: shims.bzl maps gazebo/hmap's internal `llvm-21-bin/clang` here.
-pinned_tool_launcher(
-    name = "clang",
-    path = PINNED_TOOLS["clang"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-pinned_executable(
-    name = "cxx_compiler",
-    path = PINNED_TOOLS["cxx"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-pinned_cxx_tools(
-    name = "cxx_tools",
-    cc = ":cc",
-    cxx = ":cxx_compiler",
-    ar = ":ar",
-    linker_type = "gnu",
-    visibility = ["PUBLIC"],
-)
-
-cxx_tools_info_toolchain(
-    name = "cxx_template",
-    cxx_tools_info = ":cxx_tools",
-    cxx_flags = ["-std=c++20"],
-    link_flags = PINNED_CXX_LINK_FLAGS,
-    link_style = "static",
-)
-
-pinned_cxx_toolchain(
+system_cxx_toolchain(
     name = "cxx",
-    template = ":cxx_template",
-    nm = ":nm",
-    objcopy = ":objcopy",
-    objdump = ":objdump",
-    ranlib = ":ranlib",
-    strip = ":strip",
-    llvm_link = ":llvm_link",
-    visibility = ["PUBLIC"],
-)
-
-# Muninn's prelude (87765b7b) makes clippy_configuration's `toml_merge_tool`
-# mandatory; the merged tree's own prelude made it optional, and this shim's
-# clippy_configuration wrapper (build_defs/clippy_configuration.bzl) relied on
-# that. The engine Rust toolchain declares no clippy.toml, so the prelude never
-# creates the merge action and this tool never runs; if it ever did, it fails.
-refusing_tool(
-    name = "clippy_toml_merge_undeclared",
-    message = "clippy.toml merge: no toml_merge_tool is declared for the engine Rust toolchain",
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-# protoc and the protobuf well-known types for the prost build scripts
-# (shims.bzl _rust_protobuf_library: PROTOC, PROTOC_INCLUDE), declared as
-# pinned tools: nixpkgs protobuf_21 (21.12) from the nixpkgs-compiler set,
-# replacing the prebuilt protoc 21.4 zip whose binary needs the FHS loader
-# /lib64/ld-linux-x86-64.so.2, which the NativeLink v2 worker does not provide.
-# The include root is copied into a Buck output by W's pinned_directory_copy
-# (toolchains/pinned_directory.bzl and pinned_directory_copy.py, byte-for-byte
-# in nix/), so `$(location)` names a real directory artifact of regular files.
-# shim//third-party/proto:{protoc,google_protobuf} alias these.
-pinned_executable(
-    name = "protoc",
-    path = PINNED_TOOLS["protoc"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    visibility = ["PUBLIC"],
-)
-
-pinned_directory_copy(
-    name = "protobuf_well_known_types",
-    path = PINNED_TOOLS["protobuf_proto"]["path"],
-    nix_manifest = ":nix-manifest.json",
-    script = "nix/pinned_directory_copy.py",
-    subpaths = {"include": "directory"},
-    visibility = ["PUBLIC"],
-)
-
-# As in Muninn's toolchains/BUCK: the prelude's default C++ toolchain dependency
-# names this label in a select branch no configuration matches, so it must exist.
-toolchain_alias(
-    name = "cxx_no_default_deps",
-    actual = ":cxx",
+    compiler = select({
+        "DEFAULT": "gcc",
+        "ovr_config//os:windows": None,
+        "ovr_config//os:windows-clang": "clang-cl",
+    }),
+    # `compiler_type = "gcc"` is required in addition to the compiler
+    # binary names. The prelude gates many flags on `compiler_type`
+    # rather than the binary name (e.g. `prelude/cxx/compiler.bzl` adds
+    # `-Xclang -fdebug-compilation-dir ... -fcolor-diagnostics` only when
+    # `compiler_type in ["clang", ...]`). Without this, gcc is invoked
+    # with clang-only flags and rejects them.
+    compiler_type = select({
+        "DEFAULT": "gcc",
+        "ovr_config//os:windows": "windows",
+        "ovr_config//os:windows-clang": "clang_cl",
+    }),
+    cxx_compiler = select({
+        "DEFAULT": "g++",
+        "ovr_config//os:windows": None,
+    }),
+    cxx_flags = select({
+        "DEFAULT": ["-std=c++20"],
+        "ovr_config//os:windows": ["/std:c++20", "/EHsc"],
+        "ovr_config//os:windows-clang": ["/std:c++20", "/EHsc"],
+    }),
+    # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
+    # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
+    # `prelude//toolchains/cxx/clang:path_clang_tools`. Using `g++` as the
+    # linker also causes `prelude/toolchains/cxx.bzl` to drop its
+    # automatic `-fuse-ld=lld` link flag (see the g++-gated branch there),
+    # so we don't need lld either.
+    linker = select({
+        "DEFAULT": "g++",
+        "ovr_config//os:windows": None,
+    }),
     visibility = ["PUBLIC"],
 )
 
@@ -255,29 +88,40 @@ system_ocaml_toolchain(
     visibility = ["PUBLIC"],
 )
 
-# Remote test profiles, verbatim from Muninn's toolchains/BUCK:133-151. The
-# engine unit tests (shim rust_library -> `<name>-unittest`) name
-# `nativelink_test_result_reuse`: the worker capabilities plus
-# `muninn-test-runtime=linux-unprivileged-v2`, local execution forbidden.
-remote_test_execution_toolchain(
-    name = "remote_test_execution",
-    default_profile = read_config("buck2", "remote_test_profile", default = None),
-    profiles = {
-        "nativelink_r4": {
-            "capabilities": REMOTE_EXECUTION_PROPERTIES,
-            "use_case": "buck2-default",
-            "local_enabled": False,
-            "remote_cache_enabled": False,
-        },
-        "nativelink_test_result_reuse": {
-            "capabilities": REMOTE_EXECUTION_PROPERTIES | MUNINN_TEST_RUNTIME,
-            "use_case": "buck2-default",
-            "local_enabled": False,
-            "remote_cache_enabled": True,
-        },
-    },
+system_python_toolchain(
+    name = "python",
     visibility = ["PUBLIC"],
 )
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_rust_toolchain(
+    name = "rust",
+    default_edition = "2024",
+    visibility = ["PUBLIC"],
+)
+
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    visibility = ["PUBLIC"],
+)
+
+# Tools that only the explicit NativeLink mode declares (shim/nix/BUCK, mode/nativelink.buckconfig),
+# named by test environments: the declared shell of the engine's child-process fixtures
+# (BUCK2_TEST_DECLARED_SHELL) and the pinned clang of gazebo/hmap's tests. Without that mode they
+# are stand-ins that refuse to run, so those tests still build here and, if run, fail naming the
+# missing tool: the fixtures accept only a canonical Nix store shell and have no host fallback.
+[
+    sh_binary(
+        name = tool,
+        main = "no_declared_tool.sh",
+        visibility = ["PUBLIC"],
+    )
+    for tool in ["archive_shell", "clang"]
+]
 
 noop_test_toolchain(
     name = "test",

@@ -1660,7 +1660,7 @@ mod schema_compat_reader_tests {
             let err = read(
                 "log.pb",
                 Encoding::PROTO,
-                protobuf_log(header(None), &[frame.clone()]),
+                protobuf_log(header(None), std::slice::from_ref(&frame)),
                 reading,
             )
             .await

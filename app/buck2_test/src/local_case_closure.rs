@@ -37,8 +37,6 @@
 //! loads or reads while it runs is covered by the provider's explicit request, which declares
 //! that its cases are deterministic within their declared inputs.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Component;
@@ -59,6 +57,8 @@ use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::MaterializeRequest;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::ReadLease;
+use buck2_hash::BuckMutMap;
+use buck2_hash::BuckMutSet;
 use dupe::Dupe;
 
 /// Symlink hops followed while resolving one path, as the kernel's limit.
@@ -83,14 +83,17 @@ enum Leaf {
 /// The action's input tree, by project-relative path components.
 #[derive(Debug)]
 pub(crate) struct InputTree {
-    leaves: HashMap<Vec<String>, Leaf>,
-    dirs: HashSet<Vec<String>>,
+    leaves: BuckMutMap<Vec<String>, Leaf>,
+    dirs: BuckMutSet<Vec<String>>,
 }
 
 /// Where a path ends after following input-tree symlinks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resolved {
-    Tree { path: Vec<String>, executable: bool },
+    Tree {
+        path: Vec<String>,
+        executable: bool,
+    },
     TreeDir,
     Host(PathBuf),
     /// A project path the input tree does not contain.
@@ -99,10 +102,13 @@ enum Resolved {
 
 impl InputTree {
     pub(crate) fn new(directory: &ActionImmutableDirectory) -> Self {
-        let mut leaves = HashMap::new();
-        let mut dirs = HashSet::new();
+        let mut leaves = BuckMutMap::default();
+        let mut dirs = BuckMutSet::default();
         for (path, entry) in directory.unordered_walk().with_paths() {
-            let components = path.iter().map(|c| c.as_str().to_owned()).collect::<Vec<_>>();
+            let components = path
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect::<Vec<_>>();
             let leaf = match entry {
                 DirectoryEntry::Dir(_) => {
                     dirs.insert(components);
@@ -265,7 +271,10 @@ fn store_path(path: &Path) -> Result<PathBuf, String> {
 /// A file the command names, once found bound.
 enum Bound {
     /// An input-tree build artifact.
-    Artifact { path: Vec<String>, executable: bool },
+    Artifact {
+        path: Vec<String>,
+        executable: bool,
+    },
     Store,
 }
 
@@ -389,7 +398,10 @@ impl LaunchPlan {
             store_path(&dir).map_err(|e| format!("PATH entry {e}"))?;
         }
 
-        let classify = Classify { tree, facts: &facts };
+        let classify = Classify {
+            tree,
+            facts: &facts,
+        };
         let mut executables: Vec<Vec<String>> = Vec::new();
         let (argv0, args) = facts.argv.split_first().ok_or("the command is empty")?;
         if !argv0.contains('/') {
@@ -499,7 +511,7 @@ impl LaunchPlan {
     /// This plan as if its values were materialized, for tests of the header check alone, which
     /// put the requested bytes on disk themselves. The orchestrator's composed tests cover how a
     /// real materializer puts them there.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn testing_held(&self) -> MaterializedLaunch {
         MaterializedLaunch {
             plan: self.clone(),
@@ -610,7 +622,9 @@ impl Classify<'_> {
     }
 }
 
-#[cfg(test)]
+// Every test here launches against the declared shell, a Nix store path (`crate::testing`), which
+// only Unix hosts supply; the host-local case store that uses this check is Linux and macOS only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -629,9 +643,9 @@ mod tests {
 
     fn tree(leaves: &[(&str, Leaf)], dirs: &[&str]) -> InputTree {
         let split = |p: &str| p.split('/').map(str::to_owned).collect::<Vec<_>>();
-        let leaves: HashMap<_, _> = leaves.iter().map(|(p, l)| (split(p), l.clone())).collect();
+        let leaves: BuckMutMap<_, _> = leaves.iter().map(|(p, l)| (split(p), l.clone())).collect();
         // Every ancestor of a leaf is a directory of the tree, as in a real input directory.
-        let mut all_dirs: HashSet<Vec<String>> = dirs.iter().map(|d| split(d)).collect();
+        let mut all_dirs: BuckMutSet<Vec<String>> = dirs.iter().map(|d| split(d)).collect();
         for path in leaves.keys() {
             for end in 1..path.len() {
                 all_dirs.insert(path[..end].to_vec());
@@ -680,7 +694,12 @@ mod tests {
         let path_env = ("PATH", store.as_str());
         let t = tree(
             &[(script, file_leaf(b"artifact", true))],
-            &["buck-out", "buck-out/v2", "buck-out/v2/gen", "buck-out/v2/gen/t"],
+            &[
+                "buck-out",
+                "buck-out/v2",
+                "buck-out/v2/gen",
+                "buck-out/v2/gen/t",
+            ],
         );
 
         // A literal host tool: an existing file outside the project and the store.
@@ -699,11 +718,24 @@ mod tests {
         assert!(e.contains("LD_PRELOAD"), "{e}");
         let e = plan(&t, &root, &[&sh, script, "/etc/hostname"], &[path_env]).unwrap_err();
         assert!(e.contains("/etc/hostname"), "{e}");
-        let e = plan(&t, &root, &[&sh, script], &[path_env, ("F", "x=/etc/hostname")])
-            .unwrap_err();
+        let e = plan(
+            &t,
+            &root,
+            &[&sh, script],
+            &[path_env, ("F", "x=/etc/hostname")],
+        )
+        .unwrap_err();
         assert!(e.contains("/etc/hostname"), "{e}");
         // Values naming nothing that exists are not file operands.
-        assert!(plan(&t, &root, &[&sh, script, "case_a", "/no/such/file"], &[path_env]).is_ok());
+        assert!(
+            plan(
+                &t,
+                &root,
+                &[&sh, script, "case_a", "/no/such/file"],
+                &[path_env]
+            )
+            .is_ok()
+        );
 
         std::fs::write(root.join("undeclared.txt"), "live").unwrap();
         let e = plan(&t, &root, &[&sh, script, "undeclared.txt"], &[path_env]).unwrap_err();
@@ -760,9 +792,9 @@ mod tests {
                 panic!("a launched executable is requested as a file");
             };
             let Some(Leaf::File(bound)) = t.leaves.get(
-                &["buck-out", "v2", "gen", "t", "script"]
+                ["buck-out", "v2", "gen", "t", "script"]
                     .map(str::to_owned)
-                    .to_vec(),
+                    .as_slice(),
             ) else {
                 panic!("the script is a file of the tree");
             };

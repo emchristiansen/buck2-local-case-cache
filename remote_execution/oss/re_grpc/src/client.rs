@@ -4422,7 +4422,6 @@ mod upload_retry_tests {
             digest: Some(Digest {
                 hash: hash.to_owned(),
                 size_bytes: 3,
-                ..Default::default()
             }),
             status: Some(Status {
                 code: code as i32,

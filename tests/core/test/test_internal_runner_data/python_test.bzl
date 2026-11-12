@@ -269,7 +269,7 @@ def _fresh_dir_env_impl(ctx):
             parse_test_listing = parse_internal_listing,
             parse_test_result = parse_internal_result_with_details,
             fresh_dir_env = ctx.attrs.fresh_dir_env,
-            **resources
+            **resources,
         ),
     ]
 

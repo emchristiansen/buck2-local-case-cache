@@ -6,12 +6,13 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@nix_toolchains//:rust_protobuf_generate.bzl", "rust_protobuf_generate")
 load("@prelude//utils:buckconfig.bzl", "read_bool")
 # @lint-ignore-every FBCODEBZLADDLOADS
 
 load("@prelude//utils:type_defs.bzl", "is_dict", "is_list", "is_select")
+load("@shim//build_defs:nativelink_mode.bzl", "nativelink_mode")
 load("@shim//build_defs/lib:oss.bzl", "translate_target")
-load("@shim//nix:rust_protobuf_generate.bzl", "rust_protobuf_generate")
 
 prelude = native
 
@@ -252,11 +253,12 @@ def rust_library(
         kwargs = kwargs,
     )
 
-# The remote test profile the `<name>-unittest` targets name. Profiles are
-# declared on toolchains//:remote_test_execution (shim/BUCK);
+# In the explicit NativeLink mode, the remote test profile the `<name>-unittest` targets name.
+# Profiles are declared on toolchains//:remote_test_execution (shim/nix/BUCK);
 # `nativelink_test_result_reuse` requires the worker's build properties plus
 # `muninn-test-runtime=linux-unprivileged-v2` and forbids local execution.
-_RUST_UNITTEST_REMOTE_PROFILE = read_config("shim", "rust_unittest_remote_profile", "nativelink_test_result_reuse")
+def _rust_unittest_remote_profile():
+    return read_config("shim", "rust_unittest_remote_profile", "nativelink_test_result_reuse")
 
 # The prelude's remote per-case route (rust/rust_binary.bzl rust_test_impl,
 # `remote_case_result_reuse`): besides the External provider, each harness offers the
@@ -264,11 +266,12 @@ _RUST_UNITTEST_REMOTE_PROFILE = read_config("shim", "rust_unittest_remote_profil
 # `runner -- BINARY <runner options> --raw-one-case --exact NAME`, reusing a cached result
 # only when the strict parser confirms it as one PASS for that case. The prelude admits it
 # only on `nativelink_test_result_reuse`, so another profile turns it off.
-_RUST_UNITTEST_REMOTE_CASE_RESULT_REUSE = _RUST_UNITTEST_REMOTE_PROFILE == "nativelink_test_result_reuse" and read_bool(
-    "shim",
-    "rust_unittest_remote_case_result_reuse",
-    True,
-)
+def _rust_unittest_remote_case_result_reuse(profile):
+    return profile == "nativelink_test_result_reuse" and read_bool(
+        "shim",
+        "rust_unittest_remote_case_result_reuse",
+        True,
+    )
 
 _RUST_UNITTEST_RUN_ENV = {"HOME": ".", "LC_ALL": "C", "TMPDIR": "."}
 _RUST_UNITTEST_ARGS = ["--project-relative-env", "HOME", "--project-relative-env", "TMPDIR"]
@@ -318,6 +321,23 @@ def _rust_library_unittest(name, edition, rustc_flags, deps, mapped_srcs, resour
     if kwargs.get("test_labels"):
         test_kwargs["labels"] = test_kwargs.get("labels", []) + kwargs["test_labels"]
 
+    if nativelink_mode():
+        profile = _rust_unittest_remote_profile()
+
+        # Muninn's portable rust_test contract (prelude rust/rust_binary.bzl
+        # _rust_test_re_executors), as Muninn's generated targets declare it:
+        # explicit test execution caching, the libtest framework, and HOME and
+        # TMPDIR made project-relative on the worker before any test argument.
+        test_kwargs |= {
+            "args": _RUST_UNITTEST_ARGS,
+            "remote_case_result_reuse": _rust_unittest_remote_case_result_reuse(profile),
+            "remote_execution": profile,
+            "run_env": _RUST_UNITTEST_RUN_ENV,
+            "supports_test_execution_caching": True,
+        }
+
+    # By default the harness is a plain rust_test of the bundled prelude: the same sources,
+    # dependencies and environment, run by libtest itself, as upstream Buck2 runs one.
     prelude.rust_test(
         name = name + "-unittest",
         edition = edition or _default_rust_edition(),
@@ -325,17 +345,8 @@ def _rust_library_unittest(name, edition, rustc_flags, deps, mapped_srcs, resour
         deps = deps + _fix_deps(kwargs.get("test_deps") or []),
         mapped_srcs = mapped_srcs,
         resources = resources,
-        remote_execution = _RUST_UNITTEST_REMOTE_PROFILE,
-        # Muninn's portable rust_test contract (prelude rust/rust_binary.bzl
-        # _rust_test_re_executors), as Muninn's generated targets declare it:
-        # explicit test execution caching, the libtest framework, and HOME and
-        # TMPDIR made project-relative on the worker before any test argument.
-        supports_test_execution_caching = True,
-        remote_case_result_reuse = _RUST_UNITTEST_REMOTE_CASE_RESULT_REUSE,
-        run_env = _RUST_UNITTEST_RUN_ENV,
-        args = _RUST_UNITTEST_ARGS,
         visibility = ["PUBLIC"],
-        **test_kwargs
+        **test_kwargs,
     )
 
 def _merge_env(env, extra):
@@ -449,19 +460,26 @@ def _rust_protobuf_library(
     if proto_srcs:
         build_env["BUCK_PROTO_SRCS"] = "$(location {})".format(proto_srcs)
 
-    # Not prelude.genrule: its script runs under the undeclared host
-    # `/usr/bin/env bash`. This runs the build script through the pinned bash
-    # with nix-manifest.json hidden, with the genrule's cwd, env, OUT and output.
-    rust_protobuf_generate(
-        name = proto_name,
-        srcs = (protos or [])
-        + [
-            "shim//third-party/proto:google_protobuf",
-        ],
-        build_script = ":" + build_name,
-        env = build_env,
-        nix_manifest = "shim//:nix-manifest.json",
-    )
+    proto_inputs = (protos or []) + ["shim//third-party/proto:google_protobuf"]
+    if nativelink_mode():
+        # Not prelude.genrule: its script runs under the undeclared host
+        # `/usr/bin/env bash`. This runs the build script through the pinned bash
+        # with nix-manifest.json hidden, with the genrule's cwd, env, OUT and output.
+        rust_protobuf_generate(
+            name = proto_name,
+            srcs = proto_inputs,
+            build_script = ":" + build_name,
+            env = build_env,
+            nix_manifest = "toolchains//:nix-manifest.json",
+        )
+    else:
+        prelude.genrule(
+            name = proto_name,
+            srcs = proto_inputs,
+            out = ".",
+            cmd = "$(exe :" + build_name + ")",
+            env = build_env,
+        )
 
     new_deps = [
         {
@@ -563,12 +581,12 @@ def _fix_env_value(value):
         end = rest.find(")", start)
         if end < 0:
             break
-        body = rest[start + 2:end]
+        body = rest[start + 2 : end]
         words = body.split(" ")
         if len(words) == 2 and words[0] in _ENV_TARGET_MACROS and words[1]:
             body = words[0] + " " + _fix_env_target(words[1])
         parts.append(rest[:start] + "$(" + body + ")")
-        rest = rest[end + 1:]
+        rest = rest[end + 1 :]
     parts.append(rest)
     return "".join(parts)
 

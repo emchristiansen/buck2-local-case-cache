@@ -10,9 +10,10 @@ internal_cell = fbcode
 stripped_root_dirs = buck2
 
 [project]
-# `prelude` (the engine's own prelude source) is ignored because the decl
-# edition's prelude cell is Muninn's patched prelude (.buckconfig.d/common.buckconfig);
-# the directory's BUCK files only load as the prelude cell itself.
+# `prelude` (the engine's own prelude source) is ignored: its BUCK files load only as the
+# prelude cell itself, which is that directory by default and Muninn's patched prelude in the
+# explicit NativeLink mode (mode/nativelink.buckconfig). It is ignored in both, because buck2
+# reads `project.ignore` only when the daemon starts and a `--config-file` cannot set it.
 ignore = \
     app/buck2_explain, \
     app/buck2_trailcam, \

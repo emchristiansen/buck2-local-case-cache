@@ -391,6 +391,7 @@ mod tests {
             self.0.join(name).to_str().unwrap().to_owned()
         }
 
+        #[cfg(unix)]
         fn dir(&self) -> &std::path::Path {
             &self.0
         }

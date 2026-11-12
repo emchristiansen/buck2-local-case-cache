@@ -17,8 +17,8 @@ def _pinned_executable_impl(ctx):
 pinned_executable = rule(
     impl = _pinned_executable_impl,
     attrs = {
-        "path": attrs.string(),
         "nix_manifest": attrs.source(),
+        "path": attrs.string(),
         "path_env": attrs.option(attrs.string(), default = None),
     },
 )

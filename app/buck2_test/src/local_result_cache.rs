@@ -63,6 +63,7 @@ use std::time::SystemTime;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::DigestAlgorithm;
 use buck2_common::file_ops::metadata::FileDigest;
+use buck2_core::fs::project::ProjectRoot;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::kind::CommandExecutionKind;
 use buck2_execute::execute::output::CommandStdStreams;
@@ -70,7 +71,6 @@ use buck2_execute::execute::request::CommandExecutionRequest;
 use buck2_execute::execute::request::ExecutorPreference;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
-use buck2_core::fs::project::ProjectRoot;
 use buck2_execute_impl::executors::local::determined_local_environment;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
@@ -80,10 +80,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::local_case_closure::InputTree;
-use crate::local_case_fresh_dirs::FreshDirs;
-use crate::local_case_fresh_dirs::ScratchLease;
 use crate::local_case_closure::LaunchFacts;
 use crate::local_case_closure::LaunchPlan;
+use crate::local_case_fresh_dirs::FreshDirs;
+use crate::local_case_fresh_dirs::ScratchLease;
 
 /// Version of the key record, the on-disk layout and the publication protocol. Any change to
 /// what the key covers or how entries are confirmed must change this value.
@@ -112,7 +112,9 @@ impl fmt::Display for LocalCaseGap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NoStoreConfigured => "no [test] local_case_result_cache_root is configured",
-            Self::NotOneExactCase => "the request is not exactly one case without variant or repeat",
+            Self::NotOneExactCase => {
+                "the request is not exactly one case without variant or repeat"
+            }
             Self::LocalResources => "the case requires local resources",
             Self::DeclaredOutputs => "the case declares outputs",
             Self::Worker => "the case runs in a worker",
@@ -291,7 +293,7 @@ pub(crate) struct RequestFacts<'a> {
 
 impl LocalCaseCandidate {
     /// A reusable candidate for one fixed case with its store at `root`, as admission gives it.
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn testing_new(root: String) -> Self {
         Self {
             root,
@@ -364,7 +366,11 @@ impl LocalCaseCandidate {
         };
         let request = request.with_omit_local_invocation_identity_env(true);
         let scratch = fresh_dirs.map(|fresh_dirs| fresh_dirs.absolute().clone());
-        let launch = match Self::launch_plan(&request, &facts, scratch.as_deref().map(AsRef::<AbsPath>::as_ref)) {
+        let launch = match Self::launch_plan(
+            &request,
+            &facts,
+            scratch.as_deref().map(AsRef::<AbsPath>::as_ref),
+        ) {
             Ok(launch) => launch,
             Err(gap) => return (legacy.restore(request), Err(gap)),
         };
@@ -476,13 +482,12 @@ impl ConstrainedCase {
         request: &CommandExecutionRequest,
         prepared: PreparedFacts<'_>,
     ) -> Result<LocalCaseKey, LocalCaseGap> {
-        let environment =
-            determined_local_environment(
-                request,
-                prepared.working_directory,
-                self.scratch.as_deref().map(AsRef::<AbsPath>::as_ref),
-            )
-            .ok_or(LocalCaseGap::InheritedDaemonEnvironment)?;
+        let environment = determined_local_environment(
+            request,
+            prepared.working_directory,
+            self.scratch.as_deref().map(AsRef::<AbsPath>::as_ref),
+        )
+        .ok_or(LocalCaseGap::InheritedDaemonEnvironment)?;
         Ok(LocalCaseKey::new(KeyMaterial {
             engine: engine_identity()?,
             case: &self.case,
@@ -512,6 +517,8 @@ struct KeyMaterial<'a> {
 /// The canonical key record and its digest.
 #[derive(Clone)]
 pub(crate) struct LocalCaseKey {
+    // Read by the host store, which only Linux and macOS have.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     record: Vec<u8>,
     digest: String,
     action_digest: String,
@@ -530,7 +537,10 @@ impl LocalCaseKey {
         record.field("suite", material.case.suite.as_bytes());
         record.field("case", material.case.case.as_bytes());
         record.field("discovery_sha256", material.case.discovery.as_bytes());
-        record.field("action_digest", material.action_digest.to_string().as_bytes());
+        record.field(
+            "action_digest",
+            material.action_digest.to_string().as_bytes(),
+        );
         record.count("argv", material.argv.len());
         for arg in material.argv {
             record.field("arg", arg.as_bytes());
@@ -572,6 +582,7 @@ impl LocalCaseKey {
         &self.action_digest
     }
 
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     fn content_digest(&self, bytes: &[u8]) -> String {
         sha256(bytes)
     }
@@ -678,6 +689,8 @@ pub(crate) struct ReuseProvenance {
     pub(crate) entry_manifest: String,
 }
 
+// The host store's records, which only Linux and macOS have.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum GenerationState {
@@ -686,6 +699,7 @@ enum GenerationState {
     Unsuccessful,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct KeyState {
     schema: String,
@@ -698,6 +712,7 @@ struct KeyState {
     success_generation: Option<u64>,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 impl KeyState {
     fn initial() -> Self {
         Self {
@@ -721,12 +736,14 @@ impl KeyState {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct StreamRecord {
     len: u64,
     digest: String,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct EntryManifest {
     schema: String,
@@ -749,6 +766,7 @@ struct EntryManifest {
 }
 
 /// An execution's exact raw streams and terminal facts, as the executor returned them.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) struct ExecutionRecord {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
@@ -759,9 +777,9 @@ pub(crate) struct ExecutionRecord {
 }
 
 pub(crate) use store::CapturedCase;
-pub(crate) use store::LocalCaseStore;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use store::Lease;
+pub(crate) use store::LocalCaseStore;
 pub(crate) use store::Lookup;
 pub(crate) use store::PendingCase;
 pub(crate) use store::ReusedCase;
@@ -1286,7 +1304,10 @@ mod store {
 
         fn read_required(&self, name: &str) -> buck2_error::Result<Vec<u8>> {
             self.read(name)?.ok_or_else(|| {
-                store_error(format!("Local case result file `{}` is missing", self.child_name(name)))
+                store_error(format!(
+                    "Local case result file `{}` is missing",
+                    self.child_name(name)
+                ))
             })
         }
 
@@ -1483,7 +1504,11 @@ mod store {
             let lock_name = component("lock")?;
             let fd = dir.openat(
                 &lock_name,
-                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
                 0o600,
             );
             if fd < 0 {
@@ -1543,8 +1568,8 @@ mod store {
             match self.dir.read("state.json")? {
                 None => Ok(KeyState::initial()),
                 Some(bytes) => {
-                    let state: KeyState = serde_json::from_slice(&bytes)
-                        .with_buck_error_context(|| {
+                    let state: KeyState =
+                        serde_json::from_slice(&bytes).with_buck_error_context(|| {
                             format!("Parsing `{}`", self.dir.child_name("state.json"))
                         })?;
                     if state.schema != LOCAL_CASE_RESULT_SCHEMA {
@@ -1596,8 +1621,7 @@ mod store {
                 ("stdout", &stdout, &manifest.stdout),
                 ("stderr", &stderr, &manifest.stderr),
             ] {
-                if bytes.len() as u64 != record.len || key.content_digest(bytes) != record.digest
-                {
+                if bytes.len() as u64 != record.len || key.content_digest(bytes) != record.digest {
                     return Err(store_error(format!(
                         "Local case {name} in `{}` does not match its manifest",
                         entry.name
@@ -1876,10 +1900,12 @@ mod store {
                 .attempt
                 .take()
                 .internal_error("captured local case was already settled")?;
-            match attempt
-                .guard
-                .publish(attempt.generation, &attempt.origin, &self.original, confirmed)
-            {
+            match attempt.guard.publish(
+                attempt.generation,
+                &attempt.origin,
+                &self.original,
+                confirmed,
+            ) {
                 Ok(provenance) => Ok(provenance),
                 Err(e) => {
                     let _ignored = attempt.guard.settle_unsuccessful(
@@ -1996,11 +2022,14 @@ mod store {
     pub(crate) struct CapturedCase(Never);
     pub(crate) struct ReusedCase(Never);
 
+    // The rest of the store's API, which nothing reaches here because `open` always fails.
+    #[allow(dead_code)]
     pub(crate) enum Lease {
         Held(KeyGuard),
         Busy,
     }
 
+    #[allow(dead_code)]
     pub(crate) enum Lookup {
         Hit(ReusedCase),
         Miss(KeyGuard),
@@ -2041,6 +2070,7 @@ mod store {
     }
 
     impl CapturedCase {
+        #[allow(dead_code)]
         pub(crate) fn original(&self) -> &ExecutionRecord {
             match self.0 {}
         }
@@ -2048,6 +2078,13 @@ mod store {
             match self.0 {}
         }
         pub(crate) fn reject(self, _reason: &str) -> buck2_error::Result<()> {
+            match self.0 {}
+        }
+    }
+
+    // Dropping a reused case releases its lease, as on the platforms with the store.
+    impl Drop for ReusedCase {
+        fn drop(&mut self) {
             match self.0 {}
         }
     }
@@ -2062,6 +2099,7 @@ mod store {
         pub(crate) fn stderr(&self) -> &[u8] {
             match self.0 {}
         }
+        #[allow(dead_code)]
         pub(crate) fn generation(&self) -> u64 {
             match self.0 {}
         }
@@ -2267,7 +2305,10 @@ mod tests {
         let Seen::Miss(guard) = look(&store, &key) else {
             panic!()
         };
-        let captured = guard.begin("unconfirmed").unwrap().capture(original(b"out", b""));
+        let captured = guard
+            .begin("unconfirmed")
+            .unwrap()
+            .capture(original(b"out", b""));
         assert_eq!(captured.original().stdout, b"out");
         captured.reject("parser returned 0 results").unwrap();
         assert!(matches!(look(&store, &key), Seen::Miss(_)));
@@ -2685,7 +2726,9 @@ mod tests {
         // Two keys of one case: the second differs only in an unrelated variable.
         let key = Material::new().key();
         let mut other = Material::new();
-        other.env.push((OsString::from("OTHER"), OsString::from("1")));
+        other
+            .env
+            .push((OsString::from("OTHER"), OsString::from("1")));
         let other = other.key();
         assert_ne!(key.digest(), other.digest());
 
@@ -3009,7 +3052,8 @@ mod tests {
         };
 
         let args = vec![script, "module::case"];
-        let (constrained, case) = candidate().constrain(make(args.clone()), facts(), None, |_| true);
+        let (constrained, case) =
+            candidate().constrain(make(args.clone()), facts(), None, |_| true);
         let case = case.expect("the case is eligible before its launch check");
         assert_eq!(
             constrained.executor_preference(),
@@ -3219,7 +3263,9 @@ mod tests {
             changed.push((name, m.key()));
         };
         push("case", &|m| m.case.case = "module::other".to_owned());
-        push("target", &|m| m.case.target = "root//pkg:other (cfg)".to_owned());
+        push("target", &|m| {
+            m.case.target = "root//pkg:other (cfg)".to_owned()
+        });
         push("suite", &|m| m.case.suite = "root//pkg:other".to_owned());
         push("discovery", &|m| m.case.discovery = "changed".to_owned());
         push("action", &|m| m.action = "changed".to_owned());
@@ -3250,7 +3296,7 @@ mod tests {
         });
 
         assert_eq!(base.digest(), Material::new().key().digest());
-        let mut digests = std::collections::HashSet::new();
+        let mut digests = buck2_hash::BuckMutSet::default();
         digests.insert(base.digest().to_owned());
         for (name, key) in &changed {
             assert!(
@@ -3286,10 +3332,9 @@ mod tests {
             }),
             ("fifo stdout", &|entry| {
                 std::fs::remove_file(entry.join("stdout")).unwrap();
-                let path = std::ffi::CString::new(
-                    entry.join("stdout").as_os_str().as_encoded_bytes(),
-                )
-                .unwrap();
+                let path =
+                    std::ffi::CString::new(entry.join("stdout").as_os_str().as_encoded_bytes())
+                        .unwrap();
                 // SAFETY: valid path.
                 assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
             }),
@@ -3416,15 +3461,33 @@ mod tests {
             LocalCaseAdmission::Refused(LocalCaseGap::NoDiscoveryIdentity)
         ));
         assert!(matches!(
-            admit(&testing(vec!["a", "b"], None), true, false, Some("/r"), Some(&discovery)),
+            admit(
+                &testing(vec!["a", "b"], None),
+                true,
+                false,
+                Some("/r"),
+                Some(&discovery)
+            ),
             LocalCaseAdmission::Refused(LocalCaseGap::NotOneExactCase)
         ));
         assert!(matches!(
-            admit(&testing(vec![], None), true, false, Some("/r"), Some(&discovery)),
+            admit(
+                &testing(vec![], None),
+                true,
+                false,
+                Some("/r"),
+                Some(&discovery)
+            ),
             LocalCaseAdmission::Refused(LocalCaseGap::NotOneExactCase)
         ));
         assert!(matches!(
-            admit(&testing(vec!["a"], Some("v")), true, false, Some("/r"), Some(&discovery)),
+            admit(
+                &testing(vec!["a"], Some("v")),
+                true,
+                false,
+                Some("/r"),
+                Some(&discovery)
+            ),
             LocalCaseAdmission::Refused(LocalCaseGap::NotOneExactCase)
         ));
         let listing = TestStage::Listing {

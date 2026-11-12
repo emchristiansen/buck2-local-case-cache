@@ -82,6 +82,26 @@ jobs:
         prefix-key: buck2-test
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    # The unix tests that launch a shell need the declared shell, a canonical Nix store bash with
+    # `sh` beside it (app/buck2_test/src/testing.rs); there is no fallback to a host shell.
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      if: runner.os != 'Windows'
+    - name: Provide the declared shell
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        out=$(nix build --no-link --print-out-paths '.#ci-test-shell^out')
+        shell=$(realpath "$out/bin/bash")
+        if [[ "$shell" != /nix/store/* || "$shell" != "$out/bin/bash" ]]; then
+          echo "::error::the declared shell $out/bin/bash is not a canonical Nix store path ($shell)"
+          exit 1
+        fi
+        if [[ ! -x "$out/bin/sh" ]]; then
+          echo "::error::the declared shell's store directory has no executable sh: $out/bin"
+          exit 1
+        fi
+        echo "BUCK2_TEST_DECLARED_SHELL=$shell" >> "$GITHUB_ENV"
     - name: Run the tests
       run: python3 test.py --ci --git --test-only
       shell: bash

@@ -30,6 +30,12 @@
     };
 
     in {
+      # The declared shell for Cargo test runs in CI: the non-interactive bash of this flake's
+      # locked nixpkgs, as the pinned bash is, whose `out` directory also holds `sh`. The workflow
+      # exports its canonical path as BUCK2_TEST_DECLARED_SHELL; under Buck, the tests use the
+      # pinned bash instead.
+      packages.ci-test-shell = pkgs.bashNonInteractive;
+
       devShells.default = pkgs.mkShell {
         buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux ([
           pkgs.mold

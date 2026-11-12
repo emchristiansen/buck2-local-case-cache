@@ -1012,7 +1012,9 @@ pub(crate) fn self_contained_function_source<'v>(
     let codemap = &info.codemap.as_ref().0;
     let filename = codemap.filename();
     if !def.captured.is_empty() {
-        return Err(format!("`{name}` in `{filename}` captures enclosing values"));
+        return Err(format!(
+            "`{name}` in `{filename}` captures enclosing values"
+        ));
     }
     let module = def
         .module
@@ -1020,8 +1022,12 @@ pub(crate) fn self_contained_function_source<'v>(
         .ok_or_else(|| format!("`{name}` in `{filename}` is not frozen in its module"))?;
     let module = &module.as_ref().value;
 
-    let ast = AstModule::parse(filename, codemap.source().to_owned(), &Dialect::AllOptionsInternal)
-        .map_err(|e| format!("`{filename}` does not parse: {e}"))?;
+    let ast = AstModule::parse(
+        filename,
+        codemap.source().to_owned(),
+        &Dialect::AllOptionsInternal,
+    )
+    .map_err(|e| format!("`{filename}` does not parse: {e}"))?;
     let top = match &ast.statement().node {
         StmtP::Statements(stmts) => stmts.iter().collect::<Vec<_>>(),
         _ => vec![ast.statement()],
@@ -1061,13 +1067,17 @@ pub(crate) fn self_contained_function_source<'v>(
     for (bound, bound_value) in module.all_items() {
         let bound = bound.as_str();
         if !defs.contains(&bound) {
-            return Err(format!("`{filename}` binds `{bound}`, which it does not `def`"));
+            return Err(format!(
+                "`{filename}` binds `{bound}`, which it does not `def`"
+            ));
         }
-        let bound_def = bound_value.downcast_ref::<Def>().ok_or_else(|| {
-            format!("`{bound}` in `{filename}` is not a user-defined function")
-        })?;
+        let bound_def = bound_value
+            .downcast_ref::<Def>()
+            .ok_or_else(|| format!("`{bound}` in `{filename}` is not a user-defined function"))?;
         if bound_def.def_info.value.codemap.as_ref().0.filename() != filename {
-            return Err(format!("`{bound}` in `{filename}` is defined in another file"));
+            return Err(format!(
+                "`{bound}` in `{filename}` is defined in another file"
+            ));
         }
         if bound == name && bound_value.ptr_eq(value) {
             bound_self = true;

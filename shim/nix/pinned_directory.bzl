@@ -22,9 +22,9 @@ def _pinned_directory_copy_impl(ctx):
 pinned_directory_copy = rule(
     impl = _pinned_directory_copy_impl,
     attrs = {
+        "nix_manifest": attrs.source(),
         # A PINNED_TOOLS directory artifact's exact store path.
         "path": attrs.string(),
-        "nix_manifest": attrs.source(),
         "script": attrs.source(),
         # Each subpath copied, by its exact type; each is a sub-target of that name.
         "subpaths": attrs.dict(attrs.string(), attrs.enum(["directory", "file"])),

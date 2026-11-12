@@ -2217,7 +2217,7 @@ pub(crate) mod state_machine {
 
     /// Whether `create_dir` failed because the filesystem stores only UTF-8 names: Linux
     /// reports that, for ZFS with `utf8only=on`, as EILSEQ.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn is_utf8only_refusal(e: &std::io::Error) -> bool {
         // EILSEQ in Linux's <asm-generic/errno.h>.
         #[cfg(target_os = "linux")]

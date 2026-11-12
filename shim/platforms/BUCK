@@ -23,15 +23,15 @@ execution_platform(
 remote_execution_platform(
     name = "remote_linux",
     cpu_configuration = "prelude//cpu:x86_64",
-    os_configuration = "prelude//os:linux",
     fetch_platform = ":remote_fetch_linux",
+    os_configuration = "prelude//os:linux",
     visibility = ["PUBLIC"],
 )
 
 remote_fetch_execution_platform(
     name = "remote_fetch_linux",
     cpu_configuration = "prelude//cpu:x86_64",
-    os_configuration = "prelude//os:linux",
     fetch_constraint = "prelude//git/tools:fetch_runtime_available",
+    os_configuration = "prelude//os:linux",
     visibility = ["PUBLIC"],
 )

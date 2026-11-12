@@ -17,12 +17,6 @@ rust_library(
             },
         },
     },
-    # The declared shell for this crate's launch-check fixtures (src/testing.rs
-    # DECLARED_SHELL): the pinned bash's exact store path, with the Nix manifest of its
-    # closure as a hidden input, never a host shell such as /bin/sh.
-    test_env = {
-        "BUCK2_TEST_DECLARED_SHELL": "$(exe toolchains//:archive_shell)",
-    },
     test_deps = [
         "fbsource//third-party/rust:indoc",
         "fbsource//third-party/rust:maplit",
@@ -36,6 +30,12 @@ rust_library(
         "//buck2/app/buck2_settings:buck2_settings",
         "//buck2/app/buck2_transition:buck2_transition",
     ],
+    # The declared shell for this crate's launch-check fixtures (src/testing.rs
+    # DECLARED_SHELL): the pinned bash's exact store path, with the Nix manifest of its
+    # closure as a hidden input, never a host shell such as /bin/sh.
+    test_env = {
+        "BUCK2_TEST_DECLARED_SHELL": "$(exe toolchains//:archive_shell)",
+    },
     deps = [
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:derive_more",

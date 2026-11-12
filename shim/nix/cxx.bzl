@@ -1,8 +1,8 @@
 """Local Linux/Clang toolchains backed by exact Nix store executable paths."""
 
-load("@prelude//toolchains:cxx.bzl", "CxxToolsInfo")
 load("@prelude//cxx:cxx_toolchain_types.bzl", "BinaryUtilitiesInfo", "CxxPlatformInfo", "CxxToolchainInfo", "LinkerInfo", "LinkerType")
 load("@prelude//cxx:linker.bzl", "LINKERS")
+load("@prelude//toolchains:cxx.bzl", "CxxToolsInfo")
 
 def _pinned_cxx_tools_impl(ctx):
     return [
@@ -24,85 +24,89 @@ pinned_cxx_tools = rule(
     impl = _pinned_cxx_tools_impl,
     attrs = {
         "linker_type": attrs.enum(LinkerType.values()),
-    } | {
-        name: attrs.exec_dep(providers = [RunInfo])
-        for name in ["cc", "cxx", "ar"]
-    },
+    }
+    | {name: attrs.exec_dep(providers = [RunInfo]) for name in ["cc", "cxx", "ar"]},
 )
 
 def _pinned_cxx_toolchain_impl(ctx):
     base = ctx.attrs.template[CxxToolchainInfo]
-    fields = {name: getattr(base, name) for name in [
-        "internal_tools",
-        "linker_info",
-        "bolt_enabled",
-        "cxx_compiler_info",
-        "c_compiler_info",
-        "as_compiler_info",
-        "asm_compiler_info",
-        "cvtres_compiler_info",
-        "rc_compiler_info",
-        "header_mode",
-        "cpp_dep_tracking_mode",
-        "pic_behavior",
-        "llvm_link",
-        "use_dep_files",
-        "runtime_dependency_handling",
-    ]}
-    linker_fields = {name: getattr(base.linker_info, name) for name in [
-        "archiver",
-        "archiver_flags",
-        "archiver_reads_inputs",
-        "archiver_supports_argfiles",
-        "archiver_type",
-        "archive_contents",
-        "archive_objects_locally",
-        "archive_symbol_table",
-        "binary_extension",
-        "dist_thin_lto_codegen_flags",
-        "extra_outputs",
-        "generate_linker_maps",
-        "generate_gc_sections",
-        "link_binaries_locally",
-        "link_libraries_locally",
-        "link_style",
-        "link_weight",
-        "link_ordering",
-        "linker",
-        "linker_flags",
-        "executable_linker_flags",
-        "binary_linker_flags",
-        "link_metadata_flag",
-        "lto_mode",
-        "mk_shlib_intf",
-        "object_file_extension",
-        "post_linker_flags",
-        "runtime_library_files",
-        "sanitizer_runtime_enabled",
-        "sanitizer_runtime_files",
-        "shlib_interfaces",
-        "shared_dep_runtime_ld_flags",
-        "shared_library_name_default_prefix",
-        "shared_library_name_format",
-        "shared_library_versioned_name_format",
-        "static_dep_runtime_ld_flags",
-        "static_library_extension",
-        "static_pic_dep_runtime_ld_flags",
-        "requires_archives",
-        "requires_objects",
-        "supports_distributed_thinlto",
-        "independent_shlib_interface_linker_flags",
-        "thin_lto_premerger_enabled",
-        "thin_lto_double_codegen_enabled",
-        "type",
-        "use_archiver_flags",
-        "force_full_hybrid_if_capable",
-        "is_pdb_generated",
-        "push_pop_state_flags",
-        "supports_content_based_paths_for_archiving",
-        "incremental_linking",
-        "supports_shared_libraries",
-    ]}
+    fields = {
+        name: getattr(base, name)
+        for name in [
+            "internal_tools",
+            "linker_info",
+            "bolt_enabled",
+            "cxx_compiler_info",
+            "c_compiler_info",
+            "as_compiler_info",
+            "asm_compiler_info",
+            "cvtres_compiler_info",
+            "rc_compiler_info",
+            "header_mode",
+            "cpp_dep_tracking_mode",
+            "pic_behavior",
+            "llvm_link",
+            "use_dep_files",
+            "runtime_dependency_handling",
+        ]
+    }
+    linker_fields = {
+        name: getattr(base.linker_info, name)
+        for name in [
+            "archiver",
+            "archiver_flags",
+            "archiver_reads_inputs",
+            "archiver_supports_argfiles",
+            "archiver_type",
+            "archive_contents",
+            "archive_objects_locally",
+            "archive_symbol_table",
+            "binary_extension",
+            "dist_thin_lto_codegen_flags",
+            "extra_outputs",
+            "generate_linker_maps",
+            "generate_gc_sections",
+            "link_binaries_locally",
+            "link_libraries_locally",
+            "link_style",
+            "link_weight",
+            "link_ordering",
+            "linker",
+            "linker_flags",
+            "executable_linker_flags",
+            "binary_linker_flags",
+            "link_metadata_flag",
+            "lto_mode",
+            "mk_shlib_intf",
+            "object_file_extension",
+            "post_linker_flags",
+            "runtime_library_files",
+            "sanitizer_runtime_enabled",
+            "sanitizer_runtime_files",
+            "shlib_interfaces",
+            "shared_dep_runtime_ld_flags",
+            "shared_library_name_default_prefix",
+            "shared_library_name_format",
+            "shared_library_versioned_name_format",
+            "static_dep_runtime_ld_flags",
+            "static_library_extension",
+            "static_pic_dep_runtime_ld_flags",
+            "requires_archives",
+            "requires_objects",
+            "supports_distributed_thinlto",
+            "independent_shlib_interface_linker_flags",
+            "thin_lto_premerger_enabled",
+            "thin_lto_double_codegen_enabled",
+            "type",
+            "use_archiver_flags",
+            "force_full_hybrid_if_capable",
+            "is_pdb_generated",
+            "push_pop_state_flags",
+            "supports_content_based_paths_for_archiving",
+            "incremental_linking",
+            "supports_shared_libraries",
+        ]
+    }
     if sorted(linker_fields) != sorted(dir(base.linker_info)):
         fail("Pinned LinkerInfo forwarding fields differ from the provider schema")
     # The template names shared libraries `{}.so` on every non-Windows OS;
@@ -136,9 +140,7 @@ pinned_cxx_toolchain = rule(
     impl = _pinned_cxx_toolchain_impl,
     attrs = {
         "template": attrs.toolchain_dep(providers = [CxxToolchainInfo, CxxPlatformInfo]),
-    } | {
-        name: attrs.exec_dep(providers = [RunInfo])
-        for name in ["nm", "objcopy", "objdump", "ranlib", "strip", "llvm_link"]
-    },
+    }
+    | {name: attrs.exec_dep(providers = [RunInfo]) for name in ["nm", "objcopy", "objdump", "ranlib", "strip", "llvm_link"]},
     is_toolchain_rule = True,
 )

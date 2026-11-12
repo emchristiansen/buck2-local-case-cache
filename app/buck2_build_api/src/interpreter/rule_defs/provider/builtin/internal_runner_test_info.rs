@@ -296,8 +296,10 @@ impl<'v> InternalRunnerTestInfo<'v> {
                 source.source
             ))
         }
-        Ok(callable("parse_test_listing", self.parse_test_listing.get())?
-            + &callable("parse_test_result", self.parse_test_result.get())?)
+        Ok(
+            callable("parse_test_listing", self.parse_test_listing.get())?
+                + &callable("parse_test_result", self.parse_test_result.get())?,
+        )
     }
 
     pub fn default_executor(&self) -> Option<&'v StarlarkCommandExecutorConfig> {

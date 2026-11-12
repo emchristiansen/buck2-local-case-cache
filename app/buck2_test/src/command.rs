@@ -116,13 +116,13 @@ use futures::stream::TryStreamExt;
 use itertools::Itertools;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::internal_runner::InternalTestOrchestrator;
 use crate::downward_api::BuckTestDownwardApi;
 use crate::executor_launcher::ExecutorLaunch;
 use crate::executor_launcher::ExecutorLauncher;
 use crate::executor_launcher::ExecutorOutput;
 use crate::executor_launcher::OutOfProcessTestExecutor;
 use crate::executor_launcher::TestExecutorClientWrapper;
+use crate::internal_runner::InternalTestOrchestrator;
 use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::orchestrator::BuckTestOrchestrator;
 use crate::orchestrator::ExecutorMessage;

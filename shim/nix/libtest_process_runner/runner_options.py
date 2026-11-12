@@ -22,6 +22,9 @@ class RunnerOptions:
     # `--declared-skip-substring WORD`: tests whose name contains one of these
     # substrings are left out. Never passed to libtest.
     declared_skip_substrings: tuple[str, ...]
+    # `--declared-ignored NAME`: a target's own exact names of ignored tests, which run
+    # with libtest's `--include-ignored`; every other ignored test stays reported ignored.
+    declared_ignored: tuple[str, ...]
     # `--project-relative-env NAME`: variables whose project-relative path value
     # every test process and listing receives absolute.
     project_relative_env: tuple[str, ...]
@@ -36,6 +39,9 @@ class RunnerOptions:
     # `--path-prefix-of-exe PATH`: an absolute executable whose directory is put first on
     # the PATH of every process the runner starts; `None` leaves PATH as inherited.
     path_prefix_of_exe: str | None
+    # `--spawn-inputs-witness`: after each case, write its final spawn inputs bound to its
+    # outcome as one stderr line (spawn_inputs_witness). Off unless the route sets it.
+    spawn_inputs_witness: bool
     ignored_mode: _IgnoredMode
     # `--nocapture` or `--show-output`: print passing tests' output too.
     show_output: bool

@@ -241,8 +241,7 @@ def parse_result(stdout, stderr, exit_code):
     /// A self-contained libtest parser module is admitted, with an identity that is its source
     /// and that does not depend on the configuration, and it still parses a libtest case.
     #[test]
-    fn self_contained_parser_identity_admits_generic_libtest_parsers() -> buck2_error::Result<()>
-    {
+    fn self_contained_parser_identity_admits_generic_libtest_parsers() -> buck2_error::Result<()> {
         let mut identities = Vec::new();
         for config in [None, Some("[probe]\nstatus = FAIL\n")] {
             let info = provider_with_parsers(
@@ -824,7 +823,11 @@ def parse_result(stdout, stderr, exit_code):
         "#
         ))?;
         assert_eq!(
-            info.as_ref().value().as_ref().fresh_dir_env().collect::<Vec<_>>(),
+            info.as_ref()
+                .value()
+                .as_ref()
+                .fresh_dir_env()
+                .collect::<Vec<_>>(),
             ["TMPDIR", "HOME", "_X9"]
         );
         let info = freeze_provider(indoc!(
@@ -1782,7 +1785,7 @@ external = _cases(_external)
             .finalize_with_execution_groups(
                 BuckFixedSortedMap::new(),
                 vec![ExecutionGroupResolutionPartial {
-                    group: NamedExecutionGroup::new("TestRun".to_owned(), cell_path.clone()),
+                    group: NamedExecutionGroup::new("TestRun".to_owned(), cell_path),
                     partial: ExecutionPlatformResolutionPartial::new(Some(platform()), Vec::new()),
                     exec_dep_cfgs: BuckFixedSortedMap::new(),
                 }],

@@ -37,17 +37,19 @@ def _engine_pinned_rust_toolchain_impl(ctx):
             nightly_features = True,
             doctests = False,
             rustc_env = {
-                "PATH": PINNED_NIX_PATH,
                 "CARGO": PINNED_TOOLS["cargo"]["path"],
+                "PATH": PINNED_NIX_PATH,
             },
             rustdoc_env = {"PATH": PINNED_NIX_PATH},
             trial_nix_manifest = ctx.attrs.nix_manifest,
             local_case_env = {"PATH": PINNED_NIX_PATH},
-            test_process_runner = RunInfo(args = cmd_args(
-                ctx.attrs.test_process_runner[RunInfo],
-                ["--per-test-timeout-seconds", ctx.attrs.per_test_timeout_seconds] if ctx.attrs.per_test_timeout_seconds != None else [],
-                "--",
-            )),
+            test_process_runner = RunInfo(
+                args = cmd_args(
+                    ctx.attrs.test_process_runner[RunInfo],
+                    ["--per-test-timeout-seconds", ctx.attrs.per_test_timeout_seconds] if ctx.attrs.per_test_timeout_seconds != None else [],
+                    "--",
+                )
+            ),
         ),
     ]
 

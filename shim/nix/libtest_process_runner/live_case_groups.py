@@ -1,6 +1,8 @@
-"""The process groups of running tests, so a signal to the runner reaches every one of them."""
+"""The process groups of running tests, so a signal to the runner reaches every one of them
+and nothing a test leaves running in its group outlives it."""
 
 import os as _os
+import signal as _signal
 import subprocess as _subprocess
 import threading as _threading
 from collections.abc import Callable as _Callable
@@ -24,8 +26,16 @@ class LiveCaseGroups:
             return process
 
     def finish(self, process: _subprocess.Popen) -> None:
+        # Called before the test is reaped, so its group id cannot yet be reused: whatever
+        # the test left running in its group (a server its fixture started, whose own
+        # cleanup an abort skipped) is killed here, never forgotten with the group.
         with self._lock:
             self._groups.remove(process.pid)
+            try:
+                _os.killpg(process.pid, _signal.SIGKILL)
+            except ProcessLookupError:
+                # Every member of this group has already exited and been reaped.
+                pass
 
     def stop_all(self, signal_number: int) -> None:
         with self._lock:
