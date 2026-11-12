@@ -9,4 +9,7 @@
 load("@prelude//rust:clippy_configuration.bzl", native_clippy_configuration = "clippy_configuration")
 
 def clippy_configuration(name, clippy_toml_src, **kwargs):
+    # The NativeLink decl edition analyses with Muninn's prelude, whose rule
+    # requires `toml_merge_tool`; see toolchains//:clippy_toml_merge_undeclared.
+    kwargs.setdefault("toml_merge_tool", "toolchains//:clippy_toml_merge_undeclared")
     native_clippy_configuration(name = name, clippy_toml_src = clippy_toml_src, **kwargs)

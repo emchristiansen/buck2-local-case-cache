@@ -10,6 +10,9 @@ internal_cell = fbcode
 stripped_root_dirs = buck2
 
 [project]
+# `prelude` (the engine's own prelude source) is ignored because the decl
+# edition's prelude cell is Muninn's patched prelude (.buckconfig.d/common.buckconfig);
+# the directory's BUCK files only load as the prelude cell itself.
 ignore = \
     app/buck2_explain, \
     app/buck2_trailcam, \
@@ -19,7 +22,8 @@ ignore = \
     tests, \
     .jj, \
     .git, \
-    target
+    target, \
+    prelude
 
 [rust]
 default_edition = 2024

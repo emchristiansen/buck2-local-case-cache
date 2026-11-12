@@ -2428,6 +2428,9 @@ fn executor_stage_name(st: &buck2_data::ExecutorStageStart) -> &'static str {
         Some(Stage::CacheQuery(..)) => "CacheQuery",
         Some(Stage::CacheHit(..)) => "CacheHit",
         Some(Stage::Prepare(..)) => "Prepare",
+        Some(Stage::LocalTestResultCacheQuery(..)) => "LocalTestResultCacheQuery",
+        Some(Stage::LocalTestResultCache(..)) => "LocalTestResultCache",
+        Some(Stage::UnmarkedLogStage(..)) => "UnmarkedLogStage",
         None => "?",
     }
 }
@@ -4054,6 +4057,7 @@ mod tests {
                         working_dir: String::new(),
                         trace_id: crate::ingest::testlog::RUN_ID.parse().unwrap(),
                         start_time: None,
+                        muninn_event_schema: None,
                     };
                     let scan = runtime
                         .block_on(scan_input(invocation, input, phases))
@@ -4141,6 +4145,9 @@ mod tests {
             Executor::CacheQuery(Default::default()),
             Executor::CacheHit(Default::default()),
             Executor::Prepare(Default::default()),
+            Executor::LocalTestResultCacheQuery(Default::default()),
+            Executor::LocalTestResultCache(Default::default()),
+            Executor::UnmarkedLogStage(Default::default()),
         ] {
             check(buck2_data::ExecutorStageStart { stage: Some(stage) });
         }

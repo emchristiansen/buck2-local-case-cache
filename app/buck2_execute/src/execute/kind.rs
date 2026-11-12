@@ -69,6 +69,9 @@ pub enum CommandExecutionKind {
         /// was passed to build options
         materialized_outputs_for_failed_actions: Option<Vec<ProjectRelativePathBuf>>,
         origin: RemoteExecutionOrigin,
+        /// Which `Execute` request the service answered (see `ReExecute.submission`), if the
+        /// remote execution client reported it and the service answered.
+        submission: Option<u32>,
     },
     /// This action was served by the action cache and not executed.
     #[display("action_cache")]
@@ -186,6 +189,7 @@ impl CommandExecutionKind {
                 materialized_inputs_for_failed,
                 materialized_outputs_for_failed_actions,
                 origin,
+                submission,
             } => Command::RemoteCommand(buck2_data::RemoteCommand {
                 action_digest: details.action_digest.to_string(),
                 cache_hit: false,
@@ -214,6 +218,7 @@ impl CommandExecutionKind {
                     })
                     .unwrap_or_default(),
                 re_worker: None,
+                submission: *submission,
             }),
             Self::ActionCache { details } => Command::RemoteCommand(buck2_data::RemoteCommand {
                 action_digest: details.action_digest.to_string(),
@@ -225,6 +230,7 @@ impl CommandExecutionKind {
                 materialized_inputs_for_failed: Vec::new(),
                 materialized_outputs_for_failed_actions: Vec::new(),
                 re_worker: None,
+                submission: None,
             }),
 
             Self::RemoteDepFileCache { details } => {
@@ -241,6 +247,7 @@ impl CommandExecutionKind {
                     materialized_inputs_for_failed: Vec::new(),
                     materialized_outputs_for_failed_actions: Vec::new(),
                     re_worker: None,
+                    submission: None,
                 })
             }
 

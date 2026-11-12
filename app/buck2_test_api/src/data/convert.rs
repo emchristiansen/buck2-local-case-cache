@@ -421,12 +421,22 @@ impl TryInto<buck2_test_proto::TestResult> for TestResult {
 
         // The external test runner protocol has no reuse provenance; refuse to present a reused
         // result as a fresh one.
-        if let TestResultOrigin::Reused(reused) = &self.origin {
-            return Err(buck2_error::internal_error!(
-                "Reused test result `{}` (origin attempt `{}`) cannot be sent over the test runner protocol",
-                self.name,
-                reused.origin_attempt
-            ));
+        match &self.origin {
+            TestResultOrigin::Fresh => {}
+            TestResultOrigin::Reused(reused) => {
+                return Err(buck2_error::internal_error!(
+                    "Reused test result `{}` (origin attempt `{}`) cannot be sent over the test runner protocol",
+                    self.name,
+                    reused.origin_attempt
+                ));
+            }
+            TestResultOrigin::RemoteReused(reused) => {
+                return Err(buck2_error::internal_error!(
+                    "Remotely reused test result `{}` (action `{}`) cannot be sent over the test runner protocol",
+                    self.name,
+                    reused.action_digest
+                ));
+            }
         }
 
         Ok(buck2_test_proto::TestResult {

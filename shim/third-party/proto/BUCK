@@ -5,24 +5,25 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-# @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
-load(":defs.bzl", "protoc_distribution")
-
-protoc_distribution(
-    name = "distribution",
-    version = "21.4",
-)
+# NativeLink engine build (decl-d2 edition): protoc and the well-known-type
+# include root are pinned Nix tools, nixpkgs protobuf_21 21.12
+# (toolchains//:protoc, toolchains//:protobuf_well_known_types; see
+# nix/pinned_tools.bzl), each carrying nix/nix-manifest.json as a hidden input.
+# They replace protoc_distribution(version = "21.4"), whose prebuilt
+# bin/protoc requests the interpreter /lib64/ld-linux-x86-64.so.2, absent on
+# the NativeLink v2 worker. defs.bzl, releases.bzl and update.py stay for the
+# upstream producers but no target here uses them.
 
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 alias(
     name = "protoc",
-    actual = ":distribution[protoc]",
+    actual = "toolchains//:protoc",
     visibility = ["PUBLIC"],
 )
 
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 alias(
     name = "google_protobuf",
-    actual = ":distribution[google_protobuf]",
+    actual = "toolchains//:protobuf_well_known_types[include]",
     visibility = ["PUBLIC"],
 )

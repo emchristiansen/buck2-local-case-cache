@@ -304,6 +304,10 @@ pub struct ExecuteWithProgressResponse {
     pub stage: Stage,
     pub execute_response: Option<ExecuteResponse>,
     pub metadata: OperationMetadata,
+    /// Which `Execute` request of this progress stream reported this, counted from 1. The stream
+    /// sends another when it starts the action over; resuming an operation with `WaitExecution`
+    /// is not another request. `None` if the stream does not count them.
+    pub submission: Option<u32>,
 }
 
 #[derive(Clone, Debug, Dupe, Default)]

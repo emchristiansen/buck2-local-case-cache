@@ -39,8 +39,15 @@ tokio-stream.workspace = true
 variant_name.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
+buck2_build_signals.workspace = true
+buck2_core.workspace = true
+buck2_execute.workspace = true
 prost.workspace = true
+re_grpc_proto.workspace = true
+remote_execution.workspace = true
 tempfile.workspace = true
+tonic.workspace = true
 zstd.workspace = true
 
 [lints]

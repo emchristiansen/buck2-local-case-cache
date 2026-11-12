@@ -102,6 +102,28 @@ fn convert_test_result_origin(
             entry_manifest,
             current_attempt,
             current_execution_time: current_execution_time.try_into().ok(),
+            // A host-local entry has no remote provenance: `served_by` stays absent.
+            action_digest: String::new(),
+            served_by: None,
+            original_execution_time: None,
+        })),
+        // The original execution's time goes to `original_execution_time`; only this run's own
+        // interval is `current_execution_time`, and an unreported one stays unset (unknown).
+        buck2_test_api::data::TestResultOrigin::RemoteReused(
+            buck2_test_api::data::RemoteReusedTestResult {
+                action_digest,
+                served_by,
+                original_execution_time,
+                current_execution_time,
+            },
+        ) => Some(Box::new(buck2_data::TestResultReuse {
+            origin_attempt: String::new(),
+            entry_manifest: String::new(),
+            current_attempt: String::new(),
+            current_execution_time: current_execution_time.and_then(|d| d.try_into().ok()),
+            action_digest,
+            served_by: Some(served_by.to_proto() as i32),
+            original_execution_time: original_execution_time.try_into().ok(),
         })),
     }
 }
@@ -243,6 +265,9 @@ mod tests {
                 entry_manifest: "entry-manifest".to_owned(),
                 current_attempt: "current-attempt".to_owned(),
                 current_execution_time: Some(Duration::ZERO.try_into()?),
+                action_digest: String::new(),
+                served_by: None,
+                original_execution_time: None,
             }))
         );
         // Everything but the provenance is the parsed entry, unchanged.

@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1622,7 +1623,7 @@ pub(crate) async fn scratch_sweep<T: IoHandler>(
                 Err(e) => return Err(e.into()),
             };
             let file_name = child.file_name();
-            let Some(file_name) = file_name.to_str().and_then(|f| FileName::new(f).ok()) else {
+            let Some(file_name) = entry_file_name(&file_name) else {
                 stats.scan_invalid_filename_count += 1;
                 continue;
             };
@@ -1666,6 +1667,14 @@ pub(crate) async fn scratch_sweep<T: IoHandler>(
     }
     stats.clean_duration_s = (Instant::now() - clean_start).as_secs();
     Ok(CleanResult::new(kind, stats, AdaptiveOutcome::Disabled))
+}
+
+/// The materializer's name for a directory entry, or `None` when the entry's name cannot be
+/// one: it is not valid UTF-8, or it is not a valid `FileName` (empty, `.`, `..`, or with a
+/// slash or backslash). Nothing tracked has such a name, so both scans count the entry in
+/// `scan_invalid_filename_count` and leave it in place.
+pub(crate) fn entry_file_name(name: &OsStr) -> Option<&FileName> {
+    name.to_str().and_then(|f| FileName::new(f).ok())
 }
 
 /// Get file size or directory size, without following symlinks.
@@ -1822,7 +1831,7 @@ impl<T: IoHandler> StaleFinder<'_, T> {
             };
 
             let file_name = child.file_name();
-            let file_name = file_name.to_str().and_then(|f| FileName::new(f).ok());
+            let file_name = entry_file_name(&file_name);
 
             let file_name = match file_name {
                 Some(file_name) => file_name,

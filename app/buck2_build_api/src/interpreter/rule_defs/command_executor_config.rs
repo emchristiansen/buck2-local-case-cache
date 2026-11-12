@@ -41,6 +41,8 @@ use buck2_error::internal_error;
 use buck2_hash::BuckFixedSortedMap;
 use buck2_hash::BuckMutInsertionMap;
 use derive_more::Display;
+use dupe::Dupe;
+use pagable::Pagable;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
@@ -102,7 +104,41 @@ pub struct StarlarkCommandExecutorConfig(
     #[freeze(identity)]
     #[starlark_pagable(pagable)]
     pub Arc<CommandExecutorConfig>,
+    /// Who chose this executor. Private, so every value is built by a constructor that names it.
+    #[freeze(identity)]
+    #[starlark_pagable(pagable)]
+    ExecutorConfigOrigin,
 );
+
+/// Who chose the executor a `CommandExecutorConfig` value holds. The origin belongs to the value,
+/// so it survives a test info being returned by another rule or copied field by field, and an
+/// executor recorded from an execution platform cannot pass for one a rule wrote.
+#[derive(Debug, Clone, Copy, Dupe, PartialEq, Eq, Hash, Allocative, Pagable)]
+pub enum ExecutorConfigOrigin {
+    /// Starlark wrote it with `CommandExecutorConfig(...)`: a rule selected this executor.
+    Declared,
+    /// A test info recorded it during rule analysis from the execution platform resolved for its
+    /// `exec_group` (or `DefaultExecGroup`), because no `default_executor` was passed. Execution
+    /// platform resolution chose it, not the rule, so it is governed by the invocation's
+    /// execution strategy like any other platform-derived executor.
+    ExecutionGroupPlatform,
+}
+
+impl StarlarkCommandExecutorConfig {
+    /// An executor that Starlark code selected explicitly.
+    pub fn declared(config: Arc<CommandExecutorConfig>) -> Self {
+        Self(config, ExecutorConfigOrigin::Declared)
+    }
+
+    /// The executor of the execution platform resolved for a test info's execution group.
+    pub fn from_execution_group_platform(config: Arc<CommandExecutorConfig>) -> Self {
+        Self(config, ExecutorConfigOrigin::ExecutionGroupPlatform)
+    }
+
+    pub fn origin(&self) -> ExecutorConfigOrigin {
+        self.1
+    }
+}
 
 starlark_simple_value!(StarlarkCommandExecutorConfig);
 
@@ -433,7 +469,7 @@ pub fn register_command_executor_config(builder: &mut GlobalsBuilder) {
             }
         };
 
-        Ok(StarlarkCommandExecutorConfig(Arc::new(
+        Ok(StarlarkCommandExecutorConfig::declared(Arc::new(
             command_executor_config,
         )))
     }

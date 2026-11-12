@@ -1700,3 +1700,166 @@ fn test_listing_command_accessor() -> buck2_error::Result<()> {
     assert_eq!(exec_cmd, vec!["my_binary"]);
     Ok(())
 }
+
+/// S1-PROVIDER-01: the constructors of both test infos, evaluated in a module that carries a rule
+/// analysis's execution platform resolution, record a test info's execution group executor with
+/// `ExecutorConfigOrigin::ExecutionGroupPlatform`, keep that origin through a field-by-field copy,
+/// and give a passed `CommandExecutorConfig(...)` `ExecutorConfigOrigin::Declared`.
+mod execution_group_executor_origin {
+    use buck2_build_api::analysis::extra_v::AnalysisExtraValue;
+    use buck2_build_api::interpreter::rule_defs::command_executor_config::ExecutorConfigOrigin;
+    use buck2_build_api::interpreter::rule_defs::command_executor_config::StarlarkCommandExecutorConfig;
+    use buck2_build_api::interpreter::rule_defs::command_executor_config::register_command_executor_config;
+    use buck2_build_api::interpreter::rule_defs::provider::builtin::external_runner_test_info::ExternalRunnerTestInfo;
+    use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
+    use buck2_build_api::interpreter::rule_defs::register_rule_defs;
+    use buck2_core::cells::cell_path::CellPath;
+    use buck2_core::configuration::pair::ConfigurationNoExec;
+    use buck2_core::execution_types::execution::ExecutionGroupResolutionPartial;
+    use buck2_core::execution_types::execution::ExecutionPlatform;
+    use buck2_core::execution_types::execution::ExecutionPlatformResolutionPartial;
+    use buck2_core::execution_types::execution_group::NamedExecutionGroup;
+    use buck2_core::execution_types::executor_config::CommandExecutorConfig;
+    use buck2_core::execution_types::executor_config::Executor;
+    use buck2_hash::BuckFixedSortedMap;
+    use buck2_interpreter::execution_group::FrozenStarlarkExecutionGroup;
+    use buck2_interpreter::execution_group::StarlarkExecutionGroup;
+    use starlark::environment::GlobalsBuilder;
+    use starlark::environment::Module;
+    use starlark::eval::Evaluator;
+    use starlark::syntax::AstModule;
+    use starlark::syntax::Dialect;
+    use starlark::values::Value;
+
+    const CODE: &str = r#"
+def _listing(stdout):
+    return []
+
+def _result(stdout, stderr, exit_code):
+    return []
+
+def _internal(**kwargs):
+    return InternalRunnerTestInfo(
+        type = "t",
+        parse_test_listing = _listing,
+        parse_test_result = _result,
+        listing_command = ["x"],
+        **kwargs
+    )
+
+def _external(**kwargs):
+    return ExternalRunnerTestInfo(type = "t", command = ["x"], **kwargs)
+
+def _cases(make):
+    named = make(exec_group = TestRun)
+    return {
+        "recorded_default": make(exec_group = DefaultExecGroup),
+        "recorded_named": named,
+        "copied": make(default_executor = named.default_executor, exec_group = named.exec_group),
+        "declared": make(
+            default_executor = CommandExecutorConfig(local_enabled = True, remote_enabled = False),
+            exec_group = TestRun,
+        ),
+        "no_group": make(),
+    }
+
+internal = _cases(_internal)
+external = _cases(_external)
+"#;
+
+    /// The origin and executor of each case's `default_executor`, for both provider kinds.
+    fn origins() -> buck2_error::Result<Vec<(String, Option<(ExecutorConfigOrigin, bool)>)>> {
+        let cell_path = CellPath::testing_new("root//test/rules.bzl");
+        let platform = || {
+            ExecutionPlatform::legacy_execution_platform(
+                CommandExecutorConfig::testing_local(),
+                ConfigurationNoExec::testing_new(),
+            )
+        };
+        // A rule that declares `DefaultExecGroup` and `TestRun`, both resolved to a local
+        // execution platform.
+        let resolution = ExecutionPlatformResolutionPartial::new(Some(platform()), Vec::new())
+            .finalize_with_execution_groups(
+                BuckFixedSortedMap::new(),
+                vec![ExecutionGroupResolutionPartial {
+                    group: NamedExecutionGroup::new("TestRun".to_owned(), cell_path.clone()),
+                    partial: ExecutionPlatformResolutionPartial::new(Some(platform()), Vec::new()),
+                    exec_dep_cfgs: BuckFixedSortedMap::new(),
+                }],
+                true,
+            );
+        Module::with_temp_heap(|module| {
+            AnalysisExtraValue::get_or_init(&module)?
+                .execution_platform_resolution
+                .set(resolution)
+                .unwrap();
+            module.set(
+                "DefaultExecGroup",
+                module.heap().alloc(FrozenStarlarkExecutionGroup::DEFAULT),
+            );
+            let test_run = module
+                .heap()
+                .alloc(StarlarkExecutionGroup::new_unbound(cell_path));
+            module.set("TestRun", test_run);
+            let globals = GlobalsBuilder::standard()
+                .with(register_rule_defs)
+                .with(register_command_executor_config)
+                .build();
+            let mut eval = Evaluator::new(&module);
+            test_run.export_as("TestRun", &mut eval).unwrap();
+            let ast = AstModule::parse("rules.bzl", CODE.to_owned(), &Dialect::Extended).unwrap();
+            eval.eval_module(ast, &globals).unwrap();
+            drop(eval);
+
+            let executor = |config: Option<&StarlarkCommandExecutorConfig>| {
+                config.map(|c| (c.origin(), matches!(c.0.executor, Executor::Local(_))))
+            };
+            let mut origins = Vec::new();
+            for kind in ["internal", "external"] {
+                let cases: Value = module.get(kind).unwrap();
+                for case in [
+                    "recorded_default",
+                    "recorded_named",
+                    "copied",
+                    "declared",
+                    "no_group",
+                ] {
+                    let info = cases.at(module.heap().alloc(case), module.heap()).unwrap();
+                    let default_executor = if kind == "internal" {
+                        executor(
+                            InternalRunnerTestInfo::from_value(info)
+                                .unwrap()
+                                .default_executor(),
+                        )
+                    } else {
+                        executor(
+                            ExternalRunnerTestInfo::from_value(info)
+                                .unwrap()
+                                .default_executor(),
+                        )
+                    };
+                    origins.push((format!("{kind}/{case}"), default_executor));
+                }
+            }
+            Ok(origins)
+        })
+    }
+
+    #[test]
+    fn an_execution_group_executor_is_recorded_with_its_origin() -> buck2_error::Result<()> {
+        let recorded = Some((ExecutorConfigOrigin::ExecutionGroupPlatform, true));
+        let declared = Some((ExecutorConfigOrigin::Declared, true));
+        let mut expected = Vec::new();
+        for kind in ["internal", "external"] {
+            expected.extend([
+                (format!("{kind}/recorded_default"), recorded),
+                (format!("{kind}/recorded_named"), recorded),
+                (format!("{kind}/copied"), recorded),
+                (format!("{kind}/declared"), declared),
+                (format!("{kind}/no_group"), None),
+            ]);
+        }
+        assert_eq!(origins()?, expected);
+        Ok(())
+    }
+}

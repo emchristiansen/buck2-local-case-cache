@@ -274,6 +274,38 @@ impl CommandReproducer {
         }
     }
 
+    /// The reproducer for a command submitted to the remote execution service, known only from
+    /// its terminal report because no execution stage was reported for it: the service may answer
+    /// with a completed result (including one served from its cache or deduplicated) without
+    /// ever reporting that it is executing. Only the submission's identity and origin are taken
+    /// from the report; no execution stage or interval is implied. buck2's own cache lookups are
+    /// reported by their cache-hit stages instead, so they give `None` here.
+    pub fn from_terminal_remote_command(
+        remote: &buck2_data::RemoteCommand,
+        options: &WhatRanOptions,
+    ) -> Option<Self> {
+        if options.skip_remote_executions {
+            return None;
+        }
+        match remote.cache_hit_type() {
+            buck2_data::RemoteCommandOrigin::ActionCache
+            | buck2_data::RemoteCommandOrigin::RemoteDepFileCache => return None,
+            buck2_data::RemoteCommandOrigin::Executed
+            | buck2_data::RemoteCommandOrigin::ReServedFromCache
+            | buck2_data::RemoteCommandOrigin::ReDeduplicated => {}
+        }
+        let details = remote.details.as_ref();
+        let execute = buck2_data::ReExecute {
+            action_digest: remote.action_digest.clone(),
+            platform: details.and_then(|d| d.platform.clone()),
+            action_key: None,
+            use_case: details.map(|d| d.use_case.clone()).unwrap_or_default(),
+            persistent_worker: details.is_some_and(|d| d.persistent_worker),
+            submission: remote.submission,
+        };
+        Some(Self::ReExecute(execute).with_remote_origin(remote))
+    }
+
     pub fn from_buck_data(
         data: &buck2_data::buck_event::Data,
         options: &WhatRanOptions,
@@ -544,6 +576,7 @@ mod tests {
             action_key: None,
             use_case: "".to_owned(),
             persistent_worker: false,
+            submission: None,
         };
         let result = executor_with_platform(&execute, "");
         assert_eq!(

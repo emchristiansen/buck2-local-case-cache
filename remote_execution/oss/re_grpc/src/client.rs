@@ -675,13 +675,14 @@ fn delay_with_jitter(delay: Duration) -> Duration {
 /// attempts with exponential backoff (100ms, 200ms, 400ms, 800ms — capped at
 /// 5s) plus 0–50ms of jitter to avoid synchronized retry storms across
 /// concurrent in-flight requests.
+/// Attempts per RPC, shared by [`retry`] and [`batch_update_with_retry`].
+const MAX_ATTEMPTS: u32 = 5;
+
 async fn retry<F, Fut, T>(f: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    const MAX_ATTEMPTS: u32 = 5;
-
     let mut delay = INITIAL_DELAY;
     for attempt in 1..=MAX_ATTEMPTS {
         match f().await {
@@ -827,6 +828,10 @@ struct ExecutionStreamState<F> {
     /// The response has been delivered, so there is nothing left to read and
     /// reopening the call would only produce a second one.
     done: bool,
+    /// `Execute` calls made so far, including any that failed to open. Every
+    /// event is reported with the count at the time, so a consumer can tell the
+    /// operation that answered from one an earlier call started.
+    submissions: u32,
 }
 
 /// Streams progress events for one action, resuming across a broken connection.
@@ -840,7 +845,10 @@ struct ExecutionStreamState<F> {
 /// that report nothing at all. An operation the server finishes with a
 /// transient failure is also started over with `Execute`, and that does spend
 /// the budget.
-fn execution_progress_stream<S, F, Fut>(
+///
+/// Public so that consumers of the decoded progress events can be tested against this exact
+/// decoding rather than a hand-written approximation of it.
+pub fn execution_progress_stream<S, F, Fut>(
     open: F,
     cas_ttl_secs: i64,
 ) -> impl Stream<Item = anyhow::Result<ExecuteWithProgressResponse>>
@@ -856,6 +864,7 @@ where
         empty_resumes: 0,
         delay: INITIAL_DELAY,
         done: false,
+        submissions: 0,
     };
 
     futures::stream::try_unfold(
@@ -868,7 +877,14 @@ where
 
                 let live = match &mut stream {
                     Some(live) => live,
-                    None => match (state.open)(state.operation.clone()).await {
+                    None => match {
+                        if state.operation.is_none() {
+                            state.submissions += 1;
+                        }
+                        (state.open)(state.operation.clone())
+                    }
+                    .await
+                    {
                         Ok(opened) => stream.insert(opened),
                         Err(err) => {
                             let err = match &state.operation {
@@ -890,7 +906,8 @@ where
                         }
                         state.empty_resumes = 0;
                         match decode_execute_operation(msg, cas_ttl_secs) {
-                            Ok(response) => {
+                            Ok(mut response) => {
+                                response.submission = Some(state.submissions);
                                 state.done = response.execute_response.is_some();
                                 return Ok(Some((response, (stream, state))));
                             }
@@ -1932,6 +1949,212 @@ where
     })
 }
 
+/// What one blob's status in a successful `BatchUpdateBlobs` response means
+/// for that blob.
+#[derive(Debug, Clone, PartialEq)]
+enum BlobOutcome {
+    Stored,
+    /// Worth sending the same bytes again.
+    Retryable(Status),
+    Permanent(Status),
+}
+
+/// Classifies one blob's status inside a `BatchUpdateBlobs` response that
+/// itself succeeded.
+///
+/// Each blob is an independent CAS write (remote_execution.proto: "equivalent
+/// to calling a Bytestream `Write` request on each individual blob, in
+/// parallel"), and a CAS write is idempotent: storing an already-present blob
+/// succeeds. So beside the codes [`is_retryable`] treats as transient,
+/// `DEADLINE_EXCEEDED` is retried here: for a write it means the outcome is
+/// unknown (google/rpc/code.proto), and sending the same bytes again is safe.
+/// This applies only to per-blob statuses; a `DEADLINE_EXCEEDED` RPC is still
+/// not retried, and execution keeps its own rules.
+fn classify_blob_status(status: &Status) -> BlobOutcome {
+    match Code::try_from(status.code) {
+        Ok(Code::Ok) => BlobOutcome::Stored,
+        Ok(
+            Code::Unavailable
+            | Code::ResourceExhausted
+            | Code::Aborted
+            | Code::Cancelled
+            | Code::DeadlineExceeded,
+        ) => BlobOutcome::Retryable(status.clone()),
+        _ => BlobOutcome::Permanent(status.clone()),
+    }
+}
+
+/// A blob as `BatchUpdateBlobs` identifies it.
+type BlobKey = (String, i64);
+
+fn blob_key(digest: &Digest) -> BlobKey {
+    (digest.hash.clone(), digest.size_bytes)
+}
+
+fn describe_blob_failure(key: &BlobKey, status: &Status) -> String {
+    format!(
+        "Unable to upload blob '{}', rpc status code: {}, message: \"{}\"",
+        key.0, status.code, status.message
+    )
+}
+
+/// Matches a response against the requests it answers and returns each
+/// requested blob's outcome. A request may name the same blob more than once;
+/// the response must then answer each of them. Anything else (an entry with
+/// no digest or status, a blob not requested, more answers than requests, a
+/// requested blob left unanswered) is a malformed response and an error, never
+/// a success.
+fn blob_outcomes(
+    requests: &[&Request],
+    response: &BatchUpdateBlobsResponse,
+) -> anyhow::Result<HashMap<BlobKey, BlobOutcome>> {
+    let mut expected: HashMap<BlobKey, usize> = HashMap::new();
+    for request in requests {
+        let digest = request
+            .digest
+            .as_ref()
+            .context("BatchUpdateBlobs request entry without a digest")?;
+        *expected.entry(blob_key(digest)).or_default() += 1;
+    }
+    let mut answered: HashMap<BlobKey, usize> = HashMap::new();
+    let mut outcomes: HashMap<BlobKey, BlobOutcome> = HashMap::new();
+    for entry in &response.responses {
+        let digest = entry
+            .digest
+            .as_ref()
+            .context("Malformed BatchUpdateBlobs response: an entry has no digest")?;
+        let key = blob_key(digest);
+        let Some(&wanted) = expected.get(&key) else {
+            return Err(anyhow::anyhow!(
+                "Malformed BatchUpdateBlobs response: blob '{}' ({} bytes) was not requested",
+                key.0,
+                key.1
+            ));
+        };
+        let status = entry.status.as_ref().with_context(|| {
+            format!(
+                "Malformed BatchUpdateBlobs response: blob '{}' has no status",
+                key.0
+            )
+        })?;
+        let count = answered.entry(key.clone()).or_default();
+        *count += 1;
+        if *count > wanted {
+            return Err(anyhow::anyhow!(
+                "Malformed BatchUpdateBlobs response: blob '{}' answered more times than requested",
+                key.0
+            ));
+        }
+        let outcome = classify_blob_status(status);
+        // A blob requested twice is stored only if both writes were; a
+        // permanent failure outranks a retryable one.
+        match (outcomes.get(&key), &outcome) {
+            (Some(BlobOutcome::Permanent(_)), _) => {}
+            (Some(BlobOutcome::Retryable(_)), BlobOutcome::Stored) => {}
+            _ => {
+                outcomes.insert(key, outcome);
+            }
+        }
+    }
+    for (key, wanted) in &expected {
+        if answered.get(key).copied().unwrap_or(0) != *wanted {
+            return Err(anyhow::anyhow!(
+                "Malformed BatchUpdateBlobs response: blob '{}' answered fewer times than requested",
+                key.0
+            ));
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Uploads one batch, sending again only the blobs whose status was
+/// retryable, with their bytes unchanged. Transport failures (as
+/// [`is_retryable`] classifies them) and retryable blob statuses draw on the
+/// one budget of [`MAX_ATTEMPTS`] calls and the same backoff as [`retry`].
+async fn batch_update_with_retry<Cas>(
+    mut request: BatchUpdateBlobsRequest,
+    cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas,
+) -> anyhow::Result<()>
+where
+    Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>>,
+{
+    let all = std::mem::take(&mut request.requests);
+    let mut pending: Vec<&Request> = all.iter().collect();
+    let mut delay = INITIAL_DELAY;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let attempt_request = BatchUpdateBlobsRequest {
+            requests: pending.iter().map(|r| (*r).clone()).collect(),
+            ..request.clone()
+        };
+        let response = match cas_f(attempt_request).await {
+            Ok(response) => response,
+            Err(e) if is_retryable(&e) && attempt < MAX_ATTEMPTS => {
+                let sleep_for = delay_with_jitter(delay);
+                tracing::debug!(
+                    "Transient error (attempt {}/{}), retrying in {:?}: {:#}",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    sleep_for,
+                    e
+                );
+                tokio::time::sleep(sleep_for).await;
+                delay = (delay * 2).min(MAX_DELAY);
+                continue;
+            }
+            Err(e) => return Err(normalize_re_error(e)),
+        };
+        let outcomes = blob_outcomes(&pending, &response)?;
+
+        let mut permanent = Vec::new();
+        let mut retryable = Vec::new();
+        let mut keys: Vec<&BlobKey> = outcomes.keys().collect();
+        keys.sort();
+        for key in keys {
+            match &outcomes[key] {
+                BlobOutcome::Stored => {}
+                BlobOutcome::Retryable(status) => {
+                    retryable.push(describe_blob_failure(key, status))
+                }
+                BlobOutcome::Permanent(status) => {
+                    permanent.push(describe_blob_failure(key, status))
+                }
+            }
+        }
+        if !permanent.is_empty() {
+            permanent.extend(retryable);
+            return Err(anyhow::anyhow!("Batch upload failed: {:?}", permanent));
+        }
+        if retryable.is_empty() {
+            return Ok(());
+        }
+        if attempt == MAX_ATTEMPTS {
+            return Err(anyhow::anyhow!(
+                "Batch upload failed after {} attempts: {:?}",
+                MAX_ATTEMPTS,
+                retryable
+            ));
+        }
+        pending.retain(|r| {
+            r.digest.as_ref().is_some_and(|d| {
+                matches!(outcomes.get(&blob_key(d)), Some(BlobOutcome::Retryable(_)))
+            })
+        });
+        let sleep_for = delay_with_jitter(delay);
+        tracing::debug!(
+            "Retryable blob statuses (attempt {}/{}), resending {} of {} blobs in {:?}: {:?}",
+            attempt,
+            MAX_ATTEMPTS,
+            pending.len(),
+            all.len(),
+            sleep_for,
+            retryable
+        );
+        tokio::time::sleep(sleep_for).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+    unreachable!()
+}
+
 async fn upload_impl<Byt, Cas>(
     instance_name: &InstanceName,
     request: UploadRequest,
@@ -2122,29 +2345,7 @@ where
                 .map(|x| x.digest.as_ref().unwrap().hash.clone())
                 .collect::<Vec<String>>();
 
-            let response = retry(|| async { cas_f(re_request.clone()).await }).await?;
-            let failures: Vec<String> = response
-                .responses
-                .iter()
-                .filter_map(|r| {
-                    r.status.as_ref().and_then(|s| {
-                        if s.code == (Code::Ok as i32) {
-                            None
-                        } else {
-                            Some(format!(
-                                "Unable to upload blob '{}', rpc status code: {}, message: \"{}\"",
-                                r.digest.as_ref().map_or("N/A", |d| &d.hash),
-                                s.code,
-                                s.message
-                            ))
-                        }
-                    })
-                })
-                .collect();
-
-            if !failures.is_empty() {
-                return Err(anyhow::anyhow!("Batch upload failed: {:?}", failures));
-            }
+            batch_update_with_retry(re_request, cas_f).await?;
             Ok(blob_hashes)
         };
         upload_futures.push(Box::pin(fut));
@@ -2406,6 +2607,44 @@ mod tests {
             .iter()
             .map(|e| e.as_ref().unwrap().stage)
             .collect::<Vec<_>>()
+    }
+
+    /// Every event reports which `Execute` request produced it: a resume keeps the count, a
+    /// restart after a lost operation or a transient failure advances it.
+    #[tokio::test(start_paused = true)]
+    async fn events_report_which_execute_request_produced_them() {
+        let submissions = |events: &[anyhow::Result<ExecuteWithProgressResponse>]| {
+            events
+                .iter()
+                .map(|e| e.as_ref().unwrap().submission)
+                .collect::<Vec<_>>()
+        };
+
+        // Resumed, then lost and started over.
+        let (events, calls) = run_scripted(vec![
+            Ok(vec![Ok(progress_op(execution_stage::Value::Executing))]),
+            Ok(vec![Ok(progress_op(execution_stage::Value::Executing))]),
+            Err(tonic::Status::not_found("lost")),
+            Ok(vec![Ok(done_op())]),
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            vec![None, Some(OP.to_owned()), Some(OP.to_owned()), None]
+        );
+        assert_eq!(submissions(&events), vec![Some(1), Some(1), Some(2)]);
+
+        // Failed transiently, then started over.
+        let (events, calls) = run_scripted(vec![
+            Ok(vec![
+                Ok(progress_op(execution_stage::Value::Executing)),
+                Ok(failed_response_op(TCode::UNAVAILABLE, "worker lost")),
+            ]),
+            Ok(vec![Ok(done_op())]),
+        ])
+        .await;
+        assert_eq!(calls, vec![None, None]);
+        assert_eq!(submissions(&events), vec![Some(1), Some(2)]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3636,18 +3875,15 @@ mod tests {
             ..Default::default()
         };
 
+        // Only `digest1` is batched (`digest2` goes over ByteStream), so the
+        // batch answers only `digest1`: an answer for a blob the batch did not
+        // carry is rejected as malformed. Out-of-order answers are covered in
+        // `upload_retry_tests::answers_may_come_in_any_order`.
         let res = BatchUpdateBlobsResponse {
-            responses: vec![
-                // Reply out of order
-                batch_update_blobs_response::Response {
-                    digest: Some(tdigest_to(&digest2)),
-                    status: Some(Status::default()),
-                },
-                batch_update_blobs_response::Response {
-                    digest: Some(tdigest_to(&digest1)),
-                    status: Some(Status::default()),
-                },
-            ],
+            responses: vec![batch_update_blobs_response::Response {
+                digest: Some(tdigest_to(&digest1)),
+                status: Some(Status::default()),
+            }],
         };
 
         upload_impl(
@@ -3718,9 +3954,13 @@ mod tests {
             ..Default::default()
         };
 
+        // Only `digest1` is batched (`digest2` goes over ByteStream), so the
+        // batch must answer `digest1`, and only it: a batched blob left
+        // unanswered, or an answer for a blob the batch did not carry, is
+        // rejected as malformed rather than taken as stored.
         let res = BatchUpdateBlobsResponse {
             responses: vec![batch_update_blobs_response::Response {
-                digest: Some(tdigest_to(&digest2)),
+                digest: Some(tdigest_to(&digest1)),
                 status: Some(Status::default()),
             }],
         };
@@ -4155,4 +4395,426 @@ async fn test_download_compressed() -> anyhow::Result<()> {
     );
     assert_eq!(d_resp.inlined_blobs.unwrap()[0].blob, blob_data);
     Ok(())
+}
+
+/// BatchUpdateBlobs per-blob outcome handling, driven through `upload_impl`
+/// with a scripted CAS function (the same seam as the other upload tests).
+#[cfg(test)]
+mod upload_retry_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_response;
+
+    use super::*;
+
+    enum Answer {
+        /// A successful RPC answering each named blob (3 bytes) with a code.
+        Blobs(Vec<(&'static str, Code)>),
+        /// A successful RPC with exactly this body.
+        Raw(BatchUpdateBlobsResponse),
+        /// A failed RPC.
+        Transport(tonic::Status),
+    }
+
+    fn entry(hash: &str, code: Code) -> batch_update_blobs_response::Response {
+        batch_update_blobs_response::Response {
+            digest: Some(Digest {
+                hash: hash.to_owned(),
+                size_bytes: 3,
+                ..Default::default()
+            }),
+            status: Some(Status {
+                code: code as i32,
+                message: format!("scripted {code:?}"),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Scripted CAS: each call records its request and pops one answer.
+    struct Script {
+        answers: Mutex<VecDeque<Answer>>,
+        seen: Mutex<Vec<BatchUpdateBlobsRequest>>,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Answer>) -> Self {
+            Self {
+                answers: Mutex::new(answers.into()),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn call(
+            &self,
+            req: BatchUpdateBlobsRequest,
+        ) -> anyhow::Result<BatchUpdateBlobsResponse> {
+            self.seen.lock().unwrap().push(req);
+            let answer = self
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("CAS called more often than scripted");
+            match answer {
+                Answer::Blobs(blobs) => Ok(BatchUpdateBlobsResponse {
+                    responses: blobs.into_iter().map(|(h, c)| entry(h, c)).collect(),
+                }),
+                Answer::Raw(response) => Ok(response),
+                Answer::Transport(status) => Err(status.into()),
+            }
+        }
+
+        /// The blobs each call carried, by hash, in order.
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    r.requests
+                        .iter()
+                        .map(|q| q.digest.as_ref().unwrap().hash.clone())
+                        .collect()
+                })
+                .collect()
+        }
+
+        /// Every entry ever sent equals the entry first sent for its blob:
+        /// same digest, bytes and compressor.
+        fn assert_payloads_unchanged(&self, originals: &[InlinedBlobWithDigest]) {
+            for req in self.seen.lock().unwrap().iter() {
+                assert_eq!(req.instance_name, "");
+                for sent in &req.requests {
+                    let digest = sent.digest.as_ref().unwrap();
+                    let original = originals
+                        .iter()
+                        .find(|b| b.digest.hash == digest.hash)
+                        .expect("sent a blob that was never requested");
+                    assert_eq!(digest.size_bytes, original.digest.size_in_bytes);
+                    assert_eq!(sent.data, original.blob);
+                    assert_eq!(sent.compressor, compressor::Value::Identity as i32);
+                }
+            }
+        }
+
+        fn unused_answers(&self) -> usize {
+            self.answers.lock().unwrap().len()
+        }
+    }
+
+    fn blob(hash: &str, data: &[u8]) -> InlinedBlobWithDigest {
+        InlinedBlobWithDigest {
+            digest: TDigest {
+                hash: hash.to_owned(),
+                size_in_bytes: data.len() as i64,
+                ..Default::default()
+            },
+            blob: data.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn two_blobs() -> Vec<InlinedBlobWithDigest> {
+        vec![blob("aa", b"aaa"), blob("bb", b"bbb")]
+    }
+
+    async fn upload(
+        script: &Script,
+        blobs: Vec<InlinedBlobWithDigest>,
+    ) -> anyhow::Result<UploadResponse> {
+        upload_impl(
+            &InstanceName(None),
+            UploadRequest {
+                inlined_blobs_with_digest: Some(blobs),
+                ..Default::default()
+            },
+            None,
+            1024,
+            None,
+            |req| script.call(req),
+            |_| async move { panic!("ByteStream not expected for small blobs") },
+        )
+        .await
+    }
+
+    fn calls(spec: &[&[&str]]) -> Vec<Vec<String>> {
+        spec.iter()
+            .map(|c| c.iter().map(|h| (*h).to_owned()).collect())
+            .collect()
+    }
+
+    /// The observed NativeLink failure: the RPC succeeds, one blob reports a
+    /// per-blob DEADLINE_EXCEEDED, and the same blob succeeds when sent again.
+    #[tokio::test(start_paused = true)]
+    async fn per_blob_deadline_then_success_uploads() -> anyhow::Result<()> {
+        let script = Script::new(vec![
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::DeadlineExceeded)]),
+            Answer::Blobs(vec![("bb", Code::Ok)]),
+        ]);
+        upload(&script, two_blobs()).await?;
+        // Only the pending blob is sent again; the stored one is kept.
+        assert_eq!(script.calls(), calls(&[&["aa", "bb"], &["bb"]]));
+        script.assert_payloads_unchanged(&two_blobs());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_may_come_in_any_order() -> anyhow::Result<()> {
+        let script = Script::new(vec![
+            Answer::Blobs(vec![("bb", Code::DeadlineExceeded), ("aa", Code::Ok)]),
+            Answer::Blobs(vec![("bb", Code::Ok)]),
+        ]);
+        upload(&script, two_blobs()).await?;
+        assert_eq!(script.calls(), calls(&[&["aa", "bb"], &["bb"]]));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_transient_blob_status_is_resent() -> anyhow::Result<()> {
+        for code in [
+            Code::Unavailable,
+            Code::ResourceExhausted,
+            Code::Aborted,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+        ] {
+            let script = Script::new(vec![
+                Answer::Blobs(vec![("aa", code), ("bb", Code::Ok)]),
+                Answer::Blobs(vec![("aa", Code::Ok)]),
+            ]);
+            upload(&script, two_blobs()).await?;
+            assert_eq!(script.calls(), calls(&[&["aa", "bb"], &["aa"]]), "{code:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_blob_statuses_exhaust_the_attempt_budget() -> anyhow::Result<()> {
+        let mut answers = vec![Answer::Blobs(vec![
+            ("aa", Code::Ok),
+            ("bb", Code::DeadlineExceeded),
+        ])];
+        for _ in 1..MAX_ATTEMPTS {
+            answers.push(Answer::Blobs(vec![("bb", Code::DeadlineExceeded)]));
+        }
+        // One more answer than the budget allows, which must stay unused.
+        answers.push(Answer::Blobs(vec![("bb", Code::Ok)]));
+        let script = Script::new(answers);
+        let err = upload(&script, two_blobs()).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("after 5 attempts"), "{msg}");
+        assert!(msg.contains("'bb', rpc status code: 4"), "{msg}");
+        assert!(!msg.contains("'aa'"), "{msg}");
+        assert_eq!(script.calls().len(), MAX_ATTEMPTS as usize);
+        assert_eq!(script.unused_answers(), 1);
+        script.assert_payloads_unchanged(&two_blobs());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_blob_status_fails_at_once() -> anyhow::Result<()> {
+        let script = Script::new(vec![
+            Answer::Blobs(vec![
+                ("aa", Code::InvalidArgument),
+                ("bb", Code::DeadlineExceeded),
+            ]),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::Ok)]),
+        ]);
+        let msg = format!("{:#}", upload(&script, two_blobs()).await.unwrap_err());
+        assert!(msg.contains("'aa', rpc status code: 3"), "{msg}");
+        // The still-retryable blob is listed too.
+        assert!(msg.contains("'bb', rpc status code: 4"), "{msg}");
+        assert_eq!(script.calls().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_and_blob_failures_share_one_budget() -> anyhow::Result<()> {
+        let unavailable = || Answer::Transport(tonic::Status::unavailable("scripted"));
+        // Recovers within the budget.
+        let script = Script::new(vec![
+            unavailable(),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::DeadlineExceeded)]),
+            unavailable(),
+            Answer::Blobs(vec![("bb", Code::Ok)]),
+        ]);
+        upload(&script, two_blobs()).await?;
+        assert_eq!(
+            script.calls(),
+            calls(&[&["aa", "bb"], &["aa", "bb"], &["bb"], &["bb"]])
+        );
+        script.assert_payloads_unchanged(&two_blobs());
+
+        // Two transport failures and three blob failures use all five calls.
+        let script = Script::new(vec![
+            unavailable(),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::Unavailable)]),
+            unavailable(),
+            Answer::Blobs(vec![("bb", Code::DeadlineExceeded)]),
+            Answer::Blobs(vec![("bb", Code::Aborted)]),
+            Answer::Blobs(vec![("bb", Code::Ok)]),
+        ]);
+        let msg = format!("{:#}", upload(&script, two_blobs()).await.unwrap_err());
+        assert!(msg.contains("after 5 attempts"), "{msg}");
+        assert_eq!(script.calls().len(), 5);
+        assert_eq!(script.unused_answers(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_deadline_is_still_not_retried() -> anyhow::Result<()> {
+        let script = Script::new(vec![
+            Answer::Transport(tonic::Status::deadline_exceeded("scripted")),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::Ok)]),
+        ]);
+        upload(&script, two_blobs()).await.unwrap_err();
+        assert_eq!(script.calls().len(), 1);
+        Ok(())
+    }
+
+    async fn malformed(response: BatchUpdateBlobsResponse, expect: &str) {
+        let script = Script::new(vec![
+            Answer::Raw(response),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::Ok)]),
+        ]);
+        let msg = format!("{:#}", upload(&script, two_blobs()).await.unwrap_err());
+        assert!(msg.contains("Malformed BatchUpdateBlobs response"), "{msg}");
+        assert!(msg.contains(expect), "{msg}");
+        assert_eq!(script.calls().len(), 1, "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_responses_are_never_success() {
+        let mut no_digest = entry("bb", Code::Ok);
+        no_digest.digest = None;
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![entry("aa", Code::Ok), no_digest],
+            },
+            "has no digest",
+        )
+        .await;
+
+        let mut no_status = entry("bb", Code::Ok);
+        no_status.status = None;
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![entry("aa", Code::Ok), no_status],
+            },
+            "'bb' has no status",
+        )
+        .await;
+
+        // Missing: a requested blob is not answered.
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![entry("aa", Code::Ok)],
+            },
+            "'bb' answered fewer times than requested",
+        )
+        .await;
+
+        // Duplicate.
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![
+                    entry("aa", Code::Ok),
+                    entry("aa", Code::Ok),
+                    entry("bb", Code::Ok),
+                ],
+            },
+            "'aa' answered more times than requested",
+        )
+        .await;
+
+        // Unrequested.
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![
+                    entry("aa", Code::Ok),
+                    entry("bb", Code::Ok),
+                    entry("cc", Code::Ok),
+                ],
+            },
+            "'cc' (3 bytes) was not requested",
+        )
+        .await;
+
+        // A blob of the right hash but another size was not requested.
+        let mut wrong_size = entry("bb", Code::Ok);
+        wrong_size.digest.as_mut().unwrap().size_bytes = 4;
+        malformed(
+            BatchUpdateBlobsResponse {
+                responses: vec![entry("aa", Code::Ok), wrong_size],
+            },
+            "'bb' (4 bytes) was not requested",
+        )
+        .await;
+
+        // A retry answering a blob that was already stored is unrequested.
+        let script = Script::new(vec![
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::DeadlineExceeded)]),
+            Answer::Blobs(vec![("aa", Code::Ok), ("bb", Code::Ok)]),
+        ]);
+        let msg = format!("{:#}", upload(&script, two_blobs()).await.unwrap_err());
+        assert!(msg.contains("'aa' (3 bytes) was not requested"), "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_requested_twice_needs_both_answers() -> anyhow::Result<()> {
+        let blobs = || vec![blob("aa", b"aaa"), blob("aa", b"aaa")];
+        let script = Script::new(vec![Answer::Blobs(vec![
+            ("aa", Code::Ok),
+            ("aa", Code::Ok),
+        ])]);
+        upload(&script, blobs()).await?;
+
+        // One of its two writes is retryable: both entries are sent again.
+        let script = Script::new(vec![
+            Answer::Blobs(vec![("aa", Code::Ok), ("aa", Code::DeadlineExceeded)]),
+            Answer::Blobs(vec![("aa", Code::Ok), ("aa", Code::Ok)]),
+        ]);
+        upload(&script, blobs()).await?;
+        assert_eq!(script.calls(), calls(&[&["aa", "aa"], &["aa", "aa"]]));
+        script.assert_payloads_unchanged(&blobs());
+        Ok(())
+    }
+
+    /// Per-blob retry uses the transport policy's transient codes plus
+    /// `DEADLINE_EXCEEDED` and nothing else.
+    #[test]
+    fn blob_retry_set_is_the_transport_set_plus_deadline() {
+        for code in 0..=16 {
+            let tonic_code = tonic::Code::from(code);
+            let transport = is_retryable(&anyhow::Error::from(tonic::Status::new(
+                tonic_code, "scripted",
+            )));
+            let status = Status {
+                code,
+                ..Default::default()
+            };
+            let blob = match classify_blob_status(&status) {
+                BlobOutcome::Stored => {
+                    assert_eq!(code, Code::Ok as i32);
+                    continue;
+                }
+                BlobOutcome::Retryable(_) => true,
+                BlobOutcome::Permanent(_) => false,
+            };
+            let deadline = code == Code::DeadlineExceeded as i32;
+            assert_eq!(blob, transport || deadline, "code {code}");
+            assert!(!(transport && deadline));
+        }
+        // Codes outside google.rpc.Code are permanent.
+        let unknown = Status {
+            code: 99,
+            ..Default::default()
+        };
+        assert!(matches!(
+            classify_blob_status(&unknown),
+            BlobOutcome::Permanent(_)
+        ));
+    }
 }

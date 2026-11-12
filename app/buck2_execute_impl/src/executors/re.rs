@@ -253,6 +253,7 @@ impl ReExecutor {
                             materialized_inputs_for_failed: None,
                             materialized_outputs_for_failed_actions: None,
                             origin: RemoteExecutionOrigin::Executed,
+                            submission: None,
                         },
                         reason,
                         CommandExecutionMetadata {
@@ -270,6 +271,7 @@ impl ReExecutor {
                                 materialized_inputs_for_failed: None,
                                 materialized_outputs_for_failed_actions: None,
                                 origin: RemoteExecutionOrigin::Executed,
+                                submission: None,
                             },
                             CommandCancellationReason::ReQueueTimeout,
                             CommandExecutionMetadata::empty(TimeSpan::empty_now()),
@@ -397,6 +399,7 @@ impl PreparedCommandExecutor for ReExecutor {
             materialized_inputs_for_failed: None,
             materialized_outputs_for_failed_actions: None,
             origin: RemoteExecutionOrigin::Executed,
+            submission: None,
         });
 
         // Only the local executor creates scratch directories and sets their variables.

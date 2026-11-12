@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 
 pub mod file_names;
 pub mod read;
+pub mod schema_compat;
 pub mod stream_value;
 pub mod tail;
 pub mod ttl;

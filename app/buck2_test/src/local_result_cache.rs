@@ -290,6 +290,21 @@ pub(crate) struct RequestFacts<'a> {
 }
 
 impl LocalCaseCandidate {
+    /// A reusable candidate for one fixed case with its store at `root`, as admission gives it.
+    #[cfg(test)]
+    pub(crate) fn testing_new(root: String) -> Self {
+        Self {
+            root,
+            reuse: true,
+            case: CaseIdentity {
+                target: "root//pkg:test (cfg)".to_owned(),
+                suite: "root//pkg:test".to_owned(),
+                case: "module::case".to_owned(),
+                discovery: "discovery".to_owned(),
+            },
+        }
+    }
+
     /// Check the expanded request and, if it qualifies, constrain it to the reuse contract:
     /// local execution only, and no injected per-invocation identity variables.
     ///
@@ -2941,12 +2956,8 @@ mod tests {
         let disk = project.root().as_path().join(script);
         std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
         std::fs::write(&disk, body).unwrap();
-        let store = std::fs::canonicalize("/bin/sh").unwrap();
-        assert!(
-            store.starts_with("/nix/store"),
-            "the test needs a Nix store host"
-        );
-        let store = store.parent().unwrap().to_str().unwrap().to_owned();
+        // The declared shell's store directory, never a host path (`crate::testing`).
+        let store = crate::testing::declared_shell_dir();
         let make = |args: Vec<&str>| {
             let input = CommandExecutionInput::IncrementalRemoteOutput(
                 ProjectRelativePathBuf::unchecked_new(script.to_owned()),
@@ -3005,7 +3016,7 @@ mod tests {
             ExecutorPreference::LocalRequired
         );
         assert!(constrained.omit_local_invocation_identity_env());
-        let why = case.launch().verify().unwrap_err();
+        let why = case.launch().testing_held().verify().unwrap_err();
         assert!(why.contains("/bin/sh"), "{why}");
         let fallback = case.into_legacy_request(constrained);
         // The same request, environment and executor policy as a case that never opted in.
@@ -3092,12 +3103,8 @@ mod tests {
                 FreshDirs::for_stage(&target, &stage("module::other"), names, &fs, root.as_ref())
                     .unwrap()
                     .unwrap();
-            let store = std::fs::canonicalize("/bin/sh").unwrap();
-            assert!(
-                store.starts_with("/nix/store"),
-                "the test needs a Nix store host"
-            );
-            let store = store.parent().unwrap().to_str().unwrap().to_owned();
+            // The declared shell's store directory, never a host path (`crate::testing`).
+            let store = crate::testing::declared_shell_dir();
             let script = "buck-out/v2/gen/t/runner";
             let body = b"#!/bin/sh\necho\n";
             // The request the orchestrator builds for a case whose scratch path is `scratch`.

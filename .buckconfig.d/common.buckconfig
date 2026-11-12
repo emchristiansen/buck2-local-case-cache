@@ -1,5 +1,13 @@
 [cells]
-prelude = prelude
+# NativeLink engine build (decl edition): the prelude is Muninn's patched
+# prelude, the one whose Rust, http_archive and git_fetch rules implement the
+# NativeLink worker contract (Nix manifest as hidden input, copied inputs,
+# --closed-nix-env, pinned archive shell, fetch runtime). It is the exact store
+# path Muninn's recv-v2/ws/.buck2/prelude-source names:
+#   /nix/store/qj3sf0cvm0cqgcfk00awrrd7s83fc6cm-buck2-prelude-87765b7b4ff7762535c5c1529f8d2af871e53b12-muninn-patched
+# reached through the in-project link .buck2/prelude-source, as in Muninn.
+# Upstream instead uses the prelude bundled into the running buck2 binary.
+prelude = .buck2/prelude-source
 none = none
 
 [cell_aliases]
@@ -14,11 +22,10 @@ fbsource = gh_facebook_buck2_shims_meta
 shim = gh_facebook_buck2_shims_meta
 toolchains = gh_facebook_buck2_shims_meta
 
-[external_cells]
-prelude = bundled
-
 [build]
-execution_platforms = prelude//platforms:default
+# NativeLink: build actions run remotely with {OSFamily: Linux, cpu_count: 2};
+# git_fetch runs on the fetch platform. Mirrors Muninn's .buckconfig:33.
+execution_platforms = shim//platforms:remote_linux
 
 # Default Windows compiler identity for the shim's ovr_config//os:windows-*
 # and ovr_config//compiler:* config settings; matches the prelude's default
@@ -27,4 +34,4 @@ execution_platforms = prelude//platforms:default
 windows_compiler_type = windows
 
 [parser]
-target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default
+target_platform_detector_spec = target:root//...->shim//platforms:linux_x86_64 target:shim//...->shim//platforms:linux_x86_64

@@ -2122,6 +2122,63 @@ mod tests {
         Ok((executor, temp.path().root().to_buf(), temp))
     }
 
+    /// The variable that names the declared shell: the exact Nix store path of the pinned bash
+    /// (`shim/nix/pinned_tools.bzl` `PINNED_TOOLS["bash"]`, a root of `shim/nix/nix-manifest.json`),
+    /// the same variable `buck2_test`'s fixtures read. Under Buck, `app/buck2_execute_impl/BUCK`
+    /// supplies it through `test_env` as `$(exe toolchains//:archive_shell)`; under Cargo, the
+    /// caller sets it to the same store path. A bare `sh` or `sleep` would be found through the
+    /// inherited `PATH`, or the C library's or the shell's default search path when there is none,
+    /// all outside the declared closure, so the fixtures below that start a child name neither.
+    #[cfg(unix)]
+    const DECLARED_SHELL: &str = "BUCK2_TEST_DECLARED_SHELL";
+
+    /// The declared shell, a canonical Nix store path. Panics, naming the variable, when it is not
+    /// set: there is no fallback to a host shell.
+    #[cfg(unix)]
+    fn declared_shell() -> std::path::PathBuf {
+        let shell =
+            std::path::PathBuf::from(std::env::var_os(DECLARED_SHELL).unwrap_or_else(|| {
+                panic!(
+                    "{DECLARED_SHELL} is not set: it must name the declared shell's Nix store path"
+                )
+            }));
+        assert!(
+            shell.starts_with("/nix/store/")
+                && std::fs::canonicalize(&shell).ok().as_deref() == Some(&*shell),
+            "{DECLARED_SHELL} is not a canonical Nix store path: {}",
+            shell.display()
+        );
+        shell
+    }
+
+    /// The declared shell's `sh` (`sh -> bash` in its store directory), so a script runs in the
+    /// same POSIX mode a bare `sh` gave it.
+    #[cfg(unix)]
+    fn declared_sh() -> String {
+        let sh = declared_shell().parent().unwrap().join("sh");
+        assert!(
+            sh.exists(),
+            "the declared shell has no `sh`: {}",
+            sh.display()
+        );
+        sh.to_str().unwrap().to_owned()
+    }
+
+    /// A script prefix that makes `sleep` a builtin loaded from the declared shell's own store path
+    /// (`lib/bash/sleep`), so the script never looks `sleep` up through `PATH`. It exits before
+    /// doing anything else if the builtin cannot be loaded.
+    #[cfg(unix)]
+    fn declared_sleep_builtin() -> String {
+        let shell = declared_shell();
+        let sleep = shell
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/bash/sleep");
+        format!("enable -f '{}' sleep || exit 97; ", sleep.display())
+    }
+
     #[tokio::test]
     async fn test_exec_cmd_environment() -> buck2_error::Result<()> {
         let (executor, root, _tmpdir) = test_executor()?;
@@ -2216,11 +2273,15 @@ mod tests {
             None,
         )?;
         // NUL, bytes that are not UTF-8, and no final newline on either stream.
-        let script = "printf 'out\\000\\376\\377 tail'; printf 'err\\000\\200 no newline' >&2; \
-                      : > written; exec sleep 60";
+        // The shell itself waits, through the declared shell's `sleep` builtin.
+        let script = format!(
+            "{}printf 'out\\000\\376\\377 tail'; printf 'err\\000\\200 no newline' >&2; \
+             : > written; sleep 60",
+            declared_sleep_builtin()
+        );
         let request = CommandExecutionRequest::new(
             vec![],
-            vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            vec![declared_sh(), "-c".to_owned(), script],
             paths,
             Default::default(),
         )
@@ -2402,7 +2463,7 @@ printf ran
         let request = CommandExecutionRequest::new(
             vec![],
             vec![
-                "sh".to_owned(),
+                declared_sh(),
                 "-c".to_owned(),
                 script.to_owned(),
                 "sh".to_owned(),
@@ -2538,7 +2599,7 @@ printf ran
         let request = CommandExecutionRequest::new(
             vec![],
             vec![
-                "sh".to_owned(),
+                declared_sh(),
                 "-c".to_owned(),
                 script.to_owned(),
                 "sh".to_owned(),
@@ -2628,7 +2689,7 @@ printf ran
         )?;
         let request = CommandExecutionRequest::new(
             vec![],
-            vec!["sh".to_owned(), "-c".to_owned(), ": > started".to_owned()],
+            vec![declared_sh(), "-c".to_owned(), ": > started".to_owned()],
             paths,
             Default::default(),
         )
@@ -2686,7 +2747,7 @@ printf ran
         let request = CommandExecutionRequest::new(
             vec![],
             vec![
-                "sh".to_owned(),
+                declared_sh(),
                 "-c".to_owned(),
                 script.to_owned(),
                 "sh".to_owned(),
@@ -2829,9 +2890,13 @@ printf ran
         use futures::FutureExt;
 
         let (executor, root, _tmpdir) = test_executor()?;
+        // The shell itself is the child that waits, through the declared shell's `sleep` builtin.
         let (request, _) = scratch_request(
             &executor,
-            "echo $$ > \"$PWD/pid\"; exec sleep 60",
+            &format!(
+                "{}echo $$ > \"$PWD/pid\"; sleep 60",
+                declared_sleep_builtin()
+            ),
             vec![],
             &[("FRESH_A", "0")],
         )?;

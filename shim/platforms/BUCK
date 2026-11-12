@@ -1,0 +1,37 @@
+# NativeLink execution and target platforms for the engine build (decl edition).
+#
+# remote_execution_platform.bzl is a byte-identical copy of Muninn's
+# buck2/platforms/remote_execution_platform.bzl (recv-v2/ws, sha256
+# aba04ee183dff89dd8ecce82d77c6b82fbca5e781449c9223fb6d0351cbac31d): build
+# actions carry REMOTE_EXECUTION_PROPERTIES {OSFamily: Linux, cpu_count: 2}
+# (lines 6-9); test profiles add MUNINN_TEST_RUNTIME
+# {muninn-test-runtime: linux-unprivileged-v2} (line 86). The declarations
+# below mirror Muninn's buck2/platforms/BUCK:4-26.
+
+load("@prelude//platforms:defs.bzl", "execution_platform")
+load(":remote_execution_platform.bzl", "remote_execution_platform", "remote_fetch_execution_platform")
+
+# The one target platform: Linux x86_64, independent of the analysing host.
+execution_platform(
+    name = "linux_x86_64",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    use_windows_path_separators = False,
+    visibility = ["PUBLIC"],
+)
+
+remote_execution_platform(
+    name = "remote_linux",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    fetch_platform = ":remote_fetch_linux",
+    visibility = ["PUBLIC"],
+)
+
+remote_fetch_execution_platform(
+    name = "remote_fetch_linux",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:linux",
+    fetch_constraint = "prelude//git/tools:fetch_runtime_available",
+    visibility = ["PUBLIC"],
+)

@@ -14,6 +14,10 @@ use std::time::Duration;
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_core::execution_types::execution_group::ExecutionGroup;
+use buck2_core::execution_types::executor_config::CommandExecutorConfig;
+use buck2_core::execution_types::executor_config::Executor;
+use buck2_core::execution_types::executor_config::RemoteEnabledExecutor;
+use buck2_core::execution_types::executor_config::RemoteEnabledExecutorOptions;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
@@ -114,8 +118,8 @@ pub struct InternalRunnerTestInfo<'v> {
     /// Defaults to `True`.
     run_from_project_root: ValueOfUnchecked<'v, bool>,
 
-    /// Permission to request the strict local exact-case result path. It is not
-    /// remote action-cache permission or proof that the case is eligible.
+    /// Permission to request exact-case result reuse; `case_result_reuse` says which kind the
+    /// executors select. It is not proof that the case is eligible.
     supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
 
     /// Environment variables each test case process receives naming a new, empty directory of
@@ -136,7 +140,10 @@ pub struct InternalRunnerTestInfo<'v> {
     /// `default_executor` wins and the group is not resolved, so copying a test info field by
     /// field works in any rule. A rule that declares named groups but not `DefaultExecGroup` must
     /// set `exec_group` or `default_executor`; `executor_overrides` does not replace them, as the
-    /// tests run in the default group whenever no override is picked.
+    /// tests run in the default group whenever no override is picked. A recorded executor has
+    /// `ExecutorConfigOrigin::ExecutionGroupPlatform`, also in a field-by-field copy, so it is
+    /// never taken for an executor the rule selected: `[test] local_internal_cases` does not
+    /// admit it under `--remote-only`.
     exec_group: ValueOfUnchecked<'v, NoneOr<ExecutionGroupArg>>,
 
     /// Executors that can be used to override the default executor.
@@ -253,6 +260,20 @@ impl<'v> InternalRunnerTestInfo<'v> {
             .unwrap()
             .into_option()
             .unwrap_or(false)
+    }
+
+    /// The exact-case result reuse this provider requests. Only a provider whose default
+    /// executor, and listing override if it has one, run remotely only with the remote cache
+    /// enabled reuses through the remote action cache; any other request keeps the strict
+    /// host-local case store, exactly as before.
+    pub fn case_result_reuse(&self) -> CaseResultReuse {
+        if !self.supports_test_execution_caching() {
+            CaseResultReuse::None
+        } else if is_remote_only_with_cache(self.default_executor().map(|c| &*c.0)) {
+            CaseResultReuse::RemoteActionCache
+        } else {
+            CaseResultReuse::HostStore
+        }
     }
 
     /// The content that alone determines the listing and result parsers, if both are
@@ -602,6 +623,63 @@ fn check_fresh_dir_env(info: &InternalRunnerTestInfo<'_>) -> buck2_error::Result
     Ok(())
 }
 
+/// The exact-case result reuse an `InternalRunnerTestInfo` requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseResultReuse {
+    /// Every case executes; nothing is reused.
+    None,
+    /// The strict host-local case store (`[test] local_case_result_cache_root`).
+    HostStore,
+    /// The remote action cache entry of the case's exact remote action. A hit is reused only
+    /// when the current parser confirms it as one PASS for the case; otherwise the case executes
+    /// again remotely without reading any cache.
+    RemoteActionCache,
+}
+
+/// Whether `config` runs commands remotely only, never locally, with the remote cache enabled.
+fn is_remote_only_with_cache(config: Option<&CommandExecutorConfig>) -> bool {
+    matches!(
+        config,
+        Some(CommandExecutorConfig {
+            executor: Executor::RemoteEnabled(RemoteEnabledExecutorOptions {
+                executor: RemoteEnabledExecutor::Remote(_),
+                remote_cache_enabled: true,
+                ..
+            }),
+            ..
+        })
+    )
+}
+
+/// A provider reusing through the remote action cache must list remotely too, and must declare
+/// nothing only a local execution supplies: a fresh directory or a local resource.
+fn check_remote_case_result_reuse(info: &InternalRunnerTestInfo<'_>) -> buck2_error::Result<()> {
+    if info.case_result_reuse() != CaseResultReuse::RemoteActionCache {
+        return Ok(());
+    }
+    if let Some(listing) = info.executor_override("listing") {
+        if !is_remote_only_with_cache(Some(&*listing.0)) {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "remote case result reuse requires the `listing` executor override to run remotely only, with the remote cache enabled"
+            ));
+        }
+    }
+    if info.fresh_dir_env().next().is_some() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "remote case result reuse cannot declare `fresh_dir_env`, which only a local execution supplies"
+        ));
+    }
+    if info.required_local_resources().next().is_some() || !info.local_resources().is_empty() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "remote case result reuse cannot declare local resources"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_internal_runner_test_info<'v>(
     info: &InternalRunnerTestInfo<'v>,
 ) -> buck2_error::Result<()> {
@@ -656,6 +734,7 @@ fn validate_internal_runner_test_info<'v>(
         .internal_error("`run_from_project_root` must be a bool if provided")?;
     NoneOr::<bool>::unpack_value(info.supports_test_execution_caching.get())?
         .internal_error("`supports_test_execution_caching` must be a bool if provided")?;
+    check_remote_case_result_reuse(info)?;
 
     // Both parse_test_listing and parse_test_result are required callables.
     let ptl = info.parse_test_listing.get();

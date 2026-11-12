@@ -43,10 +43,12 @@ use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArtifactVisito
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineBuilder;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SimpleCommandLineArtifactVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::SingletonCommandLineSink;
+use buck2_build_api::interpreter::rule_defs::command_executor_config::ExecutorConfigOrigin;
 use buck2_build_api::interpreter::rule_defs::command_executor_config::StarlarkCommandExecutorConfig;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::external_runner_test_info::ExternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::external_runner_test_info::OwnedExternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::external_runner_test_info::TestCommandMember;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::CaseResultReuse;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::local_resource_info::OwnedLocalResourceInfo;
@@ -77,6 +79,7 @@ use buck2_core::execution_types::executor_config::LocalExecutorOptions;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
 use buck2_core::execution_types::executor_config::RemoteExecutorCustomImage;
+use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
 use buck2_core::fs::buck_out_path::BuckOutTestPath;
@@ -296,17 +299,20 @@ impl OwnedTestInfo {
         }
     }
 
+    /// Whether the provider requests the strict host-local case store.
     fn requests_local_case_result_caching(&self) -> bool {
         match self {
             Self::External(_) => false,
-            Self::Internal(info) => info
-                .as_ref()
-                .value()
-                .as_ref()
-                .supports_test_execution_caching(),
+            Self::Internal(info) => {
+                info.as_ref().value().as_ref().case_result_reuse() == CaseResultReuse::HostStore
+            }
         }
     }
 
+    /// Whether the provider's test commands read the remote action cache. An Internal provider
+    /// does only for remote case result reuse; its runner then confirms each hit with the current
+    /// parser before reporting it, and executes a case whose hit it does not confirm again
+    /// without reading any cache.
     fn supports_test_execution_caching(&self) -> bool {
         match self {
             Self::External(info) => info
@@ -314,7 +320,10 @@ impl OwnedTestInfo {
                 .value()
                 .as_ref()
                 .supports_test_execution_caching(),
-            Self::Internal(_) => false,
+            Self::Internal(info) => {
+                info.as_ref().value().as_ref().case_result_reuse()
+                    == CaseResultReuse::RemoteActionCache
+            }
         }
     }
 
@@ -1882,25 +1891,36 @@ impl BuckTestOrchestrator<'_> {
             .await
     }
 
-    /// Materialize the input-tree executables a constrained case launches and check their `#!`
-    /// interpreters. A case found ineligible here is given up; the caller restores its legacy
-    /// request, exactly as for a case found ineligible before it was constrained.
+    /// Materialize the exact values of the input-tree executables a constrained case launches,
+    /// hold them for reading, and check their `#!` interpreters in those values. A case found
+    /// ineligible here is given up; the caller restores its legacy request, exactly as for a case
+    /// found ineligible before it was constrained.
+    ///
+    /// The values are those the action's input tree binds, which the executor materializes at
+    /// the same paths before it starts the command: the check reads what will run, never what
+    /// an earlier artifact or nothing left at the path. A path-only request would not do: the
+    /// disk-state materializer has no value to make for a bare path and leaves the path alone.
     async fn check_local_case_launch(
         test_target_label: &ConfiguredProvidersLabel,
         stage: &TestStage,
         materializer: &dyn Materializer,
+        re_use_case: RemoteExecutorUseCase,
         local_case: ConstrainedCase,
     ) -> LaunchCheck {
-        let launched = local_case.launch().executables();
-        if !launched.is_empty() {
-            if let Err(e) = materializer
-                .ensure_materialized(launched, MaterializationPurpose::IntermediateOnly)
-                .await
-            {
-                return LaunchCheck::Failed("local_case_launch_materialization", e);
+        let launch = match local_case
+            .launch()
+            .clone()
+            .materialize(materializer, re_use_case)
+            .await
+        {
+            Ok(Ok(launch)) => launch,
+            Ok(Err(e)) => {
+                return LaunchCheck::Failed("local_case_launch_materialization", e.into());
             }
-        }
-        let launch = local_case.launch().clone();
+            Err(e) => return LaunchCheck::Failed("local_case_launch_materialization", e),
+        };
+        // The lease travels with the check and is released when it ends, before the action is
+        // executed (`MaterializedLaunch`).
         match tokio::task::spawn_blocking(move || launch.verify()).await {
             Ok(Ok(())) => LaunchCheck::Eligible(local_case),
             Ok(Err(why)) => {
@@ -1979,10 +1999,12 @@ impl BuckTestOrchestrator<'_> {
                 // Only a constrained case needs the materializer: an ordinary request runs
                 // without one, as upstream's orchestrator does.
                 let materializer = dice.per_transaction_data().get_materializer_handle();
+                let re_use_case = invocation_re_use_case(dice);
                 match Self::check_local_case_launch(
                     test_target_label,
                     stage,
                     &*materializer,
+                    re_use_case,
                     local_case,
                 )
                 .await
@@ -2486,8 +2508,10 @@ impl BuckTestOrchestrator<'_> {
     }
 
     /// The local-execution admission for one listing or test command. The provider must have
-    /// explicitly selected the local executor (its `default_executor` or the named override); a
-    /// platform-derived fallback executor never is admitted. Then:
+    /// explicitly selected the local executor (its `default_executor` or the named override) with
+    /// an `ExecutorConfigOrigin::Declared` value; a platform-derived executor is never admitted,
+    /// whether it is the fallback (`None`) or one the test info recorded from the execution
+    /// platform of its execution group (`ExecutorConfigOrigin::ExecutionGroupPlatform`). Then:
     /// - an `InternalRunnerTestInfo` test is admitted under `[test] local_internal_cases`;
     /// - an `ExternalRunnerTestInfo` test that does not support test execution caching is
     ///   admitted under `[test] local_workspace_tests`, as a local-workspace test, never as an
@@ -2499,14 +2523,21 @@ impl BuckTestOrchestrator<'_> {
     /// invocation's own caching flags.
     fn local_execution_for_test(
         kind: TestProviderKind,
-        provider_executor: Option<&CommandExecutorConfig>,
+        provider_executor: Option<&StarlarkCommandExecutorConfig>,
         supports_test_execution_caching: bool,
         admissions: LocalTestAdmissions,
     ) -> LocalExecution {
-        let Some(CommandExecutorConfig {
+        let declared_executor = match provider_executor {
+            Some(config) => match config.origin() {
+                ExecutorConfigOrigin::Declared => &*config.0,
+                ExecutorConfigOrigin::ExecutionGroupPlatform => return LocalExecution::ByStrategy,
+            },
+            None => return LocalExecution::ByStrategy,
+        };
+        let CommandExecutorConfig {
             executor: Executor::Local(_),
             ..
-        }) = provider_executor
+        } = declared_executor
         else {
             return LocalExecution::ByStrategy;
         };
@@ -2523,9 +2554,11 @@ impl BuckTestOrchestrator<'_> {
         }
     }
 
-    /// The executor the provider explicitly selected for one listing or test command (the named
+    /// The executor the provider selected for one listing or test command (the named
     /// `executor_override`, else for a listing the `listing` override or the default, else the
-    /// default), and that command's local-execution admission. Both executor construction and
+    /// default), and that command's local-execution admission. The default may have been
+    /// recorded from the test info's execution group; it is still the command's executor, but its
+    /// origin keeps it from being admitted locally. Both executor construction and
     /// the choice of DICE result reuse use this one resolution, so they cannot disagree about
     /// which commands are admitted local-workspace tests.
     async fn provider_executor_admission<'t>(
@@ -2537,7 +2570,7 @@ impl BuckTestOrchestrator<'_> {
     ) -> buck2_error::Result<(Option<&'t CommandExecutorConfig>, LocalExecution)> {
         let resolved_executor_override = match executor_override {
             Some(executor_override) => Some(
-                &test_info
+                test_info
                     .executor_override(&executor_override.name)
                     .ok_or_else(|| {
                         internal_error!("The `executor_override` provided does not exist")
@@ -2547,25 +2580,23 @@ impl BuckTestOrchestrator<'_> {
                             "Error processing `executor_override`: `{}`",
                             executor_override.name
                         )
-                    })?
-                    .0,
+                    })?,
             ),
             None => match stage {
                 TestStage::Listing { .. } if test_info.has_executor_overrides() => test_info
                     .executor_override("listing")
-                    .or(test_info.default_executor())
-                    .map(|o| &o.0),
-                _ => test_info.default_executor().map(|o| &o.0),
+                    .or(test_info.default_executor()),
+                _ => test_info.default_executor(),
             },
         };
 
-        let provider_executor = resolved_executor_override.map(|a| &**a);
         let local_execution = Self::local_execution_for_test(
             test_info.kind(),
-            provider_executor,
+            resolved_executor_override,
             test_info.supports_test_execution_caching() || supports_test_execution_caching,
             Self::local_test_admissions(dice).await?,
         );
+        let provider_executor = resolved_executor_override.map(|o| &*o.0);
         Ok((provider_executor, local_execution))
     }
 
@@ -2585,8 +2616,9 @@ impl BuckTestOrchestrator<'_> {
             .await
             .require_compatible()?;
 
-        // Local admission considers only the executor the provider explicitly selected; an
-        // executor resolved from the test's execution group is never admitted locally.
+        // Local admission considers only an executor the provider explicitly selected; an
+        // executor resolved from the test's execution group is never admitted locally, whether
+        // the test info recorded it during analysis (its origin says so) or it is resolved below.
         let (provider_executor, local_execution) = Self::provider_executor_admission(
             dice,
             test_info,
@@ -3991,6 +4023,1031 @@ mod tests {
         Ok(())
     }
 
+    /// EX-S1-01: a constrained case's launch check, through `execute_request` and the disk-state
+    /// materializer with real disk IO. The check must read the executable value the action's
+    /// input tree binds, whatever was or was not at its path before: a path-only
+    /// `ensure_materialized` is deliberately a no-op in that materializer (`v2/core.rs`
+    /// `materialize_many`), so it can neither put a cold executable in place nor replace a
+    /// stale one.
+    mod launch_check_with_disk_state_materializer {
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        use buck2_common::file_ops::metadata::FileMetadata;
+        use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
+        use buck2_core::fs::project::ProjectRoot;
+        use buck2_directory::directory::entry::DirectoryEntry;
+        use buck2_execute::artifact_value::ArtifactValue;
+        use buck2_execute::digest_config::SetDigestConfig;
+        use buck2_execute::directory::ActionDirectoryMember;
+        use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
+        use buck2_execute::execute::environment_inheritance::EnvironmentInheritance;
+        use buck2_execute::execute::output::CommandStdStreams;
+        use buck2_execute::execute::prepared::PreparedCommandExecutor;
+        use buck2_execute::materialize::materializer::SetMaterializer;
+        use buck2_execute::materialize::produce::produce_locally;
+        use buck2_execute::re::invocation_re_settings::InvocationReSettings;
+        use buck2_execute::re::invocation_re_settings::SetInvocationReSettings;
+        use buck2_execute::re::manager::ReConnectionManager;
+        use buck2_execute_impl::materializers::deferred::AccessTimesUpdates;
+        use buck2_execute_impl::materializers::deferred::DeferredMaterializerConfigs;
+        use buck2_execute_impl::materializers::deferred::TtlRefreshConfiguration;
+        use buck2_execute_impl::materializers::deferred::clean_stale::CleanStaleConfig;
+        use buck2_execute_impl::materializers::v2::core::DiskStateMaterializer;
+        use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+        use buck2_re_configuration::RemoteExecutionStaticMetadata;
+        use buck2_util::time_span::TimeSpan;
+        use dice::UserComputationData;
+        use dice::testing::DiceBuilder;
+
+        use super::*;
+        use crate::local_result_cache::LocalCaseCandidate;
+
+        /// The launched executable, an input of the action.
+        const EXE: &str = "buck-out/v2/gen/t/launched";
+        /// Where another action produced the same content earlier, which is where the
+        /// materializer can copy it from.
+        const PRODUCED: &str = "buck-out/v2/gen/producer/out";
+
+        fn path(s: &str) -> ProjectRelativePathBuf {
+            ProjectRelativePathBuf::unchecked_new(s.to_owned())
+        }
+
+        fn value(content: &[u8]) -> FileMetadata {
+            FileMetadata {
+                digest: TrackedFileDigest::from_content(
+                    content,
+                    DigestConfig::testing_default().cas_digest_config(),
+                ),
+                is_executable: true,
+            }
+        }
+
+        /// The declared shell's store directory (`crate::testing`), whose `sh` is a bound
+        /// interpreter. Never a host path.
+        fn store_dir() -> String {
+            crate::testing::declared_shell_dir()
+        }
+
+        /// The daemon's disk-state materializer over `project`, with real disk IO and no CAS.
+        fn disk_state(project: &ProjectRoot, strict_leases: bool) -> Arc<dyn Materializer> {
+            let buck_out = path("buck-out/v2");
+            let re = Arc::new(ReConnectionManager::new(
+                buck2_common::fbinit::get_or_init_fbcode_globals(),
+                false,
+                0,
+                Arc::new(RemoteExecutionStaticMetadata::default()),
+                None,
+                project
+                    .root()
+                    .join(ForwardRelativePath::unchecked_new("buck-out/v2")),
+                false,
+            ));
+            Arc::new(
+                DiskStateMaterializer::new(
+                    project.dupe(),
+                    DigestConfig::testing_default(),
+                    buck_out,
+                    re,
+                    Arc::new(DummyBlockingExecutor { fs: project.dupe() }),
+                    DeferredMaterializerConfigs {
+                        materialize_final_artifacts: true,
+                        defer_write_actions: false,
+                        ttl_refresh: TtlRefreshConfiguration {
+                            frequency: Duration::default(),
+                            min_ttl: Default::default(),
+                            enabled: false,
+                        },
+                        update_access_times: AccessTimesUpdates::Disabled,
+                        verbose_materializer_log: false,
+                        clean_stale_config: CleanStaleConfig::default(),
+                        readonly_outputs: false,
+                        strict_leases,
+                    },
+                    None,
+                    None,
+                    EventDispatcher::null(),
+                )
+                .unwrap(),
+            )
+        }
+
+        /// Another action's local run producing `content` at `PRODUCED`, which the materializer
+        /// then tracks.
+        async fn produce(materializer: &dyn Materializer, project: &ProjectRoot, content: &[u8]) {
+            let disk = project.root().as_path().join(PRODUCED);
+            let bytes = content.to_vec();
+            produce_locally(
+                materializer,
+                &DummyBlockingExecutor { fs: project.dupe() },
+                path(PRODUCED),
+                ArtifactValue::file(value(content)),
+                move || {
+                    std::fs::create_dir_all(disk.parent().unwrap())?;
+                    std::fs::write(&disk, &bytes)?;
+                    std::fs::set_permissions(
+                        &disk,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                    )?;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        /// What the executor was asked to run: the request's executor preference, which is
+        /// `LocalRequired` only for a case that stayed constrained, and the bytes at `EXE` when
+        /// it started.
+        #[derive(Debug, Clone, PartialEq)]
+        struct Started {
+            preference: ExecutorPreference,
+            exe: Option<Vec<u8>>,
+        }
+
+        struct Recording {
+            exe: PathBuf,
+            started: Arc<Mutex<Vec<Started>>>,
+        }
+
+        #[async_trait]
+        impl PreparedCommandExecutor for Recording {
+            async fn exec_cmd(
+                &self,
+                command: &PreparedCommand<'_, '_>,
+                manager: CommandExecutionManager,
+                _cancellations: &CancellationContext,
+            ) -> CommandExecutionResult {
+                self.started.lock().unwrap().push(Started {
+                    preference: command.request.executor_preference(),
+                    exe: std::fs::read(&self.exe).ok(),
+                });
+                manager.claim().await.success(
+                    CommandExecutionKind::Local {
+                        digest: command.prepared_action.digest(),
+                        command: vec![],
+                        env: BuckFixedSortedMap::new(),
+                    },
+                    Default::default(),
+                    CommandStdStreams::Local {
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    CommandExecutionMetadata::empty(TimeSpan::empty_now()),
+                )
+            }
+
+            fn is_local_execution_possible(
+                &self,
+                _executor_preference: ExecutorPreference,
+            ) -> bool {
+                true
+            }
+        }
+
+        /// The request a constrained local case runs: `EXE`, bound to `requested`, launched
+        /// with a store `PATH`, and constrained as the orchestrator constrains it.
+        fn constrained_case(
+            fs: &ArtifactFs,
+            requested: &[u8],
+            cache_root: &str,
+        ) -> (CommandExecutionRequest, ConstrainedCase) {
+            let digest_config = DigestConfig::testing_default();
+            let input = CommandExecutionInput::IncrementalRemoteOutput(
+                path(EXE),
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(value(requested))),
+            );
+            let paths = CommandExecutionPaths::new(
+                vec![input],
+                Default::default(),
+                fs,
+                digest_config,
+                None,
+            )
+            .unwrap();
+            let env: BuckFixedSortedMap<String, String> =
+                [("PATH".to_owned(), store_dir())].into_iter().collect();
+            let request = CommandExecutionRequest::new(
+                vec![],
+                vec![EXE.to_owned(), "module::case".to_owned()],
+                paths,
+                env,
+            )
+            .with_local_environment_inheritance(EnvironmentInheritance::empty())
+            .with_executor_preference(ExecutorPreference::LocalPreferred);
+            let (request, case) = LocalCaseCandidate::testing_new(cache_root.to_owned()).constrain(
+                request,
+                RequestFacts {
+                    project_fs: fs.fs(),
+                    buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
+                },
+                None,
+                |_| true,
+            );
+            (
+                request,
+                case.expect("the case is eligible before its launch check"),
+            )
+        }
+
+        /// One constrained case through `execute_request`, with `on_disk` left at `EXE` by
+        /// something the materializer does not track (an earlier daemon, an older build), or
+        /// nothing there, and `requested` the value the input tree binds.
+        async fn launch(on_disk: Option<&[u8]>, requested: &[u8]) -> Vec<Started> {
+            let temp = ProjectRootTemp::new().unwrap();
+            let project = temp.path();
+            let digest_config = DigestConfig::testing_default();
+            let materializer = disk_state(project, false);
+            produce(&*materializer, project, requested).await;
+            let exe = project.root().as_path().join(EXE);
+            if let Some(stale) = on_disk {
+                std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+                std::fs::write(&exe, stale).unwrap();
+            }
+
+            let mut data = UserComputationData::new();
+            data.data.set(EventDispatcher::null());
+            data.set_materializer(materializer.dupe());
+            data.set_invocation_re_settings(InvocationReSettings {
+                use_case: RemoteExecutorUseCase::buck2_default(),
+                cas_configured: false,
+                may_probe_cas: false,
+            });
+            let dice = DiceBuilder::new()
+                .set_data(|d| {
+                    d.set_testing_io_provider(&temp);
+                    d.set_digest_config(digest_config);
+                })
+                .build(data)
+                .await
+                .unwrap()
+                .commit()
+                .await;
+            let fs = ArtifactFs::new(
+                CellResolver::testing_with_name_and_path(
+                    CellName::testing_new("cell"),
+                    CellRootPathBuf::new(path("cell")),
+                ),
+                BuckOutPathResolver::new(path("buck-out/v2")),
+                project.dupe(),
+            );
+            let started = Arc::new(Mutex::new(Vec::new()));
+            let executor = CommandExecutor::new(
+                Arc::new(Recording {
+                    exe: exe.clone(),
+                    started: started.dupe(),
+                }),
+                Arc::new(NoOpCommandOptionalExecutor {}),
+                Arc::new(NoOpCommandOptionalExecutor {}),
+                Arc::new(NoOpCacheUploader {}),
+                None,
+                fs.dupe(),
+                CommandGenerationOptions {
+                    path_separator: PathSeparatorKind::system_default(),
+                    output_paths_behavior: Default::default(),
+                    use_bazel_protocol_remote_persistent_workers: false,
+                    network_access: None,
+                },
+                remote_execution::Platform { properties: vec![] },
+            );
+            let cache_root = project.root().as_path().join("local-case-results");
+            let (request, case) = constrained_case(&fs, requested, cache_root.to_str().unwrap());
+            let label = ConfiguredProvidersLabel::new(
+                ConfiguredTargetLabel::testing_parse(
+                    "cell//pkg:foo",
+                    ConfigurationData::testing_new(),
+                ),
+                Default::default(),
+            );
+            let stage = TestStage::Testing {
+                suite: "foo".to_owned(),
+                testcases: vec!["module::case".to_owned()],
+                variant: None,
+                repeat_count: None,
+            };
+            let mut ctx = dice.ctx();
+            let result = buck2_events::dispatch::with_dispatcher_async(
+                EventDispatcher::null(),
+                BuckTestOrchestrator::execute_request(
+                    &mut ctx,
+                    CancellationContext::testing(),
+                    &label,
+                    &stage,
+                    &executor,
+                    request,
+                    NoopLivelinessObserver::create(),
+                    false,
+                    false,
+                    Some(case),
+                    None,
+                    WaitingData::new(),
+                ),
+            )
+            .await;
+            assert!(result.is_ok(), "execute_request failed");
+            started.lock().unwrap().clone()
+        }
+
+        fn constrained(exe: &[u8]) -> Vec<Started> {
+            vec![Started {
+                preference: ExecutorPreference::LocalRequired,
+                exe: Some(exe.to_vec()),
+            }]
+        }
+
+        /// The legacy request: the case was given up, and runs as if reuse were never asked.
+        fn legacy(exe: Option<&[u8]>) -> Vec<Started> {
+            vec![Started {
+                preference: ExecutorPreference::LocalPreferred,
+                exe: exe.map(<[u8]>::to_vec),
+            }]
+        }
+
+        /// A stale non-`#!` file at the path must not stand in for a requested script whose
+        /// interpreter is a host tool: the requested script is what runs, so the case is
+        /// refused, and the bytes the executor finds are the requested ones.
+        #[tokio::test]
+        async fn a_stale_binary_does_not_admit_a_requested_host_interpreter_script() {
+            let requested: &[u8] = b"#!/bin/sh\necho requested\n";
+            let started = launch(Some(b"\x7fELF stale binary"), requested).await;
+            assert_eq!(started, legacy(Some(requested)));
+        }
+
+        /// A cold executable, absent from disk, is materialized for the check, and a valid
+        /// case keeps its reuse.
+        #[tokio::test]
+        async fn a_cold_executable_is_materialized_and_the_case_stays_eligible() {
+            let requested: &[u8] = b"\x7fELF requested binary";
+            assert_eq!(launch(None, requested).await, constrained(requested));
+        }
+
+        /// A requested script with a bound store interpreter is admitted even when an
+        /// unbound script was left at its path, since that is not what runs.
+        #[tokio::test]
+        async fn a_requested_store_interpreter_script_is_admitted_over_a_stale_host_script() {
+            let requested = format!("#!{}/sh\necho requested\n", store_dir()).into_bytes();
+            let started = launch(Some(b"#!/bin/sh\necho stale\n"), &requested).await;
+            assert_eq!(started, constrained(&requested));
+        }
+
+        /// Under strict leases, which remove a tracked intermediate root the moment its last
+        /// lease ends, the checked executable stays on disk, and no writer gets its path, for
+        /// exactly as long as the check holds it; afterwards it is gone, so nothing could have
+        /// read it outside the lease.
+        #[tokio::test]
+        async fn the_checked_value_is_held_for_the_check_under_strict_leases() {
+            use buck2_execute::materialize::materializer::DeclareArtifactPayload;
+            use buck2_execute::materialize::materializer::HeldContent;
+
+            let temp = ProjectRootTemp::new().unwrap();
+            let project = temp.path();
+            let materializer = disk_state(project, true);
+            let requested = format!("#!{}/sh\necho requested\n", store_dir()).into_bytes();
+            // The producer keeps its own output, or strict cleanup would take the source away.
+            let produced = match materializer
+                .hold_or_take(path(PRODUCED), ArtifactValue::file(value(&requested)))
+                .await
+                .unwrap()
+            {
+                HeldContent::Found(_) => unreachable!("nothing was produced yet"),
+                HeldContent::Missing(lease) => {
+                    let disk = project.root().as_path().join(PRODUCED);
+                    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+                    std::fs::write(&disk, &requested).unwrap();
+                    materializer
+                        .declare_existing(
+                            &lease,
+                            vec![DeclareArtifactPayload {
+                                path: path(PRODUCED),
+                                artifact: ArtifactValue::file(value(&requested)),
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                    lease.into_read_lease()
+                }
+            };
+            let exe = project.root().as_path().join(EXE);
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(&exe, b"\x7fELF stale binary").unwrap();
+            let fs = ArtifactFs::new(
+                CellResolver::testing_with_name_and_path(
+                    CellName::testing_new("cell"),
+                    CellRootPathBuf::new(path("cell")),
+                ),
+                BuckOutPathResolver::new(path("buck-out/v2")),
+                project.dupe(),
+            );
+            let cache_root = project.root().as_path().join("local-case-results");
+            let (_, case) = constrained_case(&fs, &requested, cache_root.to_str().unwrap());
+
+            let held = case
+                .launch()
+                .clone()
+                .materialize(&*materializer, RemoteExecutorUseCase::buck2_default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read(&exe).unwrap(), requested);
+            held.verify().unwrap();
+            // A writer at the path waits for the check's lease.
+            let mut writer = Box::pin(materializer.prepare_outputs(vec![path(EXE)]));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut writer)
+                    .await
+                    .is_err(),
+                "a writer took the checked path while the check held it"
+            );
+            assert_eq!(std::fs::read(&exe).unwrap(), requested);
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("the writer is granted once the check releases its lease")
+                .unwrap()
+                .abandon();
+
+            // Held again, then released with nobody else holding it: strict cleanup removes it.
+            let held = case
+                .launch()
+                .clone()
+                .materialize(&*materializer, RemoteExecutorUseCase::buck2_default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read(&exe).unwrap(), requested);
+            held.verify().unwrap();
+            drop(held);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while exe.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "strict cleanup kept the released executable"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(produced);
+        }
+
+        /// EX-S1-01 end to end, with nothing substituted for the final executor. A normal
+        /// Artifact-backed test request goes through `execute_request`: the launch check
+        /// materializes and reads the requested value, then the materializer replaces or removes
+        /// the content at the executable's path, and then the real `LocalExecutor` runs the
+        /// request over the same disk-state materializer and starts a real child.
+        ///
+        /// The check's lease ends before execution (`MaterializedLaunch`). What makes the started
+        /// bytes the checked ones is the executor's own `materialize_inputs`, which requests the
+        /// same Artifact value at the same path. Each launched script prints its own bytes, so
+        /// the child's stdout is the content the kernel actually executed.
+        mod real_local_executor {
+            use buck2_artifact::actions::key::ActionIndex;
+            use buck2_artifact::artifact::artifact_dyn::ArtifactDyn;
+            use buck2_artifact::artifact::artifact_type::Artifact;
+            use buck2_artifact::artifact::artifact_type::testing::BuildArtifactTestingExt;
+            use buck2_artifact::artifact::build_artifact::BuildArtifact;
+            use buck2_events::daemon_id::DaemonId;
+            use buck2_execute::execute::result::CommandExecutionStatus;
+            use buck2_execute::knobs::ExecutorGlobalKnobs;
+            use buck2_execute_impl::executors::local::ForkserverAccess;
+            use buck2_execute_impl::executors::local::LocalExecutor;
+            use buck2_execute_impl::sqlite::incremental_state_db::IncrementalDbState;
+            use host_sharing::HostSharingBroker;
+            use host_sharing::HostSharingStrategy;
+
+            use super::*;
+
+            /// What happens through the materializer at the executable's path after the launch
+            /// check has ended and before the real executor runs.
+            #[derive(Debug, Clone, Copy, PartialEq)]
+            enum Between {
+                Nothing,
+                /// Another action's local run produces different content at the path, which the
+                /// materializer then tracks as that path's artifact.
+                Replace,
+                /// The path is taken for writing, its content deleted and left untracked.
+                Remove,
+            }
+
+            /// Prints the script's own bytes using only shell builtins, so no tool beyond the
+            /// interpreter is needed.
+            const SELF_PRINT: &str =
+                "while IFS= read -r line; do printf '%s\\n' \"$line\"; done < \"$0\"\n";
+
+            /// The interpreters one run uses.
+            struct Shells {
+                /// The declared shell: a canonical Nix store path, which the launch check admits.
+                store: PathBuf,
+                /// A non-store symlink, inside the run's temporary project, to the same declared
+                /// shell: it runs, but the launch check refuses it as not a Nix store path.
+                alias: PathBuf,
+            }
+
+            impl Shells {
+                fn new(project: &ProjectRoot) -> Self {
+                    Self {
+                        store: crate::testing::declared_shell(),
+                        alias: crate::testing::non_store_shell(
+                            &project.root().as_path().join("host-shell"),
+                        ),
+                    }
+                }
+
+                /// The `PATH` of the request: the declared shell's store directory.
+                fn path_env(&self) -> String {
+                    self.store.parent().unwrap().to_str().unwrap().to_owned()
+                }
+
+                /// A script with the declared store interpreter, which the launch check admits.
+                fn store_script(&self) -> Vec<u8> {
+                    format!("#!{}\n{SELF_PRINT}", self.store.display()).into_bytes()
+                }
+
+                /// A script with a non-store interpreter, which the launch check refuses and
+                /// which still runs.
+                fn host_script(&self) -> Vec<u8> {
+                    format!("#!{}\n{SELF_PRINT}", self.alias.display()).into_bytes()
+                }
+
+                /// The replacement: a script the launch check would have refused, and that
+                /// prints a marker rather than the requested bytes.
+                fn replaced(&self) -> Vec<u8> {
+                    format!("#!{}\necho REPLACED-BYTES-RAN\n", self.alias.display()).into_bytes()
+                }
+            }
+
+            /// What one run did, as the real executor reports it.
+            #[derive(Debug)]
+            struct Run {
+                /// The preference of the request handed to the executor: `LocalRequired` only
+                /// for a case that stayed constrained after its launch check.
+                preference: ExecutorPreference,
+                /// The bytes at the executable's path just before the real executor took over,
+                /// which show that the intervening step took effect.
+                at_handoff: Option<Vec<u8>>,
+                status: String,
+                exit_code: Option<i32>,
+                stdout: Vec<u8>,
+                stderr: Vec<u8>,
+                /// The bytes at the executable's path after the run.
+                after: Option<Vec<u8>>,
+            }
+
+            /// Performs the intervening materializer step and then hands the command to the real
+            /// `LocalExecutor`. It returns the real executor's result unchanged and does not
+            /// finalize anything itself.
+            struct ThenReal {
+                between: Between,
+                replaced: Vec<u8>,
+                project: ProjectRoot,
+                exe: ProjectRelativePathBuf,
+                materializer: Arc<dyn Materializer>,
+                real: LocalExecutor,
+                runs: Arc<Mutex<Vec<Run>>>,
+            }
+
+            impl ThenReal {
+                async fn intervene(&self) {
+                    let disk = self.project.root().as_path().join(self.exe.as_str());
+                    match self.between {
+                        Between::Nothing => {}
+                        Between::Replace => {
+                            let made = produce_locally(
+                                &*self.materializer,
+                                &DummyBlockingExecutor {
+                                    fs: self.project.dupe(),
+                                },
+                                self.exe.clone(),
+                                ArtifactValue::file(value(&self.replaced)),
+                                {
+                                    let disk = disk.clone();
+                                    let replaced = self.replaced.clone();
+                                    move || {
+                                        // A local run's output replaces the whole path.
+                                        match std::fs::remove_file(&disk) {
+                                            Ok(()) => {}
+                                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                            Err(e) => return Err(e.into()),
+                                        }
+                                        std::fs::create_dir_all(disk.parent().unwrap())?;
+                                        std::fs::write(&disk, &replaced)?;
+                                        std::fs::set_permissions(
+                                            &disk,
+                                            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                                        )?;
+                                        Ok(())
+                                    }
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(
+                                made,
+                                buck2_execute::materialize::produce::Produced::Made,
+                                "the replacement was not made through the materializer"
+                            );
+                        }
+                        Between::Remove => {
+                            let lease = self
+                                .materializer
+                                .prepare_outputs(vec![self.exe.clone()])
+                                .await
+                                .unwrap();
+                            std::fs::remove_file(&disk)
+                                .expect("the checked value is not on disk to be removed");
+                            lease.leave_untracked(&self.exe).unwrap();
+                        }
+                    }
+                }
+            }
+
+            #[async_trait]
+            impl PreparedCommandExecutor for ThenReal {
+                async fn exec_cmd(
+                    &self,
+                    command: &PreparedCommand<'_, '_>,
+                    manager: CommandExecutionManager,
+                    cancellations: &CancellationContext,
+                ) -> CommandExecutionResult {
+                    self.intervene().await;
+                    let at_handoff =
+                        std::fs::read(self.project.root().as_path().join(self.exe.as_str())).ok();
+                    let result = self.real.exec_cmd(command, manager, cancellations).await;
+                    let (stdout, stderr) = match &result.report.std_streams {
+                        CommandStdStreams::Local { stdout, stderr } => {
+                            (stdout.clone(), stderr.clone())
+                        }
+                        other => panic!("not a local run: {other:?}"),
+                    };
+                    self.runs.lock().unwrap().push(Run {
+                        preference: command.request.executor_preference(),
+                        at_handoff,
+                        status: match &result.report.status {
+                            CommandExecutionStatus::Success { .. } => "success".to_owned(),
+                            other => format!("{other:?}"),
+                        },
+                        exit_code: result.report.exit_code,
+                        stdout,
+                        stderr,
+                        after: None,
+                    });
+                    result
+                }
+
+                fn is_local_execution_possible(
+                    &self,
+                    executor_preference: ExecutorPreference,
+                ) -> bool {
+                    self.real.is_local_execution_possible(executor_preference)
+                }
+            }
+
+            /// Pad the shorter script with a trailing comment line so that both have the same
+            /// length, and a check that compares only lengths cannot tell them apart.
+            fn same_length(mut a: Vec<u8>, mut b: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+                fn pad(script: &mut Vec<u8>, to: usize) {
+                    if script.len() < to {
+                        script.extend(std::iter::repeat_n(b'#', to - script.len() - 1));
+                        script.push(b'\n');
+                    }
+                }
+                let len = a.len().max(b.len());
+                pad(&mut a, len);
+                pad(&mut b, len);
+                assert_eq!(a.len(), b.len());
+                (a, b)
+            }
+
+            /// What a run's scripts were.
+            struct Scripts {
+                /// Content another action left tracked at the executable's path before the
+                /// check, or nothing there.
+                tracked_before: Option<Vec<u8>>,
+                /// The value the request's Artifact input binds.
+                requested: Vec<u8>,
+            }
+
+            /// What one run did, with the scripts it used.
+            struct Outcome {
+                runs: Vec<Run>,
+                requested: Vec<u8>,
+                replaced: Vec<u8>,
+            }
+
+            /// One Artifact-backed constrained case run through `execute_request` and the real
+            /// `LocalExecutor`.
+            /// - `scripts`: the run's scripts, made from its interpreters.
+            /// - `between`: the materializer step after the check.
+            async fn run(scripts: impl FnOnce(&Shells) -> Scripts, between: Between) -> Outcome {
+                let temp = ProjectRootTemp::new().unwrap();
+                let project = temp.path();
+                let shells = Shells::new(project);
+                let Scripts {
+                    tracked_before,
+                    requested,
+                } = scripts(&shells);
+                let requested = &requested[..];
+                let replaced = shells.replaced();
+                let digest_config = DigestConfig::testing_default();
+                let materializer = disk_state(project, false);
+                // The requested content exists elsewhere, where the materializer can copy it
+                // from, as an earlier action's output.
+                produce(&*materializer, project, requested).await;
+
+                let fs = ArtifactFs::new(
+                    CellResolver::testing_with_name_and_path(
+                        CellName::testing_new("cell"),
+                        CellRootPathBuf::new(path("cell")),
+                    ),
+                    BuckOutPathResolver::new(path("buck-out/v2")),
+                    project.dupe(),
+                );
+                let target = ConfiguredTargetLabel::testing_parse(
+                    "cell//pkg:foo",
+                    ConfigurationData::testing_new(),
+                );
+                let artifact: Artifact =
+                    BuildArtifact::testing_new(target.dupe(), "launched", ActionIndex::new(0))
+                        .into();
+                let exe = artifact.resolve_configuration_hash_path(&fs).unwrap();
+                let exe_disk = project.root().as_path().join(exe.as_str());
+
+                if let Some(before) = tracked_before.as_deref() {
+                    let bytes = before.to_vec();
+                    let disk = exe_disk.clone();
+                    produce_locally(
+                        &*materializer,
+                        &DummyBlockingExecutor { fs: project.dupe() },
+                        exe.clone(),
+                        ArtifactValue::file(value(before)),
+                        move || {
+                            std::fs::create_dir_all(disk.parent().unwrap())?;
+                            std::fs::write(&disk, &bytes)?;
+                            std::fs::set_permissions(
+                                &disk,
+                                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                            )?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                let mut data = UserComputationData::new();
+                data.data.set(EventDispatcher::null());
+                data.set_materializer(materializer.dupe());
+                data.set_invocation_re_settings(InvocationReSettings {
+                    use_case: RemoteExecutorUseCase::buck2_default(),
+                    cas_configured: false,
+                    may_probe_cas: false,
+                });
+                let dice = DiceBuilder::new()
+                    .set_data(|d| {
+                        d.set_testing_io_provider(&temp);
+                        d.set_digest_config(digest_config);
+                    })
+                    .build(data)
+                    .await
+                    .unwrap()
+                    .commit()
+                    .await;
+
+                let real = LocalExecutor::new(
+                    fs.dupe(),
+                    materializer.dupe(),
+                    Arc::new(IncrementalDbState::db_disabled()),
+                    Arc::new(DummyBlockingExecutor { fs: project.dupe() }),
+                    Arc::new(HostSharingBroker::new(
+                        HostSharingStrategy::SmallerTasksFirst,
+                        1,
+                    )),
+                    project.root().to_buf(),
+                    ForkserverAccess::None,
+                    ExecutorGlobalKnobs::default(),
+                    None,
+                    None,
+                    DaemonId::new(),
+                    RemoteExecutorUseCase::buck2_default(),
+                );
+                let runs = Arc::new(Mutex::new(Vec::new()));
+                let executor = CommandExecutor::new(
+                    Arc::new(ThenReal {
+                        between,
+                        replaced: replaced.clone(),
+                        project: project.dupe(),
+                        exe: exe.clone(),
+                        materializer: materializer.dupe(),
+                        real,
+                        runs: runs.dupe(),
+                    }),
+                    Arc::new(NoOpCommandOptionalExecutor {}),
+                    Arc::new(NoOpCommandOptionalExecutor {}),
+                    Arc::new(NoOpCacheUploader {}),
+                    None,
+                    fs.dupe(),
+                    CommandGenerationOptions {
+                        path_separator: PathSeparatorKind::system_default(),
+                        output_paths_behavior: Default::default(),
+                        use_bazel_protocol_remote_persistent_workers: false,
+                        network_access: None,
+                    },
+                    remote_execution::Platform { properties: vec![] },
+                );
+
+                // A normal Artifact-backed input, as the orchestrator builds a test's inputs.
+                let input =
+                    CommandExecutionInput::Artifact(Box::new(ArtifactGroupValues::from_artifact(
+                        artifact,
+                        ArtifactValue::file(value(requested)),
+                    )));
+                let paths = CommandExecutionPaths::new(
+                    vec![input],
+                    Default::default(),
+                    &fs,
+                    digest_config,
+                    None,
+                )
+                .unwrap();
+                let env: BuckFixedSortedMap<String, String> =
+                    [("PATH".to_owned(), shells.path_env())]
+                        .into_iter()
+                        .collect();
+                let request = CommandExecutionRequest::new(
+                    vec![],
+                    vec![exe.as_str().to_owned(), "module::case".to_owned()],
+                    paths,
+                    env,
+                )
+                .with_local_environment_inheritance(EnvironmentInheritance::empty())
+                .with_executor_preference(ExecutorPreference::LocalPreferred);
+                let cache_root = project.root().as_path().join("local-case-results");
+                let (request, case) =
+                    LocalCaseCandidate::testing_new(cache_root.to_str().unwrap().to_owned())
+                        .constrain(
+                            request,
+                            RequestFacts {
+                                project_fs: fs.fs(),
+                                buck_out: vec!["buck-out".to_owned(), "v2".to_owned()],
+                            },
+                            None,
+                            |_| true,
+                        );
+                let case = case.expect("the case is eligible before its launch check");
+
+                let label = ConfiguredProvidersLabel::new(target, Default::default());
+                let stage = TestStage::Testing {
+                    suite: "foo".to_owned(),
+                    testcases: vec!["module::case".to_owned()],
+                    variant: None,
+                    repeat_count: None,
+                };
+                let mut ctx = dice.ctx();
+                let result = buck2_events::dispatch::with_dispatcher_async(
+                    EventDispatcher::null(),
+                    BuckTestOrchestrator::execute_request(
+                        &mut ctx,
+                        CancellationContext::testing(),
+                        &label,
+                        &stage,
+                        &executor,
+                        request,
+                        NoopLivelinessObserver::create(),
+                        false,
+                        false,
+                        Some(case),
+                        None,
+                        WaitingData::new(),
+                    ),
+                )
+                .await;
+                assert!(result.is_ok(), "execute_request failed");
+                let mut runs = std::mem::take(&mut *runs.lock().unwrap());
+                assert_eq!(runs.len(), 1, "exactly one real run: {runs:?}");
+                runs[0].after = std::fs::read(&exe_disk).ok();
+                Outcome {
+                    runs,
+                    requested: requested.to_vec(),
+                    replaced,
+                }
+            }
+
+            /// The child ran exactly the requested bytes and succeeded.
+            fn assert_ran_requested(run: &Run, requested: &[u8]) {
+                assert_eq!(
+                    (run.status.as_str(), run.exit_code),
+                    ("success", Some(0)),
+                    "the real run did not succeed; stderr: {}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&run.stdout),
+                    String::from_utf8_lossy(requested),
+                    "the executed bytes are not the requested value"
+                );
+                // After the run the path holds the requested value, not the replacement.
+                assert_eq!(run.after.as_deref(), Some(requested));
+            }
+
+            /// Control: with nothing in between, the admitted case runs constrained and the
+            /// child executes the requested bytes.
+            #[tokio::test]
+            async fn with_nothing_in_between_the_real_executor_runs_the_checked_value() {
+                let Outcome {
+                    runs, requested, ..
+                } = run(
+                    |shells| Scripts {
+                        tracked_before: None,
+                        requested: shells.store_script(),
+                    },
+                    Between::Nothing,
+                )
+                .await;
+                assert_eq!(runs[0].preference, ExecutorPreference::LocalRequired);
+                assert_eq!(runs[0].at_handoff.as_deref(), Some(&requested[..]));
+                assert_ran_requested(&runs[0], &requested);
+            }
+
+            /// After the check admits the requested store-interpreter script, another action
+            /// replaces the content at its path through the materializer with a script whose
+            /// interpreter is not a store path. The real executor requests the Artifact value again, so the replacement is
+            /// re-materialized away, and the child executes the checked bytes, never the
+            /// replacement.
+            #[tokio::test]
+            async fn a_replacement_after_the_check_is_rematerialized_before_the_real_run() {
+                let Outcome {
+                    runs,
+                    requested,
+                    replaced,
+                } = run(
+                    |shells| Scripts {
+                        tracked_before: None,
+                        requested: shells.store_script(),
+                    },
+                    Between::Replace,
+                )
+                .await;
+                assert_eq!(runs[0].preference, ExecutorPreference::LocalRequired);
+                assert_eq!(
+                    runs[0].at_handoff.as_deref(),
+                    Some(&replaced[..]),
+                    "the replacement did not take effect before the handoff"
+                );
+                assert_ran_requested(&runs[0], &requested);
+            }
+
+            /// After the check, the content at the path is deleted and left untracked. The real
+            /// executor materializes the requested value again and runs it.
+            #[tokio::test]
+            async fn a_removal_after_the_check_is_rematerialized_before_the_real_run() {
+                let Outcome {
+                    runs, requested, ..
+                } = run(
+                    |shells| Scripts {
+                        tracked_before: None,
+                        requested: shells.store_script(),
+                    },
+                    Between::Remove,
+                )
+                .await;
+                assert_eq!(runs[0].preference, ExecutorPreference::LocalRequired);
+                assert_eq!(
+                    runs[0].at_handoff, None,
+                    "the removal did not take effect before the handoff"
+                );
+                assert_ran_requested(&runs[0], &requested);
+            }
+
+            /// Another action left a tracked store-interpreter script at the path, of the same
+            /// length as the requested value, a script whose interpreter is not a store path. The
+            /// check reads the requested value, not the tracked one, so the case is refused and runs as its legacy request. The real
+            /// executor runs the requested bytes, and an admission based on bytes that do not
+            /// run never happens. A materializer replacement before the real run changes neither
+            /// result.
+            #[tokio::test]
+            async fn a_tracked_admissible_script_does_not_admit_the_requested_refused_one() {
+                let Outcome {
+                    runs, requested, ..
+                } = run(
+                    |shells| {
+                        let (requested, tracked) =
+                            same_length(shells.host_script(), shells.store_script());
+                        Scripts {
+                            tracked_before: Some(tracked),
+                            requested,
+                        }
+                    },
+                    Between::Replace,
+                )
+                .await;
+                assert_eq!(
+                    runs[0].preference,
+                    ExecutorPreference::LocalPreferred,
+                    "the case was admitted on bytes that are not the ones that run"
+                );
+                assert_ran_requested(&runs[0], &requested);
+            }
+        }
+    }
+
     #[test]
     fn test_create_action_key_suffix_listing() {
         let stage = TestStage::Listing {
@@ -4146,13 +5203,63 @@ mod tests {
             }
         }
 
+        /// The admission of an executor the provider declared (`CommandExecutorConfig(...)`).
         fn admission(
             kind: TestProviderKind,
             provider_executor: Option<&CommandExecutorConfig>,
             caching: bool,
             admissions: LocalTestAdmissions,
         ) -> LocalExecution {
-            Orchestrator::local_execution_for_test(kind, provider_executor, caching, admissions)
+            let declared = provider_executor
+                .map(|config| StarlarkCommandExecutorConfig::declared(Arc::new(config.clone())));
+            Orchestrator::local_execution_for_test(kind, declared.as_ref(), caching, admissions)
+        }
+
+        #[test]
+        fn an_execution_group_platform_executor_is_never_admitted() {
+            // The provider's `default_executor` was recorded from the local execution platform of
+            // its `exec_group`: the same executor as an explicit local one, but chosen by
+            // execution platform resolution, so `--remote-only` governs it.
+            for executor in [local(), hybrid(), none()] {
+                let recorded = StarlarkCommandExecutorConfig::from_execution_group_platform(
+                    Arc::new(executor),
+                );
+                for kind in [TestProviderKind::External, TestProviderKind::Internal] {
+                    for admissions in [OFF, INTERNAL_CASES, WORKSPACE_TESTS, BOTH] {
+                        for caching in [false, true] {
+                            assert_eq!(
+                                Orchestrator::local_execution_for_test(
+                                    kind,
+                                    Some(&recorded),
+                                    caching,
+                                    admissions
+                                ),
+                                LocalExecution::ByStrategy,
+                                "{kind:?} {admissions:?} {caching} {recorded:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            // The positive control: the same local executor, declared, is admitted.
+            assert_eq!(
+                admission(
+                    TestProviderKind::Internal,
+                    Some(&local()),
+                    false,
+                    INTERNAL_CASES
+                ),
+                LocalExecution::AdmittedInternalTest
+            );
+            assert_eq!(
+                admission(
+                    TestProviderKind::External,
+                    Some(&local()),
+                    false,
+                    WORKSPACE_TESTS
+                ),
+                LocalExecution::AdmittedLocalWorkspaceTest
+            );
         }
 
         #[test]
@@ -4348,7 +5455,6 @@ mod tests {
         use std::path::Path;
         use std::path::PathBuf;
         use std::sync::Mutex;
-        use std::sync::Once;
 
         use buck2_build_api::actions::execute::dice_data::CommandExecutorResponse;
         use buck2_build_api::actions::execute::dice_data::HasCommandExecutor;
@@ -4442,18 +5548,93 @@ mod tests {
                 ]
 
             live_test = rule(impl = _impl, attrs = {"mode": attrs.string()})
+
+            TestRun = exec_group()
+
+            def _parse_listing(stdout):
+                return [{"name": name, "filter": name} for name in stdout.split("\n") if name]
+
+            def _parse_result(stdout, stderr, exit_code):
+                return []
+
+            def _internal(**executors):
+                return InternalRunnerTestInfo(
+                    type = "custom",
+                    command = ["discover"],
+                    listing_command = ["discover"],
+                    parse_test_listing = _parse_listing,
+                    parse_test_result = _parse_result,
+                    **executors
+                )
+
+            # Names an execution group and passes no `default_executor`: analysis records the
+            # group's execution platform executor, which here is the local fallback platform's.
+            def _group_impl(ctx):
+                group = TestRun if ctx.attrs.named else DefaultExecGroup
+                if ctx.attrs.internal:
+                    info = _internal(exec_group = group)
+                else:
+                    info = ExternalRunnerTestInfo(
+                        type = "custom",
+                        command = ["discover"],
+                        exec_group = group,
+                    )
+                return [DefaultInfo(), info]
+
+            group_test = rule(
+                impl = _group_impl,
+                attrs = {"internal": attrs.bool(), "named": attrs.bool()},
+                exec_groups = [DefaultExecGroup, TestRun],
+            )
+
+            # Re-creates the test info of `test` field by field, as upstream supports: the recorded
+            # executor is passed on as `default_executor`.
+            def _copying_impl(ctx):
+                if ctx.attrs.internal:
+                    info = ctx.attrs.test[InternalRunnerTestInfo]
+                    copy = _internal(
+                        default_executor = info.default_executor,
+                        exec_group = info.exec_group,
+                    )
+                else:
+                    info = ctx.attrs.test[ExternalRunnerTestInfo]
+                    copy = ExternalRunnerTestInfo(
+                        type = info.test_type,
+                        command = info.command,
+                        default_executor = info.default_executor,
+                        exec_group = info.exec_group,
+                    )
+                return [DefaultInfo(), copy]
+
+            copying_test = rule(
+                impl = _copying_impl,
+                attrs = {"internal": attrs.bool(), "test": attrs.dep()},
+            )
+
+            # The explicit positive control for Internal tests: a declared local executor.
+            internal_local_test = rule(
+                impl = lambda _ctx: [DefaultInfo(), _internal(default_executor = _local())],
+                attrs = {},
+            )
             "#
         );
 
         const BUILD: &str = indoc!(
             r#"
-            load(":rules.bzl", "live_test")
+            load(":rules.bzl", "copying_test", "group_test", "internal_local_test", "live_test")
 
             live_test(name = "default_local", mode = "default_local")
             live_test(name = "cache_capable", mode = "cache_capable")
             live_test(name = "listing_override", mode = "listing_override")
             live_test(name = "named_override", mode = "named_override")
             live_test(name = "platform_fallback", mode = "platform_fallback")
+            group_test(name = "group_default", internal = False, named = False)
+            group_test(name = "group_named", internal = False, named = True)
+            group_test(name = "internal_group_default", internal = True, named = False)
+            group_test(name = "internal_group_named", internal = True, named = True)
+            copying_test(name = "group_copied", internal = False, test = ":group_named")
+            copying_test(name = "internal_group_copied", internal = True, test = ":internal_group_named")
+            internal_local_test(name = "internal_default_local")
             "#
         );
 
@@ -4461,17 +5642,7 @@ mod tests {
         const LIVE_FILE: &str = "cell/pkg/live_cases.txt";
 
         fn init_late_bindings() {
-            static INIT: Once = Once::new();
-            INIT.call_once(|| {
-                buck2_action_impl::init_late_bindings();
-                buck2_analysis::init_late_bindings();
-                buck2_anon_target::init_late_bindings();
-                buck2_configured::init_late_bindings();
-                buck2_events::init_late_bindings();
-                buck2_interpreter_for_build::init_late_bindings();
-                buck2_build_api::init_late_bindings();
-                buck2_transition::init_late_bindings();
-            });
+            crate::testing::init_late_bindings();
         }
 
         /// Runs every listing by reading the live file's current bytes as its stdout, and records
@@ -4559,9 +5730,11 @@ mod tests {
 
         /// One test target, one DICE transaction and two identical `Listing { cacheable: true }`
         /// requests through `prepare_and_execute`, with the live file changed between them.
+        /// `local_opt_ins` sets both `[test] local_workspace_tests` and `local_internal_cases`;
+        /// each admits only its own provider kind.
         async fn list_twice(
             mode: &str,
-            local_workspace_tests: bool,
+            local_opt_ins: bool,
             executor_override: Option<&str>,
             disable_test_execution_caching: bool,
         ) -> buck2_error::Result<Observed> {
@@ -4675,8 +5848,8 @@ mod tests {
             let root = AsRef::<Path>::as_ref(fs.path().root());
             std::fs::write(
                 root.join(".buckconfig"),
-                if local_workspace_tests {
-                    "[test]\nlocal_workspace_tests = true\n"
+                if local_opt_ins {
+                    "[test]\nlocal_workspace_tests = true\nlocal_internal_cases = true\n"
                 } else {
                     ""
                 },
@@ -4824,6 +5997,56 @@ mod tests {
             assert_eq!(
                 list_twice("named_override", true, None, false).await?,
                 reused()
+            );
+            Ok(())
+        }
+
+        /// S1-PROVIDER-01. A test info that names an execution group and passes no
+        /// `default_executor` records the group's execution platform executor during analysis.
+        /// Here that platform is local, both opt-ins are on, and the provider is uncached; still
+        /// the executor was chosen by execution platform resolution, not by the rule, so the
+        /// command is not admitted and the factory's `--remote-only` ban applies
+        /// (`LocalExecution::ByStrategy`). This covers `DefaultExecGroup` and a named group, both
+        /// provider kinds, and a field-by-field copy of the test info in a rule that declares no
+        /// group.
+        #[tokio::test]
+        async fn an_execution_group_executor_is_not_admitted_under_the_opt_ins()
+        -> buck2_error::Result<()> {
+            let mut admitted = Vec::new();
+            for mode in [
+                "group_default",
+                "group_named",
+                "group_copied",
+                "internal_group_default",
+                "internal_group_named",
+                "internal_group_copied",
+            ] {
+                let observed = list_twice(mode, true, None, false).await?;
+                if observed != reused() {
+                    admitted.push((mode, observed.admissions));
+                }
+            }
+            assert_eq!(admitted, Vec::new());
+            Ok(())
+        }
+
+        /// The explicit positive controls next to S1-PROVIDER-01: the same local executor,
+        /// declared with `CommandExecutorConfig(...)`, is admitted for each provider kind.
+        #[tokio::test]
+        async fn a_declared_local_executor_is_admitted_for_both_provider_kinds()
+        -> buck2_error::Result<()> {
+            assert_eq!(
+                list_twice("default_local", true, None, false).await?,
+                fresh(LocalExecution::AdmittedLocalWorkspaceTest)
+            );
+            // An admitted Internal listing still reuses its successful cacheable result.
+            assert_eq!(
+                list_twice("internal_default_local", true, None, false).await?,
+                Observed {
+                    returned: [b"case_a\n".to_vec(), b"case_a\n".to_vec()],
+                    executions: vec![b"case_a\n".to_vec()],
+                    admissions: vec![LocalExecution::AdmittedInternalTest],
+                }
             );
             Ok(())
         }

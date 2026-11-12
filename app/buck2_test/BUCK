@@ -17,14 +17,22 @@ rust_library(
             },
         },
     },
+    # The declared shell for this crate's launch-check fixtures (src/testing.rs
+    # DECLARED_SHELL): the pinned bash's exact store path, with the Nix manifest of its
+    # closure as a hidden input, never a host shell such as /bin/sh.
+    test_env = {
+        "BUCK2_TEST_DECLARED_SHELL": "$(exe toolchains//:archive_shell)",
+    },
     test_deps = [
         "fbsource//third-party/rust:indoc",
         "fbsource//third-party/rust:maplit",
         "//buck2/app/buck2_action_impl:buck2_action_impl",
         "//buck2/app/buck2_analysis:buck2_analysis",
         "//buck2/app/buck2_anon_target:buck2_anon_target",
+        "//buck2/app/buck2_artifact:buck2_artifact",
         "//buck2/app/buck2_configured:buck2_configured",
         "//buck2/app/buck2_event_observer:buck2_event_observer",
+        "//buck2/app/buck2_re_configuration:buck2_re_configuration",
         "//buck2/app/buck2_settings:buck2_settings",
         "//buck2/app/buck2_transition:buck2_transition",
     ],

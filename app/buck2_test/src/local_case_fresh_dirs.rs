@@ -390,6 +390,10 @@ mod tests {
         fn path(&self, name: &str) -> String {
             self.0.join(name).to_str().unwrap().to_owned()
         }
+
+        fn dir(&self) -> &std::path::Path {
+            &self.0
+        }
     }
 
     impl Drop for TempDir {
@@ -715,35 +719,123 @@ mod tests {
         refused(&open, "must be owned by uid");
     }
 
+    /// The longest path an `AF_UNIX` address holds here: `sun_path` less its terminating NUL.
+    #[cfg(unix)]
+    fn af_unix_path_max() -> usize {
+        // SAFETY: `sockaddr_un` is plain data, for which all zero bytes are a valid value.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_path.len() - 1
+    }
+
+    /// The `std` refusal of an `AF_UNIX` path too long for an address.
+    #[cfg(unix)]
+    fn refused_as_too_long(result: std::io::Result<()>) {
+        let e = result.unwrap_err();
+        assert!(e.to_string().contains("path must be shorter than"), "{e}");
+    }
+
     /// A Unix socket for a tmux server, `tmux-<uid>/default` in the directory of a fresh
     /// directory variable, cannot be bound in a `buck-out` scratch path, whose absolute path is
-    /// too long for an `AF_UNIX` address, but can in a scratch root's.
+    /// too long for an `AF_UNIX` address, but can in a scratch root's of at most
+    /// `af_unix_path_max()` less the 37 bytes the layout adds for uid 1000: 70 bytes on Linux.
+    ///
+    /// The test's own temporary directory can be longer than that (a remote worker's action
+    /// directory is), so the limit is shown without it: the scratch path of a root of every
+    /// length is the root and a fixed suffix; a socket path of exactly the limit binds in a real
+    /// directory and one more byte is refused; so a socket path in a root at most that long
+    /// binds. A root in the temporary directory is then bound for real when it is that short,
+    /// and otherwise refused as too long, exactly as the limit says.
     #[cfg(unix)]
     #[test]
     fn a_tmux_socket_fits_in_a_scratch_root_but_not_in_buck_out() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
         // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
-        let bind = |fresh: &FreshDirs| {
+        let max = af_unix_path_max();
+        let socket = |fresh: &FreshDirs| {
             let (_, directory) = fresh.values().unwrap().remove(0);
-            let server = format!("{directory}/tmux-{uid}");
+            (
+                format!("{directory}/tmux-{uid}"),
+                format!("{directory}/tmux-{uid}/default"),
+            )
+        };
+        let bind = |fresh: &FreshDirs| {
+            let (server, socket) = socket(fresh);
             std::fs::create_dir_all(&server).unwrap();
-            std::os::unix::net::UnixListener::bind(format!("{server}/default")).map(drop)
+            UnixListener::bind(socket).map(drop)
         };
         let temp = ProjectRootTemp::new().unwrap();
         let fs = artifact_fs(&temp);
         let stage = testing(&["a"], None);
 
         let buck_out = fresh(&fs, "t", &stage, &["TMUX_TMPDIR"]).unwrap();
-        let e = bind(&buck_out).unwrap_err();
-        assert!(e.to_string().contains("path must be shorter than"), "{e}");
+        refused_as_too_long(bind(&buck_out));
 
-        let dir = TempDir::new();
-        let root_path = dir.path("r");
-        assert!(
-            root_path.len() <= 70,
-            "this test needs a temporary directory of at most 64 bytes: {root_path}"
+        // What a scratch root adds to the socket path: `/<16 hex digits>/0/tmux-<uid>/default`.
+        let added = format!("/{}/0/tmux-{uid}/default", "0".repeat(16)).len();
+        let longest_root = max - added;
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            max - "/0123456789abcdef/0/tmux-1000/default".len(),
+            70,
+            "the module documents a root of at most 70 bytes for uid 1000"
         );
-        let root = scratch_root(&root_path).unwrap();
-        bind(&owned(&fs, "t", &stage, &["TMUX_TMPDIR"], &root)).unwrap();
+        // The layout of roots one byte either side of the limit. It reads no directory, so these
+        // roots need not exist; validation is `the_scratch_root_is_validated_like_the_result_root`.
+        for length in [longest_root, longest_root + 1] {
+            let root = ScratchRoot(format!("/{}", "r".repeat(length - 1)));
+            let (_, path) = socket(&owned(&fs, "t", &stage, &["TMUX_TMPDIR"], &root));
+            assert_eq!(path.len(), length + added, "{path}");
+            if length > longest_root {
+                refused_as_too_long(UnixListener::bind(&path).map(drop));
+            }
+        }
+
+        // A socket path of exactly `max` bytes binds in a real directory, the temporary one,
+        // whatever its length; on Linux the path names that directory through its descriptor.
+        let dir = TempDir::new();
+        let handle = std::fs::File::open(dir.dir()).unwrap();
+        #[cfg(target_os = "linux")]
+        let prefix = {
+            use std::os::fd::AsRawFd;
+            format!("/proc/self/fd/{}", handle.as_raw_fd())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let prefix = dir.dir().to_str().unwrap().to_owned();
+        assert!(
+            prefix.len() + 2 <= max,
+            "no room for a socket under the {max}-byte AF_UNIX limit in {prefix}"
+        );
+        let name = "s".repeat(max - prefix.len() - 1);
+        let at_limit = format!("{prefix}/{name}");
+        assert_eq!(at_limit.len(), max);
+        let listener = UnixListener::bind(&at_limit).unwrap();
+        let bound = std::fs::symlink_metadata(dir.dir().join(&name)).unwrap();
+        assert!(bound.file_type().is_socket());
+        refused_as_too_long(UnixListener::bind(format!("{at_limit}s")).map(drop));
+        drop((listener, handle));
+
+        // A validated root in the temporary directory: bound if it is short enough, refused if not.
+        let root_path = dir.path("r");
+        let root = owned(
+            &fs,
+            "t",
+            &stage,
+            &["TMUX_TMPDIR"],
+            &scratch_root(&root_path).unwrap(),
+        );
+        if root_path.len() <= longest_root {
+            bind(&root).unwrap();
+        } else {
+            refused_as_too_long(bind(&root));
+            eprintln!(
+                "a_tmux_socket_fits_in_a_scratch_root_but_not_in_buck_out: the root {root_path} \
+                 ({} bytes) is longer than {longest_root}, so its socket is refused; the \
+                 limit itself was bound above",
+                root_path.len()
+            );
+        }
     }
 }

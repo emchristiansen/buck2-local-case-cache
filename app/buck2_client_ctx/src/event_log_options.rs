@@ -18,12 +18,14 @@ use buck2_error::ErrorTag;
 use buck2_event_log::file_names::find_log_by_trace_id;
 use buck2_event_log::file_names::retrieve_nth_recent_log;
 use buck2_event_log::read::EventLogPathBuf;
+use buck2_event_log::schema_compat::UnmarkedLogReading;
 use buck2_event_log::utils::Encoding;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_fs::working_dir::AbsWorkingDir;
 use buck2_util::indent::indent;
 use buck2_util::process::async_background_command;
 use buck2_wrapper_common::invocation_id::TraceId;
@@ -63,6 +65,14 @@ pub struct EventLogOptions {
     /// A path to an event-log file to read from.
     #[clap(group = "event_log", value_name = "PATH")]
     pub path: Option<PathArg>,
+
+    /// Read a log without a schema marker (written by upstream buck2, or by this fork before
+    /// the marker existed) as written by this fork at or before b1100380. Its action execution
+    /// kind 12 then means a local test-result cache hit, and its executor stages 25 and 26 the
+    /// local test-result cache query and hit. Without this flag, values whose meaning such a log
+    /// does not decide are shown as ambiguous. Logs with the marker are read the same either way.
+    #[clap(long)]
+    pub unmarked_log_as_legacy_fork: bool,
 }
 
 impl EventLogOptions {
@@ -70,9 +80,46 @@ impl EventLogOptions {
         &self,
         ctx: &ClientCommandContext<'_>,
     ) -> buck2_error::Result<EventLogPathBuf> {
-        if let Some(path) = &self.path {
-            EventLogPathBuf::infer(path.resolve(&ctx.working_dir))
-        } else if let Some(id) = &self.trace_id {
+        if let Some(log) = self.get_from_path_arg(&ctx.working_dir) {
+            return log;
+        }
+        Ok(self.read_as_selected(self.get_path(ctx).await?))
+    }
+
+    /// The log named by the positional `PATH`, resolved against `working_dir` and read as
+    /// selected (see [`Self::read_as_selected`]). `None` if no `PATH` was given; then the log is
+    /// found by `--trace-id` or `--recent`, which needs the full client context.
+    pub fn get_from_path_arg(
+        &self,
+        working_dir: &AbsWorkingDir,
+    ) -> Option<buck2_error::Result<EventLogPathBuf>> {
+        let path = self.path.as_ref()?;
+        Some(
+            EventLogPathBuf::infer(path.resolve(working_dir)).map(|log| self.read_as_selected(log)),
+        )
+    }
+
+    /// `log`, to be read with the selected `--unmarked-log-as-legacy-fork` mode. Every log a
+    /// command opens from these options goes through this, however it was named.
+    pub fn read_as_selected(&self, log: EventLogPathBuf) -> EventLogPathBuf {
+        log.with_unmarked_log_reading(self.unmarked_log_reading())
+    }
+
+    /// How to read a log without a schema marker, per `--unmarked-log-as-legacy-fork`.
+    pub fn unmarked_log_reading(&self) -> UnmarkedLogReading {
+        if self.unmarked_log_as_legacy_fork {
+            UnmarkedLogReading::LegacyFork
+        } else {
+            UnmarkedLogReading::Ambiguous
+        }
+    }
+
+    /// The log named by `--trace-id` or `--recent` (a `PATH` is `get_from_path_arg`'s).
+    async fn get_path(
+        &self,
+        ctx: &ClientCommandContext<'_>,
+    ) -> buck2_error::Result<EventLogPathBuf> {
+        if let Some(id) = &self.trace_id {
             if let Some(log_path) = find_log_by_trace_id(&ctx.paths()?.log_dir(), id)? {
                 Ok(log_path)
             } else if !self.no_remote {

@@ -45,12 +45,21 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use buck2_common::file_ops::metadata::FileMetadata;
+use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
+use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::directory::ActionDirectoryMember;
 use buck2_execute::directory::ActionImmutableDirectory;
+use buck2_execute::materialize::materializer::MaterializationError;
+use buck2_execute::materialize::materializer::MaterializationPurpose;
+use buck2_execute::materialize::materializer::MaterializeRequest;
+use buck2_execute::materialize::materializer::Materializer;
+use buck2_execute::materialize::materializer::ReadLease;
+use dupe::Dupe;
 
 /// Symlink hops followed while resolving one path, as the kernel's limit.
 const MAX_SYMLINK_HOPS: usize = 40;
@@ -63,7 +72,8 @@ const LOADER_OVERRIDES: &[&str] = &["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"]
 /// One leaf of the action's input tree.
 #[derive(Debug, Clone)]
 enum Leaf {
-    File { executable: bool },
+    /// A file, as the exact value the action's input tree binds at its path.
+    File(FileMetadata),
     /// A symlink whose target is relative to its own directory.
     Symlink(String),
     /// A symlink to an absolute host path.
@@ -98,9 +108,7 @@ impl InputTree {
                     dirs.insert(components);
                     continue;
                 }
-                DirectoryEntry::Leaf(ActionDirectoryMember::File(meta)) => Leaf::File {
-                    executable: meta.is_executable,
-                },
+                DirectoryEntry::Leaf(ActionDirectoryMember::File(meta)) => Leaf::File(meta.dupe()),
                 DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(link)) => {
                     Leaf::Symlink(link.target().as_str().to_owned())
                 }
@@ -154,11 +162,11 @@ impl InputTree {
             current.push(name);
             match self.leaves.get(&current) {
                 None => {}
-                Some(Leaf::File { executable }) => {
+                Some(Leaf::File(meta)) => {
                     if pending.is_empty() {
                         return Ok(Resolved::Tree {
                             path: current,
-                            executable: *executable,
+                            executable: meta.is_executable,
                         });
                     }
                     // A file is not a directory: nothing below it exists.
@@ -273,12 +281,43 @@ pub(crate) struct LaunchFacts<'a> {
     pub(crate) env: &'a [(OsString, OsString)],
 }
 
-/// The input-tree executables the command launches, whose `#!` lines must be read once the
-/// inputs are on disk.
+/// The input-tree executables the command launches, whose `#!` lines must be read from the
+/// exact values the action's input tree binds at their paths. Only [`LaunchPlan::materialize`]
+/// gives a plan that can be verified: there is no way to read a launched executable's header
+/// from whatever happens to occupy its path.
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchPlan {
     project_root: PathBuf,
-    executables: Vec<Vec<String>>,
+    executables: Vec<Launched>,
+}
+
+/// One launched input-tree executable: its path and the file value the action's input tree, and
+/// so the action digest and the case's key, binds there. The local executor materializes this
+/// same value at this path before it starts the command.
+#[derive(Debug, Clone)]
+struct Launched {
+    path: Vec<String>,
+    value: FileMetadata,
+}
+
+impl Launched {
+    fn project_path(&self) -> ProjectRelativePathBuf {
+        ProjectRelativePathBuf::unchecked_new(self.path.join("/"))
+    }
+}
+
+/// A launch plan whose executables were materialized as their requested values and are held
+/// for reading by `_lease` for as long as this lives. [`MaterializedLaunch::verify`] is the only
+/// launch check there is, so the check always reads the bytes of the requested values.
+///
+/// It is held over the check and released before the action is executed: the executor then
+/// requests these same values at these same paths, under its own lease, so what it starts is
+/// what was checked. Keeping this lease while the executor acquires its own would be an
+/// acquisition made while holding, which the disk-state core's lock ordering rules out.
+#[must_use = "verify the launch while the lease holds the executables"]
+pub(crate) struct MaterializedLaunch {
+    plan: LaunchPlan,
+    _lease: ReadLease,
 }
 
 impl LaunchPlan {
@@ -303,7 +342,7 @@ impl LaunchPlan {
         let mut links = tree
             .leaves
             .iter()
-            .filter(|(_, leaf)| !matches!(leaf, Leaf::File { .. }))
+            .filter(|(_, leaf)| !matches!(leaf, Leaf::File(..)))
             .map(|(path, _)| path)
             .collect::<Vec<_>>();
         links.sort();
@@ -351,7 +390,7 @@ impl LaunchPlan {
         }
 
         let classify = Classify { tree, facts: &facts };
-        let mut executables = Vec::new();
+        let mut executables: Vec<Vec<String>> = Vec::new();
         let (argv0, args) = facts.argv.split_first().ok_or("the command is empty")?;
         if !argv0.contains('/') {
             return Err(format!(
@@ -394,31 +433,108 @@ impl LaunchPlan {
                 }
             }
         }
+        let executables = executables
+            .into_iter()
+            .map(|path| match tree.leaves.get(&path) {
+                Some(Leaf::File(value)) => Ok(Launched {
+                    value: value.dupe(),
+                    path,
+                }),
+                _ => Err(format!(
+                    "launched artifact `{}` is not a file of the input tree",
+                    path.join("/")
+                )),
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             project_root: facts.project_root.to_owned(),
             executables,
         })
     }
 
-    /// The input-tree executables to materialize before [`LaunchPlan::verify`].
-    pub(crate) fn executables(&self) -> Vec<ProjectRelativePathBuf> {
+    /// The input-tree executables, each with the exact value the input tree binds at its path.
+    pub(crate) fn launched_values(&self) -> Vec<(ProjectRelativePathBuf, ArtifactValue)> {
         self.executables
             .iter()
-            .map(|p| ProjectRelativePathBuf::unchecked_new(p.join("/")))
+            .map(|launched| {
+                (
+                    launched.project_path(),
+                    ArtifactValue::file(launched.value.dupe()),
+                )
+            })
             .collect()
     }
 
-    /// Check that each launched input-tree script's `#!` interpreter is a Nix store path. The
-    /// executables must be materialized.
+    /// Put the requested value of every launched executable at its path and hold it for
+    /// reading. A path-only request is not enough: a materializer that tracks disk state has no
+    /// value to make for a bare path and leaves whatever is there, which may be nothing or an
+    /// older artifact's bytes.
+    pub(crate) async fn materialize(
+        self,
+        materializer: &dyn Materializer,
+        re_use_case: RemoteExecutorUseCase,
+    ) -> buck2_error::Result<Result<MaterializedLaunch, MaterializationError>> {
+        if self.executables.is_empty() {
+            return Ok(Ok(MaterializedLaunch {
+                plan: self,
+                _lease: ReadLease::noop(),
+            }));
+        }
+        let response = materializer
+            .materialize(MaterializeRequest {
+                artifacts: self.launched_values(),
+                outputs: Vec::new(),
+                purpose: MaterializationPurpose::IntermediateOnly,
+                re_use_case,
+            })
+            .await?;
+        Ok(response
+            .ensure_results_ok()
+            .map(|lease| MaterializedLaunch {
+                plan: self,
+                _lease: lease,
+            }))
+    }
+
+    /// This plan as if its values were materialized, for tests of the header check alone, which
+    /// put the requested bytes on disk themselves. The orchestrator's composed tests cover how a
+    /// real materializer puts them there.
+    #[cfg(test)]
+    pub(crate) fn testing_held(&self) -> MaterializedLaunch {
+        MaterializedLaunch {
+            plan: self.clone(),
+            _lease: ReadLease::noop(),
+        }
+    }
+}
+
+impl MaterializedLaunch {
+    /// Check that each launched input-tree script's `#!` interpreter is a Nix store path, reading
+    /// the requested values this holds. A file whose length is not its requested value's is
+    /// refused rather than read as if it were that value.
     pub(crate) fn verify(&self) -> Result<(), String> {
-        for path in &self.executables {
-            let mut disk = self.project_root.clone();
+        for launched in &self.plan.executables {
+            let path = &launched.path;
+            let mut disk = self.plan.project_root.clone();
             disk.extend(path);
             let mut head = Vec::with_capacity(SHEBANG_LIMIT);
             {
                 use std::io::Read;
-                std::fs::File::open(&disk)
-                    .and_then(|f| f.take(SHEBANG_LIMIT as u64).read_to_end(&mut head))
+                let file = std::fs::File::open(&disk)
+                    .map_err(|e| format!("`{}` cannot be read: {e}", disk.display()))?;
+                let len = file
+                    .metadata()
+                    .map_err(|e| format!("`{}` cannot be read: {e}", disk.display()))?
+                    .len();
+                let expected = launched.value.digest.size();
+                if len != expected {
+                    return Err(format!(
+                        "`{}` holds {len} bytes, not the {expected} bytes of its requested value",
+                        disk.display()
+                    ));
+                }
+                file.take(SHEBANG_LIMIT as u64)
+                    .read_to_end(&mut head)
                     .map_err(|e| format!("`{}` cannot be read: {e}", disk.display()))?;
             }
             let Some(line) = head.strip_prefix(b"#!") else {
@@ -498,6 +614,19 @@ impl Classify<'_> {
 mod tests {
     use super::*;
 
+    /// A file leaf holding `content`.
+    fn file_leaf(content: &[u8], executable: bool) -> Leaf {
+        use buck2_common::file_ops::metadata::TrackedFileDigest;
+        use buck2_execute::digest_config::DigestConfig;
+        Leaf::File(FileMetadata {
+            digest: TrackedFileDigest::from_content(
+                content,
+                DigestConfig::testing_default().cas_digest_config(),
+            ),
+            is_executable: executable,
+        })
+    }
+
     fn tree(leaves: &[(&str, Leaf)], dirs: &[&str]) -> InputTree {
         let split = |p: &str| p.split('/').map(str::to_owned).collect::<Vec<_>>();
         let leaves: HashMap<_, _> = leaves.iter().map(|(p, l)| (split(p), l.clone())).collect();
@@ -515,10 +644,8 @@ mod tests {
     }
 
     fn store_dir() -> String {
-        // Any canonical directory in the store of the machine running the test.
-        let sh = std::fs::canonicalize("/bin/sh").unwrap();
-        assert!(sh.starts_with("/nix/store"), "tests need a Nix store host");
-        sh.parent().unwrap().to_str().unwrap().to_owned()
+        // The declared shell's store directory, never a host path (`crate::testing`).
+        crate::testing::declared_shell_dir()
     }
 
     fn plan(
@@ -552,12 +679,15 @@ mod tests {
         let script = "buck-out/v2/gen/t/script";
         let path_env = ("PATH", store.as_str());
         let t = tree(
-            &[(script, Leaf::File { executable: true })],
+            &[(script, file_leaf(b"artifact", true))],
             &["buck-out", "buck-out/v2", "buck-out/v2/gen", "buck-out/v2/gen/t"],
         );
 
-        let e = plan(&t, &root, &["/bin/sh", script], &[path_env]).unwrap_err();
-        assert!(e.contains("/bin/sh"), "{e}");
+        // A literal host tool: an existing file outside the project and the store.
+        let host_sh = crate::testing::non_store_shell(&root.with_extension("host"));
+        let host_sh = host_sh.to_str().unwrap();
+        let e = plan(&t, &root, &[host_sh, script], &[path_env]).unwrap_err();
+        assert!(e.contains(host_sh), "{e}");
         assert!(plan(&t, &root, &[&sh, script], &[path_env]).is_ok());
         let e = plan(&t, &root, &["sh", script], &[path_env]).unwrap_err();
         assert!(e.contains("PATH"), "{e}");
@@ -582,8 +712,8 @@ mod tests {
         // A declared checkout file is an input, but no build artifact.
         let with_source = tree(
             &[
-                (script, Leaf::File { executable: true }),
-                ("src/lib.rs", Leaf::File { executable: false }),
+                (script, file_leaf(b"artifact", true)),
+                ("src/lib.rs", file_leaf(b"artifact", false)),
             ],
             &[],
         );
@@ -599,40 +729,64 @@ mod tests {
         let dir = root.join("buck-out/v2/gen/t");
         std::fs::create_dir_all(&dir).unwrap();
         let link_target = "../t/script";
-        let t = tree(
-            &[
-                ("buck-out/v2/gen/t/script", Leaf::File { executable: true }),
-                (
-                    "buck-out/v2/gen/u/link",
-                    Leaf::Symlink(link_target.to_owned()),
-                ),
-                (
-                    "buck-out/v2/gen/t/tool",
-                    Leaf::External(PathBuf::from(format!("{store}/sh"))),
-                ),
-            ],
-            &[],
-        );
+        // The tree binds `content` as the script's value; the check reads it from disk, where a
+        // materializer put it.
+        let check = |content: &[u8]| {
+            let t = tree(
+                &[
+                    ("buck-out/v2/gen/t/script", file_leaf(content, true)),
+                    (
+                        "buck-out/v2/gen/u/link",
+                        Leaf::Symlink(link_target.to_owned()),
+                    ),
+                    (
+                        "buck-out/v2/gen/t/tool",
+                        Leaf::External(PathBuf::from(format!("{store}/sh"))),
+                    ),
+                ],
+                &[],
+            );
+            std::fs::write(dir.join("script"), content).unwrap();
+            let p = plan(&t, &root, &["buck-out/v2/gen/u/link"], &[path_env]).unwrap();
+            let values = p.launched_values();
+            assert_eq!(values.len(), 1);
+            assert_eq!(
+                values[0].0,
+                ProjectRelativePathBuf::unchecked_new("buck-out/v2/gen/t/script".to_owned())
+            );
+            // The request is the tree's own value for the script.
+            let DirectoryEntry::Leaf(ActionDirectoryMember::File(meta)) = values[0].1.entry()
+            else {
+                panic!("a launched executable is requested as a file");
+            };
+            let Some(Leaf::File(bound)) = t.leaves.get(
+                &["buck-out", "v2", "gen", "t", "script"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ) else {
+                panic!("the script is a file of the tree");
+            };
+            assert_eq!(meta, bound);
+            (t, p.testing_held().verify())
+        };
 
-        std::fs::write(dir.join("script"), "#!/bin/sh\necho\n").unwrap();
-        let p = plan(&t, &root, &["buck-out/v2/gen/u/link"], &[path_env]).unwrap();
-        assert_eq!(
-            p.executables(),
-            vec![ProjectRelativePathBuf::unchecked_new(
-                "buck-out/v2/gen/t/script".to_owned()
-            )]
-        );
-        let e = p.verify().unwrap_err();
+        let e = check(b"#!/bin/sh\necho\n").1.unwrap_err();
         assert!(e.contains("/bin/sh"), "{e}");
+        check(format!("#!{store}/sh -e\necho\n").as_bytes())
+            .1
+            .unwrap();
+        let (t, ok) = check(b"\x7fELF binary");
+        ok.unwrap();
 
-        std::fs::write(dir.join("script"), format!("#!{store}/sh -e\necho\n")).unwrap();
-        p.verify().unwrap();
-        std::fs::write(dir.join("script"), b"\x7fELF binary").unwrap();
-        p.verify().unwrap();
+        // Bytes of another length than the requested value's are not read as that value.
+        std::fs::write(dir.join("script"), b"\x7fELF other binary").unwrap();
+        let p = plan(&t, &root, &["buck-out/v2/gen/u/link"], &[path_env]).unwrap();
+        let e = p.testing_held().verify().unwrap_err();
+        assert!(e.contains("requested value"), "{e}");
 
         // An external symlink into the store is a bound tool.
         let p = plan(&t, &root, &["buck-out/v2/gen/t/tool"], &[path_env]).unwrap();
-        assert!(p.executables().is_empty());
+        assert!(p.launched_values().is_empty());
     }
 
     /// An input tree built the way an action's input directory is: leaves inserted into an
@@ -771,8 +925,8 @@ mod tests {
         symlink("link/../payload", v2.join("chain")).unwrap();
         let t = tree(
             &[
-                ("buck-out/v2/payload", Leaf::File { executable: false }),
-                ("buck-out/v2/gen/b", Leaf::File { executable: false }),
+                ("buck-out/v2/payload", file_leaf(b"artifact", false)),
+                ("buck-out/v2/gen/b", file_leaf(b"artifact", false)),
                 ("buck-out/v2/link", Leaf::External(outside.join("deep"))),
                 (
                     "buck-out/v2/chain",
@@ -823,7 +977,7 @@ mod tests {
         ] {
             let tree_without_links = tree(
                 &[
-                    ("buck-out/v2/payload", Leaf::File { executable: false }),
+                    ("buck-out/v2/payload", file_leaf(b"artifact", false)),
                     ("buck-out/v2/link", Leaf::External(outside.join("deep"))),
                 ],
                 &[],

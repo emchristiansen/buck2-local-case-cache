@@ -17,6 +17,8 @@ use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
 use itertools::Itertools;
 
+use crate::schema_compat::LogSchema;
+
 #[derive(Debug, buck2_error::Error)]
 pub(crate) enum EventLogErrors {
     #[error(
@@ -151,6 +153,9 @@ pub struct Invocation {
     pub trace_id: TraceId,
     /// Optional to support event logs from before this field was added
     pub start_time: Option<SystemTime>,
+    /// Fork-local event schema marker (`buck2_data::Invocation.muninn_event_schema`), as read
+    /// from the log. Absent in logs written before it existed; see `crate::schema_compat`.
+    pub muninn_event_schema: Option<u32>,
 }
 
 impl Invocation {
@@ -172,6 +177,11 @@ impl Invocation {
             .expect("Null byte unexpected")
     }
 
+    /// The schema this log was written with, per its marker.
+    pub fn schema(&self) -> LogSchema {
+        LogSchema::of(self.muninn_event_schema)
+    }
+
     pub(crate) fn parse_json_line(json: &str) -> buck2_error::Result<Invocation> {
         let i = serde_json::from_str::<buck2_data::Invocation>(json)
             .with_buck_error_context(|| format!("Invalid header: {}", json.trim_end()))?;
@@ -185,6 +195,7 @@ impl Invocation {
             working_dir: self.working_dir.clone(),
             trace_id: Some(self.trace_id.to_string()),
             start_time: self.start_time.map(Into::into),
+            muninn_event_schema: self.muninn_event_schema,
         }
     }
 
@@ -198,6 +209,7 @@ impl Invocation {
                 .and_then(|s| TraceId::from_str(&s).ok())
                 .unwrap_or(TraceId::null()),
             start_time: proto.start_time.and_then(|t| t.try_into().ok()),
+            muninn_event_schema: proto.muninn_event_schema,
         }
     }
 }
@@ -260,6 +272,7 @@ mod tests {
 
     use buck2_wrapper_common::invocation_id::TraceId;
 
+    use crate::schema_compat::LogSchema;
     use crate::utils::Invocation;
 
     #[test]
@@ -278,7 +291,9 @@ mod tests {
             expanded_command_line_args: Vec::new(),
             trace_id: TraceId::from_str("281d1c16-8930-40cd-8fc1-7d71355c20f5").unwrap(),
             start_time: None,
+            muninn_event_schema: None,
         };
         assert_eq!(expected, line);
+        assert_eq!(line.schema(), LogSchema::Unmarked);
     }
 }

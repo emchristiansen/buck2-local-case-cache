@@ -10,6 +10,7 @@
 
 // TODO(brasselsprouts): move this onto the original core types and convert in events
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -658,7 +659,65 @@ fn display_executor_stage_detail(
         ));
     }
 
-    display_executor_stage(stage).map(str::to_owned)
+    display_executor_stage_name(stage).map(Cow::into_owned)
+}
+
+/// Like `display_executor_stage`, but a stage the event-log reader could not attribute is named
+/// with every reading it carries, including the current schema's stage when that is another
+/// stage (see `buck2_data::UnmarkedLogStage.as_current_schema_stage`), which the fixed label of
+/// `display_executor_stage` cannot name.
+pub fn display_executor_stage_name(
+    stage: &buck2_data::executor_stage_start::Stage,
+) -> Option<Cow<'static, str>> {
+    use buck2_data::executor_stage_start::Stage;
+
+    if let Stage::UnmarkedLogStage(unmarked) = stage
+        && let Some(current) = unmarked
+            .as_current_schema_stage
+            .as_ref()
+            .and_then(|s| s.stage.as_ref())
+            .and_then(display_executor_stage)
+    {
+        let other = if unmarked.as_legacy_local_test_result_cache.is_some() {
+            "legacy local_test_result_cache"
+        } else {
+            "unknown stage 26, not represented"
+        };
+        return Some(Cow::Owned(format!(
+            "{current} or {other} (log predates schema marker)"
+        )));
+    }
+    display_executor_stage(stage).map(Cow::Borrowed)
+}
+
+/// A stage the event-log reader could not attribute, from a log without a schema marker (see
+/// `buck2_data::UnmarkedLogStage`). Names every reading the log allows, and asserts none; a
+/// current-schema stage is named generically here (`display_executor_stage_name` names it).
+fn display_unmarked_log_stage(stage: &buck2_data::UnmarkedLogStage) -> &'static str {
+    match (
+        stage.field_number,
+        stage.as_cas_artifact.is_some(),
+        stage.as_legacy_local_test_result_cache_query.is_some(),
+        stage.as_legacy_local_test_result_cache.is_some(),
+        stage.as_current_schema_stage.is_some(),
+    ) {
+        (25, true, true, _, _) => {
+            "cas_artifact or legacy local_test_result_cache_query (log predates schema marker)"
+        }
+        (26, _, _, true, true) => {
+            "a current-schema stage or legacy local_test_result_cache (log predates schema marker)"
+        }
+        (26, _, _, false, true) => {
+            "a current-schema stage or unknown stage 26, not represented (log predates schema marker)"
+        }
+        (26, _, _, true, false) => {
+            "unknown stage 26 or legacy local_test_result_cache (log predates schema marker)"
+        }
+        (26, _, _, false, false) => {
+            "unknown stage 26, not represented (log predates schema marker)"
+        }
+        _ => "ambiguous stage (log predates schema marker)",
+    }
 }
 
 pub fn display_executor_stage(
@@ -688,6 +747,7 @@ pub fn display_executor_stage(
         Stage::CacheHit(..) => "re_download",
         Stage::LocalTestResultCacheQuery(..) => "local_test_result_cache_query",
         Stage::LocalTestResultCache(..) => "local_test_result_cache",
+        Stage::UnmarkedLogStage(unmarked) => display_unmarked_log_stage(unmarked),
         Stage::Re(re) => {
             use buck2_data::re_stage::Stage;
 
@@ -785,7 +845,8 @@ pub fn is_active_execution_stage(event: &BuckEvent) -> bool {
         | Stage::CacheHit(..)
         | Stage::CasArtifact(..)
         | Stage::LocalTestResultCacheQuery(..)
-        | Stage::LocalTestResultCache(..) => false,
+        | Stage::LocalTestResultCache(..)
+        | Stage::UnmarkedLogStage(..) => false,
     }
 }
 
@@ -870,7 +931,9 @@ pub fn format_test_result(
         }
         // No case ran for a reused result: its duration (and details) are the original
         // execution's, and this run's own execution time is reported beside it.
-        Some(reuse) => {
+        // A host-local entry (or a record written before remote provenance existed): no remote
+        // provenance is claimed.
+        Some(reuse) if reuse.served_by.is_none() && reuse.action_digest.is_empty() => {
             let original = match duration {
                 Some(duration) => format!("{duration} originally"),
                 None => "original duration unknown".to_owned(),
@@ -884,6 +947,54 @@ pub fn format_test_result(
                 format!(
                     " (reused: {original}, {} now)",
                     fmt_duration::fmt_duration(current)
+                )
+                .cyan(),
+            )?);
+        }
+        // A remote cached answer: the case's original duration, the original action's recorded
+        // execution time and this run's own interval are three separate values, each labelled.
+        // Absent `served_by` is unrecorded provenance, never shown as an action-cache answer or
+        // an execution.
+        Some(reuse) => {
+            let fmt = |d: Option<&prost_types::Duration>| {
+                d.and_then(|d| Duration::try_from(*d).ok())
+                    .map(fmt_duration::fmt_duration)
+            };
+            let original = match duration {
+                Some(duration) => format!("{duration} originally"),
+                None => "original duration unknown".to_owned(),
+            };
+            let action = match fmt(reuse.original_execution_time.as_ref()) {
+                Some(action) => format!("action ran {action} originally"),
+                None => "original action time unknown".to_owned(),
+            };
+            let current = match fmt(reuse.current_execution_time.as_ref()) {
+                Some(current) => format!("{current} now"),
+                None => "current interval unknown".to_owned(),
+            };
+            let source = match reuse
+                .served_by
+                .map(buck2_data::RemoteCommandOrigin::try_from)
+            {
+                None => "reused, provenance unrecorded,".to_owned(),
+                Some(Ok(buck2_data::RemoteCommandOrigin::ActionCache)) => {
+                    "reused from remote action cache".to_owned()
+                }
+                Some(Ok(buck2_data::RemoteCommandOrigin::ReServedFromCache)) => {
+                    "reused from remote served execute".to_owned()
+                }
+                Some(Ok(buck2_data::RemoteCommandOrigin::ReDeduplicated)) => {
+                    "reused from remote deduplicated execute".to_owned()
+                }
+                Some(_) => format!(
+                    "reused, unrecognized provenance {},",
+                    reuse.served_by.unwrap_or_default()
+                ),
+            };
+            base.push(Span::new_styled(
+                format!(
+                    " ({source} {}: {original}, {action}, {current})",
+                    reuse.action_digest
                 )
                 .cyan(),
             )?);
@@ -1669,6 +1780,9 @@ mod tests {
             entry_manifest: "manifest".to_owned(),
             current_attempt: "current".to_owned(),
             current_execution_time: Some(Duration::ZERO.try_into().unwrap()),
+            action_digest: String::new(),
+            served_by: None,
+            original_execution_time: None,
         }));
         assert_eq!(
             rendered(&fresh, "1").unwrap(),
@@ -1681,6 +1795,62 @@ mod tests {
                 "test case ... ok"
             ]
         );
+    }
+
+    #[test]
+    fn test_result_remote_reuse_places_original_and_current_time() {
+        use buck2_data::RemoteCommandOrigin;
+        let remote = |served_by: Option<RemoteCommandOrigin>, current: Option<Duration>| {
+            test_result(Some(buck2_data::TestResultReuse {
+                current_execution_time: current.map(|d| d.try_into().unwrap()),
+                action_digest: "abc:12".to_owned(),
+                served_by: served_by.map(|o| o as i32),
+                original_execution_time: Some(Duration::from_millis(9500).try_into().unwrap()),
+                ..Default::default()
+            }))
+        };
+        for (served_by, source) in [
+            (
+                Some(RemoteCommandOrigin::ActionCache),
+                "reused from remote action cache",
+            ),
+            (
+                Some(RemoteCommandOrigin::ReServedFromCache),
+                "reused from remote served execute",
+            ),
+            (
+                Some(RemoteCommandOrigin::ReDeduplicated),
+                "reused from remote deduplicated execute",
+            ),
+            // Absent provenance is unrecorded: never shown as the action cache or an execution.
+            (None, "reused, provenance unrecorded,"),
+            (
+                Some(RemoteCommandOrigin::Executed),
+                "reused, unrecognized provenance 2,",
+            ),
+        ] {
+            assert_eq!(
+                rendered(&remote(served_by, Some(Duration::from_millis(300))), "1").unwrap(),
+                [
+                    format!(
+                        "✓ Pass: case ({source} abc:12: 9.0s originally, action ran 9.5s \
+                         originally, 0.3s now)"
+                    ),
+                    "test case ... ok".to_owned()
+                ]
+            );
+            // An unreported current interval is never shown as zero or as the original's.
+            assert_eq!(
+                rendered(&remote(served_by, None), "1").unwrap()[0],
+                format!(
+                    "✓ Pass: case ({source} abc:12: 9.0s originally, action ran 9.5s \
+                     originally, current interval unknown)"
+                )
+            );
+        }
+        let absent = rendered(&remote(None, None), "1").unwrap().join("\n");
+        assert!(!absent.contains("action cache"), "{absent}");
+        assert!(!absent.contains("execute"), "{absent}");
     }
 
     #[test]

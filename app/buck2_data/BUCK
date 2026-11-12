@@ -9,6 +9,9 @@ rust_protobuf_library(
     srcs = glob(["src/**/*.rs"]),
     build_script = "build.rs",
     proto_srcs = ":data_proto",
+    # Declares the crate's unit tests (src/lib.rs #[cfg(test)]). In the OSS
+    # shim a declared test list emits the libtest harness
+    # :buck2_data_prost-unittest. Its one test-only dependency follows `deps`.
     deps = [
         "fbsource//third-party/rust:derive_more",
         "fbsource//third-party/rust:hex",
@@ -22,6 +25,9 @@ rust_protobuf_library(
         "//buck2/gazebo/variant_name:variant_name",
         "//buck2/pagable:pagable",
         "//buck2/shed/mini_vec:mini_vec",
+    ],
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
     ],
 )
 

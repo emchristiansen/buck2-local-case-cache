@@ -524,6 +524,11 @@ fn project_attempt(
                 .details
                 .and_then(|details| nonempty(details.use_case));
         }
+        // Explicit local test-result reuse: no command ran for this attempt.
+        Some(Command::LocalTestResultCache(reused)) => {
+            report.executor = "local_test_result_cache".to_owned();
+            report.action_digest = nonempty(reused.action_digest);
+        }
         None => {}
     }
     let remote = report.executor == "remote";

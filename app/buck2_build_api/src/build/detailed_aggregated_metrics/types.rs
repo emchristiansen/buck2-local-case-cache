@@ -226,6 +226,9 @@ impl TopLevelTargetAggregatedData {
             ActionExecutionKind::LocalTestResultCache => {
                 // No child consumed local or remote memory during this reuse.
             }
+            ActionExecutionKind::ServedFromCacheOrLegacyLocalTestResultCache => {
+                // Reader-only (an unmarked event log's ambiguous 12); no execution produces it.
+            }
         }
     }
 }
@@ -281,6 +284,10 @@ impl AggregatedBuildMetrics {
                 }
                 buck2_data::ActionExecutionKind::LocalTestResultCache => {
                     self.local_test_result_cache_hits += factor;
+                }
+                buck2_data::ActionExecutionKind::ServedFromCacheOrLegacyLocalTestResultCache => {
+                    // Reader-only (an unmarked event log's ambiguous 12); no execution produces
+                    // it, and it is counted as neither.
                 }
                 buck2_data::ActionExecutionKind::NotSet
                 | buck2_data::ActionExecutionKind::Simple

@@ -153,6 +153,9 @@ impl BuckSubcommand for SnoopCommand {
                 event_log.get(&ctx).await?
             };
             loop {
+                // Whichever way this log was found (the options, the daemon's running commands,
+                // or a switch), read it with the selected unmarked-log mode.
+                current = event_log.read_as_selected(current);
                 match snoop_one(&mut ctx, &console_opts, &current, idle_timeout, &live).await? {
                     SnoopOutcome::Switch(target) => current = target,
                     SnoopOutcome::Ended { invocation, res } => {

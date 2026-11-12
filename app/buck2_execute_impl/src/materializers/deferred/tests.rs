@@ -2119,16 +2119,52 @@ pub(crate) mod state_machine {
             fs_util::write(&listable_file, b"x")?;
             fs_util::set_permissions(&listable, std::fs::Permissions::from_mode(0o444))?;
 
+            // Names the materializer cannot track are counted and left in place. A UTF-8 name
+            // with a backslash is not a valid `FileName`, and every POSIX filesystem stores it,
+            // so this entry reaches that arm of the sweep on every host.
+            let scratch_root = project_root.resolve(make_path("buck-out/v2/tmp"));
+            let backslash_name = scratch_root.as_abs_path().join("bad\\name");
+            fs_util::create_dir(&backslash_name)?;
+
+            // A name that is not valid UTF-8 reaches the same arm where the filesystem can store
+            // it. macOS filesystems reject such names, and so does ZFS with `utf8only=on` (the
+            // NativeLink worker's dataset, and this host's home dataset) with EILSEQ: on such a
+            // filesystem no entry of the scratch root can have one, so the sweep never meets one
+            // there. That exact refusal is a distinct, reported outcome; any other error fails
+            // the test, and `test_entry_file_name_refuses_names_the_materializer_cannot_track`
+            // checks the sweep's classification of such a name on every filesystem.
             #[cfg(not(target_os = "macos"))]
-            let invalid_name = {
-                // macOS filesystems reject invalid UTF-8 file names.
-                let scratch_root = project_root.resolve(make_path("buck-out/v2/tmp"));
-                let invalid_name = scratch_root
+            let non_utf8_name = {
+                let non_utf8_name = scratch_root
                     .as_abs_path()
                     .join(OsString::from_vec(vec![0xff]));
-                fs_util::create_dir(&invalid_name)?;
-                invalid_name
+                match std::fs::create_dir(&non_utf8_name) {
+                    Ok(()) => Some(non_utf8_name),
+                    Err(e) if is_utf8only_refusal(&e) => {
+                        for entry in std::fs::read_dir(scratch_root.as_abs_path())? {
+                            let name = entry?.file_name();
+                            assert!(
+                                name.to_str().is_some(),
+                                "the filesystem refused a non-UTF-8 name with EILSEQ yet holds \
+                                 {name:?}"
+                            );
+                        }
+                        eprintln!(
+                            "test_clean_scratch_sweep: the filesystem of {} refuses names that \
+                             are not valid UTF-8 (EILSEQ), so no such entry can exist there; \
+                             the sweep's invalid-name arm runs here only for the backslash name",
+                            scratch_root.as_abs_path().display()
+                        );
+                        None
+                    }
+                    Err(e) => panic!(
+                        "create_dir({}) failed other than as a UTF-8-only filesystem refusal: {e}",
+                        non_utf8_name.display()
+                    ),
+                }
             };
+            #[cfg(target_os = "macos")]
+            let non_utf8_name: Option<std::path::PathBuf> = None;
 
             let (mut events, sink) = buck2_events::create_source_sink_pair();
             let dispatcher = EventDispatcher::new(TraceId::null(), DaemonId::new(), sink);
@@ -2153,9 +2189,11 @@ pub(crate) mod state_machine {
             assert!(!fs_util::try_exists(&dead)?);
             assert!(fs_util::try_exists(&unreadable_file)?);
             assert!(fs_util::try_exists(&listable_file)?);
-            #[cfg(not(target_os = "macos"))]
-            assert!(fs_util::try_exists(&invalid_name)?);
-            let expected_invalid_filename_count = if cfg!(target_os = "macos") { 0 } else { 1 };
+            assert!(fs_util::try_exists(&backslash_name)?);
+            if let Some(non_utf8_name) = &non_utf8_name {
+                assert!(std::fs::exists(non_utf8_name)?);
+            }
+            let expected_invalid_filename_count = 1 + u64::from(non_utf8_name.is_some());
             assert_eq!(
                 (
                     untracked_artifact_count,
@@ -2175,6 +2213,43 @@ pub(crate) mod state_machine {
             Ok(())
         })
         .await
+    }
+
+    /// Whether `create_dir` failed because the filesystem stores only UTF-8 names: Linux
+    /// reports that, for ZFS with `utf8only=on`, as EILSEQ.
+    #[cfg(not(target_os = "macos"))]
+    fn is_utf8only_refusal(e: &std::io::Error) -> bool {
+        // EILSEQ in Linux's <asm-generic/errno.h>.
+        #[cfg(target_os = "linux")]
+        const EILSEQ: Option<i32> = Some(84);
+        #[cfg(not(target_os = "linux"))]
+        const EILSEQ: Option<i32> = None;
+        EILSEQ.is_some() && e.raw_os_error() == EILSEQ
+    }
+
+    /// The classifier both scans use: a name that is not valid UTF-8, or is valid UTF-8 but not
+    /// a `FileName`, is never the materializer's; every other name is, byte for byte. This needs
+    /// no filesystem, so it holds where the sweep test cannot create a non-UTF-8 entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_entry_file_name_refuses_names_the_materializer_cannot_track() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        use crate::materializers::deferred::clean_stale::entry_file_name;
+
+        for name in ["junk", "dead", "a b", "\u{e9}t\u{e9}"] {
+            assert_eq!(
+                entry_file_name(OsStr::new(name)).map(|n| n.as_str()),
+                Some(name)
+            );
+        }
+        for bytes in [&[0xff][..], &[b'a', 0xc3][..], &[0xed, 0xa0, 0x80][..]] {
+            assert_eq!(entry_file_name(OsStr::from_bytes(bytes)), None, "{bytes:?}");
+        }
+        for name in ["bad\\name", "", ".", "..", "a/b"] {
+            assert_eq!(entry_file_name(OsStr::new(name)), None, "{name:?}");
+        }
     }
 
     #[tokio::test]
