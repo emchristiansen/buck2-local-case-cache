@@ -26,6 +26,7 @@ use buck2_event_log::stream_value::StreamValue;
 use buck2_event_observer::fmt_duration;
 use buck2_event_observer::humanized::HumanizedBytes;
 use buck2_event_observer::humanized::HumanizedBytesPerSecond;
+use buck2_event_observer::last_command_execution_kind::is_local_test_result_reuse;
 use buck2_util::network_speed_average::NetworkSpeedAverage;
 use buck2_util::sliding_window::SlidingWindow;
 use tokio_stream::StreamExt;
@@ -44,6 +45,7 @@ struct Stats {
     // TODO(yurysamkevich): split by RE platform - mac/windows/linux once available in log
     total_remote_actions: u64,
     total_cached_actions: u64,
+    total_local_test_result_cache_hits: u64,
     total_other_actions: u64,
     total_targets_analysed: u64,
     peak_process_memory_bytes: Option<u64>,
@@ -79,7 +81,17 @@ impl Stats {
                             self.total_remote_actions += 1
                         }
                         Ok(ActionExecutionKind::ActionCache) => self.total_cached_actions += 1,
+                        Ok(ActionExecutionKind::LocalTestResultCache) => {
+                            self.total_local_test_result_cache_hits += 1;
+                        }
                         _ => self.total_other_actions += 1,
+                    }
+                }
+                // A test run is not a build action: only a local test-result reuse is counted,
+                // once, from its `TestRunEnd` (not from its query/hit executor stages).
+                Some(buck2_data::span_end_event::Data::TestRun(data)) => {
+                    if is_local_test_result_reuse(data) {
+                        self.total_local_test_result_cache_hits += 1;
                     }
                 }
                 Some(buck2_data::span_end_event::Data::Analysis(_)) => {
@@ -189,6 +201,13 @@ impl Display for Stats {
         writeln!(f, "- Local actions: {}", self.total_local_actions)?;
         writeln!(f, "- Remote actions: {}", self.total_remote_actions)?;
         writeln!(f, "- Cached actions: {}", self.total_cached_actions)?;
+        if self.total_local_test_result_cache_hits > 0 {
+            writeln!(
+                f,
+                "- Local test-result reuse: {}",
+                self.total_local_test_result_cache_hits
+            )?;
+        }
         writeln!(f, "- Other actions: {}", self.total_other_actions)?;
         writeln!(f)?;
 
@@ -368,5 +387,153 @@ impl BuckSubcommand for SummaryCommand {
         }
         buck2_client_ctx::println!("{}", stats)?;
         ExitResult::success()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_data::buck_event::Data;
+    use buck2_data::command_execution_kind::Command;
+
+    use super::Stats;
+
+    fn event(data: Data) -> buck2_data::BuckEvent {
+        buck2_data::BuckEvent {
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn start(data: buck2_data::span_start_event::Data) -> buck2_data::BuckEvent {
+        event(Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(data),
+        }))
+    }
+
+    fn end(data: buck2_data::span_end_event::Data) -> buck2_data::BuckEvent {
+        event(Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(data),
+            ..Default::default()
+        }))
+    }
+
+    fn stage(stage: buck2_data::executor_stage_start::Stage) -> [buck2_data::BuckEvent; 2] {
+        [
+            start(buck2_data::ExecutorStageStart { stage: Some(stage) }.into()),
+            end(buck2_data::ExecutorStageEnd::default().into()),
+        ]
+    }
+
+    fn command_report(command: Command) -> buck2_data::CommandExecution {
+        buck2_data::CommandExecution {
+            details: Some(buck2_data::CommandExecutionDetails {
+                command_kind: Some(buck2_data::CommandExecutionKind {
+                    command: Some(command),
+                }),
+                ..Default::default()
+            }),
+            status: Some(buck2_data::command_execution::Success {}.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The events the test orchestrator emits for one test stage (see
+    /// `BuckTestOrchestrator::execute_request` / `execute_local_case`): a `TestRun` span
+    /// containing the local-test-result-cache query stage, on a hit the hit stage, and a
+    /// `TestRunEnd` carrying the final command report.
+    fn test_run(hit: bool) -> Vec<buck2_data::BuckEvent> {
+        let suite = buck2_data::TestSuite {
+            suite_name: "suite".to_owned(),
+            test_names: vec!["case".to_owned()],
+            target_label: None,
+        };
+        let mut events = vec![start(
+            buck2_data::TestRunStart {
+                suite: Some(suite.clone()),
+            }
+            .into(),
+        )];
+        events.extend(stage(
+            buck2_data::LocalTestResultCacheQuery {
+                action_digest: "digest".to_owned(),
+                cache_key: "key".to_owned(),
+                current_attempt: "current".to_owned(),
+            }
+            .into(),
+        ));
+        let command = if hit {
+            let hit = buck2_data::LocalTestResultCache {
+                action_digest: "digest".to_owned(),
+                cache_key: "key".to_owned(),
+                origin_attempt: "origin".to_owned(),
+                entry_manifest: "manifest".to_owned(),
+                current_attempt: "current".to_owned(),
+            };
+            events.extend(stage(hit.clone().into()));
+            Command::LocalTestResultCache(hit)
+        } else {
+            Command::LocalCommand(buck2_data::LocalCommand::default())
+        };
+        events.push(end(buck2_data::TestRunEnd {
+            suite: Some(suite),
+            command_report: Some(command_report(command)),
+            command_host_sharing_requirements: None,
+        }
+        .into()));
+        events
+    }
+
+    fn local_action() -> [buck2_data::BuckEvent; 2] {
+        [
+            start(buck2_data::ActionExecutionStart::default().into()),
+            end(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                buck2_data::ActionExecutionEnd {
+                    kind: buck2_data::ActionKind::Run as i32,
+                    execution_kind: buck2_data::ActionExecutionKind::Local as i32,
+                    commands: vec![command_report(Command::LocalCommand(
+                        buck2_data::LocalCommand::default(),
+                    ))],
+                    ..Default::default()
+                },
+            ))),
+        ]
+    }
+
+    #[test]
+    fn local_test_result_reuse_is_counted_from_test_run_end() {
+        let mut stats = Stats::default();
+        for e in local_action()
+            .iter()
+            .chain(&test_run(true))
+            .chain(&test_run(false))
+        {
+            stats.update_with_event(e);
+        }
+        // The hit is counted once, although both its hit stage and `TestRunEnd` were seen.
+        assert_eq!(stats.total_local_test_result_cache_hits, 1);
+        // The build action is accounted exactly as before; the fresh test run changes nothing.
+        assert_eq!(stats.total_local_actions, 1);
+        assert_eq!(stats.total_remote_actions, 0);
+        assert_eq!(stats.total_cached_actions, 0);
+        assert_eq!(stats.total_other_actions, 0);
+        let summary = stats.to_string();
+        assert!(summary.contains("- Local actions: 1\n"), "{summary}");
+        assert!(summary.contains("- Cached actions: 0\n"), "{summary}");
+        assert!(
+            summary.contains("- Local test-result reuse: 1\n"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn fresh_test_run_is_not_counted() {
+        let mut stats = Stats::default();
+        for e in &test_run(false) {
+            stats.update_with_event(e);
+        }
+        assert_eq!(stats.total_local_test_result_cache_hits, 0);
+        assert_eq!(stats.total_local_actions, 0);
+        assert_eq!(stats.total_other_actions, 0);
+        assert!(!stats.to_string().contains("Local test-result reuse"));
     }
 }

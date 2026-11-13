@@ -510,23 +510,34 @@ where
     ) -> buck2_error::Result<()> {
         let snapshots = self.observer().two_snapshots();
 
-        if self.verbosity.print_status() && self.observer().action_stats().log_stats() {
-            let cache_hit_percentage = self.observer().action_stats().total_cache_hit_percentage();
-            echo!("Cache hits: {}%", cache_hit_percentage)?;
-            echo!(
-                "Commands: {} (cached: {}, remote: {}, local: {})",
-                self.observer()
-                    .action_stats()
-                    .total_executed_and_cached_actions(),
-                self.observer().action_stats().cached_actions,
-                self.observer().action_stats().remote_actions,
-                self.observer().action_stats().local_actions
-            )?;
-            if self.observer().action_stats().fallback_actions > 0 {
+        if self.verbosity.print_status() {
+            let action_stats = self.observer().action_stats();
+            // The build cache-hit rate and command counts describe build actions only. Without a
+            // build action that executed or hit a cache there is no rate to report (the shared
+            // zero-denominator helper would claim 100%), even when test results were reused.
+            if action_stats.total_executed_and_cached_actions() > 0 {
+                echo!("Cache hits: {}%", action_stats.total_cache_hit_percentage())?;
                 echo!(
-                    "Fallback: {}/{}",
-                    self.observer().action_stats().fallback_actions,
-                    self.observer().action_stats().total_executed_actions()
+                    "Commands: {} (cached: {}, remote: {}, local: {})",
+                    action_stats.total_executed_and_cached_actions(),
+                    action_stats.cached_actions,
+                    action_stats.remote_actions,
+                    action_stats.local_actions
+                )?;
+                if action_stats.fallback_actions > 0 {
+                    echo!(
+                        "Fallback: {}/{}",
+                        action_stats.fallback_actions,
+                        action_stats.total_executed_actions()
+                    )?;
+                }
+            }
+            // Reused test results are not build commands: they get their own line rather than
+            // entering the command or cache counts above.
+            if action_stats.local_test_result_cached_actions > 0 {
+                echo!(
+                    "Local test-result reuse: {}",
+                    action_stats.local_test_result_cached_actions
                 )?;
             }
         }
@@ -886,5 +897,250 @@ mod tests {
             "and not again before another minute"
         );
         assert!(agent.should_show(at(120)));
+    }
+
+    mod command_end {
+        use buck2_data::buck_event::Data;
+        use buck2_data::command_execution_kind::Command;
+        use buck2_event_observer::event_observer::NoopEventObserverExtra;
+        use buck2_events::span::SpanId;
+
+        use super::*;
+
+        const COMMAND_SPAN: u64 = 1;
+
+        fn event(span: u64, parent: Option<u64>, data: Data) -> Arc<BuckEvent> {
+            Arc::new(BuckEvent::new(
+                SystemTime::now(),
+                TraceId::null(),
+                Some(SpanId::from_u64(span).unwrap()),
+                parent.map(|p| SpanId::from_u64(p).unwrap()),
+                data,
+            ))
+        }
+
+        fn start(
+            span: u64,
+            parent: Option<u64>,
+            data: buck2_data::span_start_event::Data,
+        ) -> Arc<BuckEvent> {
+            event(
+                span,
+                parent,
+                Data::SpanStart(buck2_data::SpanStartEvent { data: Some(data) }),
+            )
+        }
+
+        fn end(
+            span: u64,
+            parent: Option<u64>,
+            data: buck2_data::span_end_event::Data,
+        ) -> Arc<BuckEvent> {
+            event(
+                span,
+                parent,
+                Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(data),
+                    ..Default::default()
+                }),
+            )
+        }
+
+        fn command_report(command: Command) -> buck2_data::CommandExecution {
+            buck2_data::CommandExecution {
+                details: Some(buck2_data::CommandExecutionDetails {
+                    command_kind: Some(buck2_data::CommandExecutionKind {
+                        command: Some(command),
+                    }),
+                    ..Default::default()
+                }),
+                status: Some(buck2_data::command_execution::Success {}.into()),
+                ..Default::default()
+            }
+        }
+
+        /// A test run whose final command report is either a local test-result reuse or a fresh
+        /// local execution, as `TestRunEnd` carries it.
+        fn test_run(span: u64, reused: bool) -> Vec<Arc<BuckEvent>> {
+            let suite = buck2_data::TestSuite {
+                suite_name: format!("suite{span}"),
+                test_names: vec!["case".to_owned()],
+                target_label: None,
+            };
+            let command = if reused {
+                Command::LocalTestResultCache(buck2_data::LocalTestResultCache {
+                    action_digest: "digest".to_owned(),
+                    cache_key: "key".to_owned(),
+                    origin_attempt: "origin".to_owned(),
+                    entry_manifest: "manifest".to_owned(),
+                    current_attempt: "current".to_owned(),
+                })
+            } else {
+                Command::LocalCommand(buck2_data::LocalCommand::default())
+            };
+            vec![
+                start(
+                    span,
+                    Some(COMMAND_SPAN),
+                    buck2_data::TestRunStart {
+                        suite: Some(suite.clone()),
+                    }
+                    .into(),
+                ),
+                end(
+                    span,
+                    Some(COMMAND_SPAN),
+                    buck2_data::TestRunEnd {
+                        suite: Some(suite),
+                        command_report: Some(command_report(command)),
+                        command_host_sharing_requirements: None,
+                    }
+                    .into(),
+                ),
+            ]
+        }
+
+        fn action_key(span: u64) -> buck2_data::ActionKey {
+            buck2_data::ActionKey {
+                owner: Some(buck2_data::action_key::Owner::TargetLabel(
+                    buck2_data::ConfiguredTargetLabel {
+                        label: Some(buck2_data::TargetLabel {
+                            package: "root//pkg".to_owned(),
+                            name: format!("t{span}"),
+                        }),
+                        configuration: Some(buck2_data::Configuration {
+                            full_name: "cfg".to_owned(),
+                        }),
+                        execution_configuration: None,
+                    },
+                )),
+                ..Default::default()
+            }
+        }
+
+        fn action_name() -> buck2_data::ActionName {
+            buck2_data::ActionName {
+                category: "cat".to_owned(),
+                identifier: "id".to_owned(),
+            }
+        }
+
+        /// A build action whose last command is `command`.
+        fn build_action(span: u64, command: Command) -> Vec<Arc<BuckEvent>> {
+            vec![
+                start(
+                    span,
+                    Some(COMMAND_SPAN),
+                    buck2_data::ActionExecutionStart {
+                        key: Some(action_key(span)),
+                        name: Some(action_name()),
+                        kind: buck2_data::ActionKind::Run as i32,
+                    }
+                    .into(),
+                ),
+                end(
+                    span,
+                    Some(COMMAND_SPAN),
+                    buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            key: Some(action_key(span)),
+                            name: Some(action_name()),
+                            kind: buck2_data::ActionKind::Run as i32,
+                            commands: vec![command_report(command)],
+                            ..Default::default()
+                        },
+                    )),
+                ),
+            ]
+        }
+
+        /// Feeds a whole command through the real `SimpleConsole` event entry point, with status
+        /// printing on, and returns the lines it printed at command end (timestamps removed).
+        fn command_end_lines(body: Vec<Arc<BuckEvent>>) -> Vec<String> {
+            let mut console = SimpleConsole::<NoopEventObserverExtra>::without_tty(
+                TraceId::null(),
+                Verbosity::try_from_cli("status").unwrap(),
+                true,
+                None,
+            );
+            assert!(console.verbosity.print_status());
+            futures::executor::block_on(async {
+                console
+                    .handle_event(&start(
+                        COMMAND_SPAN,
+                        None,
+                        buck2_data::CommandStart::default().into(),
+                    ))
+                    .await
+                    .unwrap();
+                for e in &body {
+                    console.handle_event(e).await.unwrap();
+                }
+            });
+            let ((), printed) = crate::stdio::capture_stderr(|| {
+                futures::executor::block_on(console.handle_event(&end(
+                    COMMAND_SPAN,
+                    None,
+                    buck2_data::CommandEnd::default().into(),
+                )))
+                .unwrap()
+            });
+            printed
+                .lines()
+                .map(|line| match line.split_once("] ") {
+                    Some((_, message)) => message.to_owned(),
+                    None => line.to_owned(),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn empty_command_prints_no_build_or_reuse_stats() {
+            assert_eq!(command_end_lines(Vec::new()), Vec::<String>::new());
+        }
+
+        #[test]
+        fn fresh_test_runs_only_print_no_build_or_reuse_stats() {
+            let body = test_run(10, false);
+            assert_eq!(command_end_lines(body), Vec::<String>::new());
+        }
+
+        #[test]
+        fn reuse_only_command_prints_reuse_without_a_build_cache_rate() {
+            let body = [test_run(10, true), test_run(20, true), test_run(30, false)].concat();
+            assert_eq!(
+                command_end_lines(body),
+                vec!["Local test-result reuse: 2".to_owned()]
+            );
+        }
+
+        #[test]
+        fn mixed_command_prints_build_stats_and_separate_reuse() {
+            let body = [
+                build_action(
+                    10,
+                    Command::LocalCommand(buck2_data::LocalCommand::default()),
+                ),
+                build_action(
+                    20,
+                    Command::RemoteCommand(buck2_data::RemoteCommand {
+                        cache_hit: true,
+                        cache_hit_type: buck2_data::RemoteCommandOrigin::ActionCache.into(),
+                        ..Default::default()
+                    }),
+                ),
+                test_run(30, true),
+                test_run(40, false),
+            ]
+            .concat();
+            assert_eq!(
+                command_end_lines(body),
+                vec![
+                    "Cache hits: 50%".to_owned(),
+                    "Commands: 2 (cached: 1, remote: 0, local: 1)".to_owned(),
+                    "Local test-result reuse: 1".to_owned(),
+                ]
+            );
+        }
     }
 }

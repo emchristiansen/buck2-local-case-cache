@@ -283,6 +283,49 @@ fn main() -> io::Result<()> {
             "buck.data.Invocation.expanded_command_line_args",
             "#[serde(default)]",
         )
+        // Upstream members the fork's pre-sync (b1100380) JSON logs lack, on the two messages
+        // that carry the fork's renumbered members: absent is empty / zero, as in protobuf, so
+        // those records still read (and the reader's schema_compat rules can apply to them).
+        .field_attribute("buck.data.ActionExecutionEnd.exec_group", "#[serde(default)]")
+        .field_attribute(
+            "buck.data.InvocationRecord.re_exceeded_quotas",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "buck.data.InvocationRecord.run_remote_served_from_cache_count",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "buck.data.InvocationRecord.run_remote_deduplicated_count",
+            "#[serde(default)]",
+        )
+        .field_attribute("buck.data.InvocationRecord.agent_callers", "#[serde(default)]")
+        // Fork-local event schema marker: absent in logs written before it existed, which the
+        // reader then treats as unmarked.
+        .field_attribute(
+            "buck.data.Invocation.muninn_event_schema",
+            "#[serde(default)]",
+        )
+        // Added after event logs were already written without it: an absent value is zero, as
+        // in protobuf, so older JSON logs stay readable.
+        .field_attribute(
+            "buck.data.AggregatedBuildMetrics.local_test_result_cache_hits",
+            "#[serde(default)]",
+        )
+        .field_attribute("buck.data.TestResult.reuse", "#[serde(default)]")
+        .field_attribute(
+            "buck.data.TestResultReuse.current_execution_time",
+            "#[serde(default, rename = \"current_execution_time_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",
+        )
+        // Remote reuse provenance, added after event logs were already written without it: an
+        // absent value is empty / unset (`served_by` absent is unrecorded provenance), as in
+        // protobuf, so older JSON logs stay readable.
+        .field_attribute("buck.data.TestResultReuse.action_digest", "#[serde(default)]")
+        .field_attribute("buck.data.TestResultReuse.served_by", "#[serde(default)]")
+        .field_attribute(
+            "buck.data.TestResultReuse.original_execution_time",
+            "#[serde(default, rename = \"original_execution_time_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",
+        )
         .field_attribute(
             "buck.data.CommandExecutionMetadata.wall_time",
             "#[serde(rename = \"wall_time_us\", with = \"::buck2_proto_serde::serialize_duration_as_micros\")]",
@@ -319,6 +362,10 @@ fn main() -> io::Result<()> {
         .boxed("InstantEvent.data.rage_result")
         .boxed("InstantEvent.data.resource_control_event")
         .boxed("InstantEvent.data.snapshot")
+        // Fork-local: the rare reuse provenance stays off the inline size of every event.
+        .boxed("TestResult.reuse")
+        // Fork-local and reader-only: keeps the rare ambiguity record off every event's size.
+        .boxed("ExecutorStageStart.stage.unmarked_log_stage")
         .extern_path(".buck.host_sharing", "::buck2_host_sharing_proto")
         .compile(proto_files, &includes)
 }

@@ -16,6 +16,7 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_build_api::build::AsyncBuildTargetResultBuilder;
 use buck2_build_api::build::BuildConfiguredLabelOptions;
 use buck2_build_api::build::ProvidersToBuild;
+use buck2_build_api::build::TestArtifacts;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::bxl::build_result::BxlBuildResult;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
@@ -201,7 +202,7 @@ pub(crate) fn build<'v>(
                                                 default: true,
                                                 default_other: true,
                                                 run: true,
-                                                tests: true,
+                                                tests: TestArtifacts::Preferred,
                                             }, // TODO support skipping/configuring?
                                             BuildConfiguredLabelOptions {
                                                 skippable: false,

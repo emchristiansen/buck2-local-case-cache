@@ -1670,6 +1670,16 @@ fn lines_for_command_details(
         use buck2_data::command_execution_kind::Command;
 
         match command_kind.command.as_ref() {
+            Some(Command::LocalTestResultCache(reused)) => {
+                lines.push(Line::from_iter([Span::new_unstyled_lossy(format!(
+                    "Local test-result reuse: action={} key={} origin_attempt={} entry_manifest={} current_attempt={}",
+                    reused.action_digest,
+                    reused.cache_key,
+                    reused.origin_attempt,
+                    reused.entry_manifest,
+                    reused.current_attempt
+                ))]));
+            }
             Some(Command::LocalCommand(local_command)) => {
                 let command = command_to_string(local_command);
                 let command = command.as_str();

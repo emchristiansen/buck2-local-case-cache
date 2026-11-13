@@ -96,7 +96,33 @@ pub fn _print(fmt: Arguments) -> buck2_error::Result<()> {
         .map_err(|e| ClientIoError::from(e).into())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// When set, `_eprint` on this thread appends here instead of writing to stderr, so unit
+    /// tests can observe exactly what a console printed.
+    static CAPTURED_STDERR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, returning what it printed to stderr through this module on the current thread.
+#[cfg(test)]
+pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, String) {
+    CAPTURED_STDERR.with(|c| *c.borrow_mut() = Some(String::new()));
+    let result = f();
+    let captured = CAPTURED_STDERR.with(|c| c.borrow_mut().take().unwrap_or_default());
+    (result, captured)
+}
+
 pub fn _eprint(fmt: Arguments) -> buck2_error::Result<()> {
+    #[cfg(test)]
+    {
+        let captured = CAPTURED_STDERR.with(|c| match c.borrow_mut().as_mut() {
+            Some(buffer) => std::fmt::Write::write_fmt(buffer, fmt).map(|()| true),
+            None => Ok(false),
+        });
+        if captured.map_err(|e| internal_error!("capturing stderr: {e}"))? {
+            return Ok(());
+        }
+    }
     io::stderr()
         .lock()
         .write_fmt(fmt)

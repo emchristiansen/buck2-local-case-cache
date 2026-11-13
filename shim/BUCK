@@ -109,6 +109,20 @@ remote_test_execution_toolchain(
     visibility = ["PUBLIC"],
 )
 
+# Tools that only the explicit NativeLink mode declares (shim/nix/BUCK, mode/nativelink.buckconfig),
+# named by test environments: the declared shell of the engine's child-process fixtures
+# (BUCK2_TEST_DECLARED_SHELL) and the pinned clang of gazebo/hmap's tests. Without that mode they
+# are stand-ins that refuse to run, so those tests still build here and, if run, fail naming the
+# missing tool: the fixtures accept only a canonical Nix store shell and have no host fallback.
+[
+    sh_binary(
+        name = tool,
+        main = "no_declared_tool.sh",
+        visibility = ["PUBLIC"],
+    )
+    for tool in ["archive_shell", "clang"]
+]
+
 noop_test_toolchain(
     name = "test",
     visibility = ["PUBLIC"],

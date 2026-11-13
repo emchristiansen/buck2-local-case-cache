@@ -8,10 +8,19 @@ rust_library(
         "src/**/*.rs",
     ]),
     test_deps = [
+        "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:prost",
         "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tonic",
         "fbsource//third-party/rust:zstd",
+        "//buck2/app/buck2_build_signals:buck2_build_signals",
+        "//buck2/app/buck2_core:buck2_core",
+        "//buck2/app/buck2_execute:buck2_execute",
         "//buck2/app/buck2_fs:buck2_fs",
+        # The test joining what-ran to the OSS provider's decoder needs the OSS
+        # crate itself, not the alias selecting between implementations.
+        "//buck2/remote_execution/oss/re_grpc:remote_execution",
+        "//buck2/remote_execution/oss/re_grpc_proto:re_grpc_proto",
     ],
     deps = [
         "fbsource//third-party/rust:async-trait",

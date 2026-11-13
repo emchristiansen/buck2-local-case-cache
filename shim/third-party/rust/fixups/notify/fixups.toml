@@ -1,0 +1,5 @@
+# notify 9.0.0-rc.6's build script only acts when CARGO_CFG_TARGET_OS is
+# freebsd (it runs /bin/freebsd-version on the host); on Linux it prints just
+# `rustc-check-cfg=cfg(notify_freebsd_inotify)`. Not running it changes nothing
+# for the Linux engine build and keeps a host command out of the action.
+buildscript.run = false

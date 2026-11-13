@@ -253,6 +253,7 @@ impl ReExecutor {
                             materialized_inputs_for_failed: None,
                             materialized_outputs_for_failed_actions: None,
                             origin: RemoteExecutionOrigin::Executed,
+                            submission: None,
                         },
                         reason,
                         CommandExecutionMetadata {
@@ -270,6 +271,7 @@ impl ReExecutor {
                                 materialized_inputs_for_failed: None,
                                 materialized_outputs_for_failed_actions: None,
                                 origin: RemoteExecutionOrigin::Executed,
+                                submission: None,
                             },
                             CommandCancellationReason::ReQueueTimeout,
                             CommandExecutionMetadata::empty(TimeSpan::empty_now()),
@@ -397,9 +399,14 @@ impl PreparedCommandExecutor for ReExecutor {
             materialized_inputs_for_failed: None,
             materialized_outputs_for_failed_actions: None,
             origin: RemoteExecutionOrigin::Executed,
+            submission: None,
         });
 
-        if command.request.executor_preference().requires_local() {
+        // Only the local executor creates scratch directories and sets their variables.
+        if command.request.executor_preference().requires_local()
+            || !command.request.scratch_dir_variables().is_empty()
+            || command.request.owned_scratch_path().is_some()
+        {
             return ControlFlow::Break(
                 manager.error("remote_prepare", RemoteExecutorError::LocalOnlyAction),
             )?;

@@ -1251,15 +1251,6 @@ impl RemoteExecutionClientImpl {
         knobs: &ExecutorGlobalKnobs,
         persistent_worker: bool,
     ) -> anyhow::Result<ExecuteResponseOrCancelled> {
-        use buck2_data::ReAfterAction;
-        use buck2_data::ReBeforeAction;
-        use buck2_data::ReExecute;
-        use buck2_data::ReQueue;
-        use buck2_data::ReUnknown;
-        use buck2_data::ReWorkerDownload;
-        use buck2_data::ReWorkerUpload;
-        use buck2_data::re_stage;
-
         let action_key = if knobs.log_action_keys {
             metadata
                 .action_history_info
@@ -1271,218 +1262,6 @@ impl RemoteExecutionClientImpl {
 
         let re_use_case = metadata.use_case_id.clone();
 
-        #[allow(clippy::large_enum_variant)]
-        enum ResponseOrStateChange {
-            Present(ExecuteWithProgressResponse),
-            Cancelled(Cancelled),
-        }
-
-        /// Wait for either the ExecuteResponse to show up, or a stage change, within a span
-        /// on the CommandExecutionManager.
-        async fn wait_for_response_or_stage_change(
-            receiver: &mut BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>,
-            previous_stage: Stage,
-            previous_metadata: &Option<OperationMetadata>,
-            report_stage: re_stage::Stage,
-            manager: &mut CommandExecutionManager,
-            queue_stats: &mut QueueStats,
-            re_fallback_on_estimated_queue_time_exceeds_duration: Option<Duration>,
-            re_cancel_on_estimated_queue_time_exceeds: Option<Duration>,
-        ) -> anyhow::Result<ResponseOrStateChange> {
-            executor_stage_async(
-                buck2_data::ReStage {
-                    stage: Some(report_stage),
-                },
-                async move {
-                    loop {
-                        let now = Instant::now();
-
-                        let event = {
-                            let next = futures::future::select(
-                                manager.inner.liveliness_observer.while_alive(),
-                                receiver.next(),
-                            )
-                            .await;
-
-                            // Whenever time elapsed and we were previously in
-                            // queued stage, we add the time that elapsed. If we
-                            // just exited a queued stage, then we tracked how long
-                            // we spent queued. If we are still in queue, we'll keep
-                            // counting. This might not be as accurate as the RE
-                            // logging but at least it works even if we get cancelled.
-                            if matches!(previous_stage, Stage::QUEUED) {
-                                queue_stats.cumulative_queue_duration += Instant::now() - now;
-                            }
-
-                            match next {
-                                futures::future::Either::Left((_dead, _)) => {
-                                    return Ok(ResponseOrStateChange::Cancelled(Cancelled {
-                                        ..Default::default()
-                                    }));
-                                }
-                                futures::future::Either::Right((event, _)) => match event {
-                                    Some(event) => event,
-                                    None => {
-                                        return Err(anyhow::anyhow!(
-                                            "RE execution did not yield a ExecuteResponse"
-                                        ));
-                                    }
-                                },
-                            }
-                            .context("Error was returned on the stream by RE")?
-                        };
-
-                        // Check if we have a response or if the stage has changed
-                        let stage_changed = event.stage != previous_stage;
-
-                        // Check if queue information has changed (when in QUEUED stage)
-                        let queue_info_changed = if matches!(event.stage, Stage::QUEUED)
-                            && matches!(previous_stage, Stage::QUEUED)
-                        {
-                            // Check if the kind of task state has changed.
-                            let previous_task_info = previous_metadata
-                                .as_ref()
-                                .and_then(|m| m.task_info.as_ref());
-                            match (&event.metadata.task_info, previous_task_info) {
-                                (Some(current_task_info), Some(previous_task_info)) => {
-                                    std::mem::discriminant(&current_task_info.state)
-                                        != std::mem::discriminant(&previous_task_info.state)
-                                }
-                                (None, None) => false,
-                                _ => true,
-                            }
-                        } else {
-                            false
-                        };
-
-                        if event.execute_response.is_some() || stage_changed || queue_info_changed {
-                            return Ok(ResponseOrStateChange::Present(event));
-                        }
-
-                        if let Some(anticipated_queue_duration) =
-                            anticipated_queue_duration(&event)?
-                        {
-                            if let Some(re_queue_threshold) =
-                                re_cancel_on_estimated_queue_time_exceeds
-                            {
-                                if anticipated_queue_duration > re_queue_threshold {
-                                    return Ok(ResponseOrStateChange::Cancelled(Cancelled {
-                                        reason: Some(CancellationReason::ReQueueTimeout),
-                                    }));
-                                }
-                            }
-
-                            if let Some(re_acceptable_anticipated_queue_duration) =
-                                re_fallback_on_estimated_queue_time_exceeds_duration
-                            {
-                                if anticipated_queue_duration
-                                    > re_acceptable_anticipated_queue_duration
-                                {
-                                    manager.on_result_delayed();
-                                }
-                            }
-                        }
-                    }
-                },
-            )
-            .await
-        }
-
-        fn get_queue_state(
-            action_digest: String,
-            use_case: String,
-            operation_metadata: &Option<OperationMetadata>,
-        ) -> re_stage::Stage {
-            let queue_info = ReQueue {
-                action_digest,
-                use_case,
-            };
-            let state = operation_metadata
-                .as_ref()
-                .and_then(|m| m.task_info.as_ref())
-                .map(|i| &i.state);
-            match state {
-                // Waiting to run, no extra info needed
-                Some(TaskState::enqueued(..)) => re_stage::Stage::Queue(queue_info),
-                Some(TaskState::waiting_on_reservation(..)) => re_stage::Stage::Queue(queue_info),
-                Some(TaskState::waiting_for_gang_allocation(..)) => {
-                    re_stage::Stage::Queue(queue_info)
-                }
-                // Useful info to display
-                Some(TaskState::no_worker_available(..)) => {
-                    re_stage::Stage::QueueNoWorkerAvailable(ReQueueNoWorkerAvailable {
-                        queue_info: Some(queue_info),
-                    })
-                }
-                Some(TaskState::cancelled(..)) => {
-                    re_stage::Stage::QueueCancelled(ReQueueCancelled {
-                        queue_info: Some(queue_info),
-                    })
-                }
-                Some(TaskState::over_quota(over_quota)) => {
-                    re_stage::Stage::QueueOverQuota(ReQueueOverQuota {
-                        queue_info: Some(queue_info),
-                        exceeded_quotas: over_quota
-                            .exceeded_quotas
-                            .iter()
-                            .map(|q| q.name.clone())
-                            .collect(),
-                    })
-                }
-                Some(TaskState::acquiring_dependencies(..)) => {
-                    re_stage::Stage::QueueAcquiringDependencies(ReQueueAcquiringDependencies {
-                        queue_info: Some(queue_info),
-                    })
-                }
-                // Unknown
-                Some(TaskState::UnknownField(..)) => re_stage::Stage::Queue(queue_info),
-                None => re_stage::Stage::Queue(queue_info),
-            }
-        }
-
-        fn re_stage_from_exe_stage(
-            stage: Stage,
-            operation_metadata: &Option<OperationMetadata>,
-            action_digest: String,
-            platform: &remote_execution::Platform,
-            action_key: &Option<String>,
-            use_case: String,
-            persistent_worker: bool,
-        ) -> re_stage::Stage {
-            match stage {
-                Stage::QUEUED => get_queue_state(action_digest, use_case, operation_metadata),
-                Stage::MATERIALIZING_INPUT => re_stage::Stage::WorkerDownload(ReWorkerDownload {
-                    action_digest,
-                    use_case,
-                }),
-                Stage::BEFORE_ACTION => {
-                    re_stage::Stage::BeforeActionExecution(ReBeforeAction { action_digest })
-                }
-                Stage::EXECUTING => re_stage::Stage::Execute(ReExecute {
-                    action_digest,
-                    platform: Some(platform_to_proto(platform)),
-                    action_key: action_key.clone(),
-                    use_case,
-                    persistent_worker,
-                }),
-                Stage::AFTER_ACTION => {
-                    re_stage::Stage::AfterActionExecution(ReAfterAction { action_digest })
-                }
-                Stage::UPLOADING_OUTPUT => re_stage::Stage::WorkerUpload(ReWorkerUpload {
-                    action_digest,
-                    use_case,
-                }),
-                _ => {
-                    tracing::debug!(
-                        "Received unexpected RE stage {:#?} for action: {}",
-                        stage,
-                        action_digest
-                    );
-                    re_stage::Stage::Unknown(ReUnknown { action_digest })
-                }
-            }
-        }
-
         // There are four possible outcomes, three of them failures:
         // 1. We get Err, which means we failed to communicate to RE.
         // 2. We get Ok(error.code != TCode::Ok), which means we have an RE-level failure
@@ -1491,7 +1270,7 @@ impl RemoteExecutionClientImpl {
 
         // Obtain a stream of events from RE. If this fails then that is case #1 above so we
         // bail.
-        let mut receiver = self
+        let receiver = self
             .client()
             .get_execution_client()
             .execute_with_progress(metadata, request)
@@ -1500,106 +1279,18 @@ impl RemoteExecutionClientImpl {
             .await
             .context("Failed to start remote execution")?;
 
-        // Now we wait until the ExecuteResponse shows up, and produce events accordingly. If
-        // this doesn't give us an ExecuteResponse then this is case #1 again so we also fail.
-        let action_digest_str = action_digest.to_string();
-        let mut queue_stats = QueueStats::default();
-        let mut exe_stage = Stage::QUEUED;
-        let mut execution_started = ExecutionStarted::No;
-        let mut operation_metadata = None;
-        let mut log_stream_emitted = false;
-
-        let re_fallback_on_estimated_queue_time_exceeds = knobs
-            .re_fallback_on_estimated_queue_time_exceeds
-            .or(re_max_queue_time);
-
-        // Lets tests exercise the over-quota path without needing a throttled RE quota pool.
-        let injected_exceeded_quotas = buck2_env!(
-            "BUCK2_TEST_INJECTED_RE_EXCEEDED_QUOTAS",
-            type = Vec<String>,
-            converter = |v| Ok(v.split(' ').map(str::to_owned).collect()),
-            applicability = testing
+        report_execution_progress(
+            receiver,
+            action_digest,
+            platform,
+            action_key,
+            re_use_case,
+            persistent_worker,
+            manager,
+            re_max_queue_time,
+            knobs,
         )
-        // Stringify the error because we can't deal with buck2_errors here
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-        loop {
-            let report_stage = match injected_exceeded_quotas {
-                Some(exceeded_quotas) if exe_stage == Stage::QUEUED => {
-                    re_stage::Stage::QueueOverQuota(ReQueueOverQuota {
-                        queue_info: Some(ReQueue {
-                            action_digest: action_digest_str.clone(),
-                            use_case: re_use_case.clone(),
-                        }),
-                        exceeded_quotas: exceeded_quotas.clone(),
-                    })
-                }
-                _ => re_stage_from_exe_stage(
-                    exe_stage,
-                    &operation_metadata,
-                    action_digest_str.clone(),
-                    platform,
-                    &action_key,
-                    re_use_case.clone(),
-                    persistent_worker,
-                ),
-            };
-            let progress_response = wait_for_response_or_stage_change(
-                &mut receiver,
-                exe_stage,
-                &operation_metadata,
-                report_stage,
-                manager,
-                &mut queue_stats,
-                re_fallback_on_estimated_queue_time_exceeds,
-                knobs.re_cancel_on_estimated_queue_time_exceeds,
-            )
-            .await?;
-
-            let progress_response = match progress_response {
-                ResponseOrStateChange::Present(r) => r,
-                ResponseOrStateChange::Cancelled(c) => {
-                    return Ok(ExecuteResponseOrCancelled::Cancelled(
-                        c,
-                        queue_stats,
-                        execution_started,
-                    ));
-                }
-            };
-
-            // Return the result if we're done
-            if let Some(execute_response) = progress_response.execute_response {
-                return Ok(ExecuteResponseOrCancelled::Response(
-                    ExecuteResponseWithQueueStats {
-                        execute_response,
-                        queue_stats,
-                    },
-                ));
-            }
-
-            // Change the stage
-            exe_stage = progress_response.stage;
-            if exe_stage == Stage::EXECUTING {
-                execution_started = ExecutionStarted::Yes;
-            }
-            operation_metadata = Some(progress_response.metadata);
-
-            // Emit log stream handles when first available
-            if !log_stream_emitted {
-                if let Some(ref meta) = operation_metadata {
-                    if !meta.stdout_stream_name.is_empty() || !meta.stderr_stream_name.is_empty() {
-                        log_stream_emitted = true;
-                        get_dispatcher().instant_event(buck2_data::ReLogStreamAvailable {
-                            action_digest: action_digest_str.clone(),
-                            stdout_stream_name: meta.stdout_stream_name.clone(),
-                            stderr_stream_name: meta.stderr_stream_name.clone(),
-                            action_key: action_key.clone(),
-                            use_case: re_use_case.clone(),
-                        });
-                    }
-                }
-            }
-        }
+        .await
     }
 
     pub async fn execute<'a>(
@@ -2172,6 +1863,370 @@ impl Drop for RemoteExecutionClientImpl {
                 drop(client);
                 tracing::info!("Dropped RE client");
             });
+        }
+    }
+}
+
+/// Which `Execute` request reported `response`, when the remote execution client counts them.
+fn progress_submission(response: &ExecuteWithProgressResponse) -> Option<u32> {
+    #[cfg(fbcode_build)]
+    {
+        let _ = response;
+        None
+    }
+    #[cfg(not(fbcode_build))]
+    {
+        response.submission
+    }
+}
+
+/// Reports the progress of one remote execution as executor stages on the current span, and
+/// returns once `receiver` yields the execute response, or once the command is cancelled.
+///
+/// The stages are what `buck2 log what-ran` and the consoles read. A stage is reported for each
+/// change the provider reports, in the order reported, so a provider that starts the action over
+/// (for example after losing the operation) can report `EXECUTING` and later `QUEUED` again.
+/// When the provider counts its `Execute` requests, a progress update from another request
+/// starts a new stage even if the stage is the same, the execution stage records its request, and
+/// the response records the request that was answered: the answer of a request started over
+/// after an execution is never attributed to that execution.
+///
+/// Public so that consumers of these stages can be tested against this exact producer, driven by
+/// the real provider progress stream, rather than a hand-written approximation of it.
+pub async fn report_execution_progress(
+    mut receiver: BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>,
+    action_digest: &ActionDigest,
+    platform: &remote_execution::Platform,
+    action_key: Option<String>,
+    re_use_case: String,
+    persistent_worker: bool,
+    manager: &mut CommandExecutionManager,
+    re_max_queue_time: Option<Duration>,
+    knobs: &ExecutorGlobalKnobs,
+) -> anyhow::Result<ExecuteResponseOrCancelled> {
+    use buck2_data::ReAfterAction;
+    use buck2_data::ReBeforeAction;
+    use buck2_data::ReExecute;
+    use buck2_data::ReQueue;
+    use buck2_data::ReUnknown;
+    use buck2_data::ReWorkerDownload;
+    use buck2_data::ReWorkerUpload;
+    use buck2_data::re_stage;
+
+    #[allow(clippy::large_enum_variant)]
+    enum ResponseOrStateChange {
+        Present(ExecuteWithProgressResponse),
+        Cancelled(Cancelled),
+    }
+
+    /// Wait for either the ExecuteResponse to show up, or a stage change, within a span
+    /// on the CommandExecutionManager.
+    async fn wait_for_response_or_stage_change(
+        receiver: &mut BoxStream<'static, anyhow::Result<ExecuteWithProgressResponse>>,
+        previous_stage: Stage,
+        previous_submission: Option<u32>,
+        previous_metadata: &Option<OperationMetadata>,
+        report_stage: re_stage::Stage,
+        manager: &mut CommandExecutionManager,
+        queue_stats: &mut QueueStats,
+        re_fallback_on_estimated_queue_time_exceeds_duration: Option<Duration>,
+        re_cancel_on_estimated_queue_time_exceeds: Option<Duration>,
+    ) -> anyhow::Result<ResponseOrStateChange> {
+        executor_stage_async(
+            buck2_data::ReStage {
+                stage: Some(report_stage),
+            },
+            async move {
+                loop {
+                    let now = Instant::now();
+
+                    let event = {
+                        let next = futures::future::select(
+                            manager.inner.liveliness_observer.while_alive(),
+                            receiver.next(),
+                        )
+                        .await;
+
+                        // Whenever time elapsed and we were previously in
+                        // queued stage, we add the time that elapsed. If we
+                        // just exited a queued stage, then we tracked how long
+                        // we spent queued. If we are still in queue, we'll keep
+                        // counting. This might not be as accurate as the RE
+                        // logging but at least it works even if we get cancelled.
+                        if matches!(previous_stage, Stage::QUEUED) {
+                            queue_stats.cumulative_queue_duration += Instant::now() - now;
+                        }
+
+                        match next {
+                            futures::future::Either::Left((_dead, _)) => {
+                                return Ok(ResponseOrStateChange::Cancelled(Cancelled {
+                                    ..Default::default()
+                                }));
+                            }
+                            futures::future::Either::Right((event, _)) => match event {
+                                Some(event) => event,
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "RE execution did not yield a ExecuteResponse"
+                                    ));
+                                }
+                            },
+                        }
+                        .context("Error was returned on the stream by RE")?
+                    };
+
+                    // Check if we have a response or if the stage has changed, including to
+                    // the same stage of another request.
+                    let stage_changed = event.stage != previous_stage
+                        || (previous_submission.is_some()
+                            && progress_submission(&event) != previous_submission);
+
+                    // Check if queue information has changed (when in QUEUED stage)
+                    let queue_info_changed = if matches!(event.stage, Stage::QUEUED)
+                        && matches!(previous_stage, Stage::QUEUED)
+                    {
+                        // Check if the kind of task state has changed.
+                        let previous_task_info = previous_metadata
+                            .as_ref()
+                            .and_then(|m| m.task_info.as_ref());
+                        match (&event.metadata.task_info, previous_task_info) {
+                            (Some(current_task_info), Some(previous_task_info)) => {
+                                std::mem::discriminant(&current_task_info.state)
+                                    != std::mem::discriminant(&previous_task_info.state)
+                            }
+                            (None, None) => false,
+                            _ => true,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if event.execute_response.is_some() || stage_changed || queue_info_changed {
+                        return Ok(ResponseOrStateChange::Present(event));
+                    }
+
+                    if let Some(anticipated_queue_duration) = anticipated_queue_duration(&event)? {
+                        if let Some(re_queue_threshold) = re_cancel_on_estimated_queue_time_exceeds
+                        {
+                            if anticipated_queue_duration > re_queue_threshold {
+                                return Ok(ResponseOrStateChange::Cancelled(Cancelled {
+                                    reason: Some(CancellationReason::ReQueueTimeout),
+                                }));
+                            }
+                        }
+
+                        if let Some(re_acceptable_anticipated_queue_duration) =
+                            re_fallback_on_estimated_queue_time_exceeds_duration
+                        {
+                            if anticipated_queue_duration > re_acceptable_anticipated_queue_duration
+                            {
+                                manager.on_result_delayed();
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    fn get_queue_state(
+        action_digest: String,
+        use_case: String,
+        operation_metadata: &Option<OperationMetadata>,
+    ) -> re_stage::Stage {
+        let queue_info = ReQueue {
+            action_digest,
+            use_case,
+        };
+        let state = operation_metadata
+            .as_ref()
+            .and_then(|m| m.task_info.as_ref())
+            .map(|i| &i.state);
+        match state {
+            // Waiting to run, no extra info needed
+            Some(TaskState::enqueued(..)) => re_stage::Stage::Queue(queue_info),
+            Some(TaskState::waiting_on_reservation(..)) => re_stage::Stage::Queue(queue_info),
+            Some(TaskState::waiting_for_gang_allocation(..)) => re_stage::Stage::Queue(queue_info),
+            // Useful info to display
+            Some(TaskState::no_worker_available(..)) => {
+                re_stage::Stage::QueueNoWorkerAvailable(ReQueueNoWorkerAvailable {
+                    queue_info: Some(queue_info),
+                })
+            }
+            Some(TaskState::cancelled(..)) => re_stage::Stage::QueueCancelled(ReQueueCancelled {
+                queue_info: Some(queue_info),
+            }),
+            Some(TaskState::over_quota(over_quota)) => {
+                re_stage::Stage::QueueOverQuota(ReQueueOverQuota {
+                    queue_info: Some(queue_info),
+                    exceeded_quotas: over_quota
+                        .exceeded_quotas
+                        .iter()
+                        .map(|q| q.name.clone())
+                        .collect(),
+                })
+            }
+            Some(TaskState::acquiring_dependencies(..)) => {
+                re_stage::Stage::QueueAcquiringDependencies(ReQueueAcquiringDependencies {
+                    queue_info: Some(queue_info),
+                })
+            }
+            // Unknown
+            Some(TaskState::UnknownField(..)) => re_stage::Stage::Queue(queue_info),
+            None => re_stage::Stage::Queue(queue_info),
+        }
+    }
+
+    fn re_stage_from_exe_stage(
+        stage: Stage,
+        operation_metadata: &Option<OperationMetadata>,
+        action_digest: String,
+        platform: &remote_execution::Platform,
+        action_key: &Option<String>,
+        use_case: String,
+        persistent_worker: bool,
+        submission: Option<u32>,
+    ) -> re_stage::Stage {
+        match stage {
+            Stage::QUEUED => get_queue_state(action_digest, use_case, operation_metadata),
+            Stage::MATERIALIZING_INPUT => re_stage::Stage::WorkerDownload(ReWorkerDownload {
+                action_digest,
+                use_case,
+            }),
+            Stage::BEFORE_ACTION => {
+                re_stage::Stage::BeforeActionExecution(ReBeforeAction { action_digest })
+            }
+            Stage::EXECUTING => re_stage::Stage::Execute(ReExecute {
+                action_digest,
+                platform: Some(platform_to_proto(platform)),
+                action_key: action_key.clone(),
+                use_case,
+                persistent_worker,
+                submission,
+            }),
+            Stage::AFTER_ACTION => {
+                re_stage::Stage::AfterActionExecution(ReAfterAction { action_digest })
+            }
+            Stage::UPLOADING_OUTPUT => re_stage::Stage::WorkerUpload(ReWorkerUpload {
+                action_digest,
+                use_case,
+            }),
+            _ => {
+                tracing::debug!(
+                    "Received unexpected RE stage {:#?} for action: {}",
+                    stage,
+                    action_digest
+                );
+                re_stage::Stage::Unknown(ReUnknown { action_digest })
+            }
+        }
+    }
+
+    // Now we wait until the ExecuteResponse shows up, and produce events accordingly. If
+    // this doesn't give us an ExecuteResponse then this is case #1 again so we also fail.
+    let action_digest_str = action_digest.to_string();
+    let mut queue_stats = QueueStats::default();
+    let mut exe_stage = Stage::QUEUED;
+    let mut execution_started = ExecutionStarted::No;
+    let mut operation_metadata = None;
+    let mut submission = None;
+    let mut log_stream_emitted = false;
+
+    let re_fallback_on_estimated_queue_time_exceeds = knobs
+        .re_fallback_on_estimated_queue_time_exceeds
+        .or(re_max_queue_time);
+
+    // Lets tests exercise the over-quota path without needing a throttled RE quota pool.
+    let injected_exceeded_quotas = buck2_env!(
+        "BUCK2_TEST_INJECTED_RE_EXCEEDED_QUOTAS",
+        type = Vec<String>,
+        converter = |v| Ok(v.split(' ').map(str::to_owned).collect()),
+        applicability = testing
+    )
+    // Stringify the error because we can't deal with buck2_errors here
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    loop {
+        let report_stage = match injected_exceeded_quotas {
+            Some(exceeded_quotas) if exe_stage == Stage::QUEUED => {
+                re_stage::Stage::QueueOverQuota(ReQueueOverQuota {
+                    queue_info: Some(ReQueue {
+                        action_digest: action_digest_str.clone(),
+                        use_case: re_use_case.clone(),
+                    }),
+                    exceeded_quotas: exceeded_quotas.clone(),
+                })
+            }
+            _ => re_stage_from_exe_stage(
+                exe_stage,
+                &operation_metadata,
+                action_digest_str.clone(),
+                platform,
+                &action_key,
+                re_use_case.clone(),
+                persistent_worker,
+                submission,
+            ),
+        };
+        let progress_response = wait_for_response_or_stage_change(
+            &mut receiver,
+            exe_stage,
+            submission,
+            &operation_metadata,
+            report_stage,
+            manager,
+            &mut queue_stats,
+            re_fallback_on_estimated_queue_time_exceeds,
+            knobs.re_cancel_on_estimated_queue_time_exceeds,
+        )
+        .await?;
+
+        let progress_response = match progress_response {
+            ResponseOrStateChange::Present(r) => r,
+            ResponseOrStateChange::Cancelled(c) => {
+                return Ok(ExecuteResponseOrCancelled::Cancelled(
+                    c,
+                    queue_stats,
+                    execution_started,
+                ));
+            }
+        };
+
+        // Return the result if we're done
+        let response_submission = progress_submission(&progress_response);
+        if let Some(execute_response) = progress_response.execute_response {
+            return Ok(ExecuteResponseOrCancelled::Response(
+                ExecuteResponseWithQueueStats {
+                    execute_response,
+                    queue_stats,
+                    submission: response_submission,
+                },
+            ));
+        }
+
+        // Change the stage
+        exe_stage = progress_response.stage;
+        submission = response_submission;
+        if exe_stage == Stage::EXECUTING {
+            execution_started = ExecutionStarted::Yes;
+        }
+        operation_metadata = Some(progress_response.metadata);
+
+        // Emit log stream handles when first available
+        if !log_stream_emitted {
+            if let Some(ref meta) = operation_metadata {
+                if !meta.stdout_stream_name.is_empty() || !meta.stderr_stream_name.is_empty() {
+                    log_stream_emitted = true;
+                    get_dispatcher().instant_event(buck2_data::ReLogStreamAvailable {
+                        action_digest: action_digest_str.clone(),
+                        stdout_stream_name: meta.stdout_stream_name.clone(),
+                        stderr_stream_name: meta.stderr_stream_name.clone(),
+                        action_key: action_key.clone(),
+                        use_case: re_use_case.clone(),
+                    });
+                }
+            }
         }
     }
 }

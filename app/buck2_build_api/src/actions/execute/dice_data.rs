@@ -45,11 +45,34 @@ pub trait SetCommandExecutor {
     fn set_command_executor(&mut self, init: Box<dyn HasCommandExecutor + Send + Sync + 'static>);
 }
 
+/// Whether a command's explicitly selected local executor may run when the invocation's
+/// execution strategy bans local execution with `--remote-only`.
+#[derive(Clone, Copy, Debug, Dupe, PartialEq, Eq)]
+pub enum LocalExecution {
+    /// The invocation's execution strategy alone decides. Builds, runs, every other action and
+    /// every test command the test orchestrator does not admit use this.
+    ByStrategy,
+    /// The listing or case command of an `InternalRunnerTestInfo` test whose resolved executor
+    /// is `Executor::Local`, selected under `[test] local_internal_cases = true`. Only the test
+    /// orchestrator grants it. It admits that local executor under `--remote-only` and nothing
+    /// else: no other executor kind, and nothing under a strategy that bans all execution.
+    AdmittedInternalTest,
+    /// The listing or test command of an `ExternalRunnerTestInfo` test whose provider explicitly
+    /// selected `Executor::Local` (its `default_executor` or the named override, never the
+    /// execution platform's fallback) and which does not support test execution caching,
+    /// selected under `[test] local_workspace_tests = true`. Such a test may read its live
+    /// workspace, so it runs locally and uncached. Only the test orchestrator grants it, and the
+    /// orchestrator keeps its cache checker and uploader no-ops. It admits that local executor
+    /// under `--remote-only` and nothing else, exactly like `AdmittedInternalTest`.
+    AdmittedLocalWorkspaceTest,
+}
+
 pub trait HasCommandExecutor {
     fn get_command_executor(
         &self,
         artifact_fs: &ArtifactFs,
         config: &CommandExecutorConfig,
+        local_execution: LocalExecution,
     ) -> buck2_error::Result<CommandExecutorResponse>;
 }
 
@@ -67,6 +90,7 @@ pub trait DiceHasCommandExecutor {
         &self,
         artifact_fs: &ArtifactFs,
         config: &CommandExecutorConfig,
+        local_execution: LocalExecution,
     ) -> buck2_error::Result<CommandExecutorResponse>;
 }
 
@@ -75,6 +99,7 @@ impl DiceHasCommandExecutor for DiceComputations<'_> {
         &self,
         artifact_fs: &ArtifactFs,
         config: &CommandExecutorConfig,
+        local_execution: LocalExecution,
     ) -> buck2_error::Result<CommandExecutorResponse> {
         let holder = self
             .per_transaction_data()
@@ -82,7 +107,9 @@ impl DiceHasCommandExecutor for DiceComputations<'_> {
             .get::<HasCommandExecutorHolder>()
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
             .buck_error_context("CommandExecutorDelegate should be set")?;
-        holder.delegate.get_command_executor(artifact_fs, config)
+        holder
+            .delegate
+            .get_command_executor(artifact_fs, config, local_execution)
     }
 }
 

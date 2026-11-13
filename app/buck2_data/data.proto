@@ -1127,6 +1127,8 @@ message AggregatedBuildMetrics {
 
   double analysis_retained_memory = 8;
   double declared_actions = 10;
+  // Reused local test results, with no new local or remote execution.
+  double local_test_result_cache_hits = 11;
 }
 
 message TopLevelTargetCriticalPath {
@@ -1717,6 +1719,51 @@ message TestResult {
   string details = 8; // Required
   ConfiguredTargetLabel target_label = 9;
   optional uint64 max_memory_used_bytes = 10;
+  // Present only when no case was executed for this result: the recorded
+  // output of an earlier execution was reused and parsed again. `duration`,
+  // `msg` and `details` then describe that earlier execution.
+  TestResultReuse reuse = 11; // Optional
+}
+
+// The provenance of a reused test result: a host-local case store entry
+// (origin_attempt, entry_manifest, current_attempt) or a remote cached answer
+// for the case's exact remote action (action_digest, served_by,
+// original_execution_time); the other fields are empty. In both,
+// TestResult.duration is the original execution's duration and
+// current_execution_time is this test run's own interval.
+message TestResultReuse {
+  // Numbers and the name used only by unreleased candidates (a bool
+  // `served_execute` at 6): never reused, so stray candidate data is ignored
+  // rather than misread.
+  reserved 5, 6, 7;
+  reserved "served_execute";
+
+  // The attempt that executed the case and recorded the reused output.
+  string origin_attempt = 1;
+  // The immutable entry manifest binding the reused output to its original
+  // execution.
+  string entry_manifest = 2;
+  // This test run's attempt, which looked the output up and reused it.
+  string current_attempt = 3;
+  // The time this test run spent on the case (no case ran): zero for a
+  // host-local entry; for a remote entry, the client's wall time obtaining the
+  // cached answer now, never the original execution's duration. Unset when
+  // it was not reported.
+  google.protobuf.Duration current_execution_time = 4;
+  // The digest of the remote action whose cached answer was reused. Empty for
+  // a host-local entry.
+  string action_digest = 8;
+  // How the remote cached answer reached this run: ACTION_CACHE for buck2's
+  // own action-cache lookup, RE_SERVED_FROM_CACHE for an execute request the
+  // service answered from its cache, RE_DEDUPLICATED for one it deduplicated
+  // against an identical execution in flight. Absent (explicit presence) for a
+  // host-local entry and in records written before this field existed:
+  // unrecorded provenance, never an action-cache answer or an execution.
+  optional RemoteCommandOrigin served_by = 9;
+  // For a remote entry: how long the original execution of that action ran, as
+  // the worker recorded it in the cached ActionResult's execution metadata.
+  // Unset for a host-local entry.
+  google.protobuf.Duration original_execution_time = 10;
 }
 
 // At the beginning of discovery, the test orchestrator will advertise
@@ -2212,6 +2259,18 @@ enum ActionExecutionKind {
   // build: the service deduplicated it against an identical execution already
   // in flight.
   ACTION_EXECUTION_KIND_REMOTE_DEDUPLICATED = 13;
+  // Fork-local (emchristiansen/buck2-local-case-cache): fork-local numbers
+  // live at 10001+ so they stay clear of upstream's sequential allocation.
+  // A semantically confirmed local test result was reused; no child executed.
+  // (Was 12 before the 2026-11-01 sync; upstream now owns 12.)
+  ACTION_EXECUTION_KIND_LOCAL_TEST_RESULT_CACHE = 10001;
+  // Fork-local, reader-only: never produced by an executor or written as the
+  // result of an execution. The event-log reader puts it in place of 12 in a
+  // log without an `Invocation.muninn_event_schema` marker, where 12 is
+  // either upstream's REMOTE_SERVED_FROM_CACHE or this fork's pre-sync
+  // LOCAL_TEST_RESULT_CACHE and the log does not say which. Reading such a log
+  // with the explicit legacy-fork opt-in gives LOCAL_TEST_RESULT_CACHE instead.
+  ACTION_EXECUTION_KIND_SERVED_FROM_CACHE_OR_LEGACY_LOCAL_TEST_RESULT_CACHE = 10002;
 }
 
 // A name for a particular action, suitable for offline analytics and user
@@ -2275,7 +2334,24 @@ message CommandExecutionKind {
     WorkerInitCommand worker_init_command = 4;
     // The command, if executed by a local worker.
     WorkerCommand worker_command = 5;
+    // Explicit local test-result reuse; never a RemoteCommand cache event.
+    LocalTestResultCache local_test_result_cache = 6;
   }
+}
+
+message LocalTestResultCacheQuery {
+  string action_digest = 1;
+  string cache_key = 2;
+  string current_attempt = 3;
+}
+
+message LocalTestResultCache {
+  string action_digest = 1;
+  string cache_key = 2;
+  string origin_attempt = 3;
+  // Immutable entry manifest, binding full raw/output and original confirmation.
+  string entry_manifest = 4;
+  string current_attempt = 5;
 }
 
 // Serialization of CommandExecutionMetadata
@@ -2800,7 +2876,41 @@ message ExecutorStageStart {
     CacheHit cache_hit = 23;
     PrepareAction prepare = 24;
     CasArtifactStage cas_artifact = 25;
+    // Fork-local (were 25/26 before the 2026-11-01 sync; upstream owns 25).
+    LocalTestResultCacheQuery local_test_result_cache_query = 10001;
+    LocalTestResultCache local_test_result_cache = 10002;
+    // Fork-local, reader-only: see `UnmarkedLogStage`.
+    UnmarkedLogStage unmarked_log_stage = 10003;
   }
+}
+
+// Fork-local, reader-only: never written by an executor. The event-log reader
+// puts this in place of an `ExecutorStageStart` stage at field 25 or 26 of a
+// log without an `Invocation.muninn_event_schema` marker, when the bytes do not
+// decide what the stage was:
+// - 25 whose payload is valid both as upstream's `CasArtifactStage` and as the
+//   fork's pre-sync (b1100380) `LocalTestResultCacheQuery` (for example, an
+//   empty one);
+// - 26, which the current schema does not define (b1100380's
+//   `LocalTestResultCache`, or a stage from a later upstream).
+// Each reading is set only if the payload is valid under that schema; neither
+// is asserted. A 25 that is valid only under b1100380 (a nonempty digest) or
+// only as `CasArtifactStage` (a phase) is decided by its bytes and never
+// becomes this.
+message UnmarkedLogStage {
+  // The stage's field number in the log: 25 or 26.
+  uint32 field_number = 1;
+  // The reading as upstream's `cas_artifact = 25`.
+  CasArtifactStage as_cas_artifact = 2;
+  // The reading as b1100380's `local_test_result_cache_query = 25`.
+  LocalTestResultCacheQuery as_legacy_local_test_result_cache_query = 3;
+  // The reading as b1100380's `local_test_result_cache = 26`.
+  LocalTestResultCache as_legacy_local_test_result_cache = 4;
+  // For 26: the current schema's reading of the same `ExecutorStageStart`. It
+  // does not define 26, skips it, and selects the last member it does define
+  // (for example `prepare = 24` written before the 26). Unset if that leaves
+  // no stage or the current schema cannot decode the message.
+  ExecutorStageStart as_current_schema_stage = 5;
 }
 
 message PrepareAction {}
@@ -2871,6 +2981,13 @@ message ReExecute {
   optional string action_key = 3;
   string use_case = 4;
   bool persistent_worker = 5;
+  // Fork-only. Which `Execute` request for this command the service reported
+  // executing, counted by the remote execution client from 1 within one remote
+  // execution of the command: the client sends another when it starts the
+  // action over (the service lost the operation, or failed it transiently).
+  // Resuming an operation is not another request. Unset when the client does
+  // not report it, and in logs written before it was reported.
+  optional uint32 submission = 10001;
 }
 
 message RePlatform {
@@ -3357,6 +3474,12 @@ message RemoteCommand {
   /// for a reused result (a cache hit or a deduplicated execution), whose
   /// metadata describes another execution.
   ReWorkerDetails re_worker = 9;
+  // Fork-only. Which `Execute` request the service answered with this result,
+  // counted as `ReExecute.submission` is within the same remote execution: an
+  // execution stage with another value describes a different request. Unset
+  // when the client does not report it, when the service gave no answer, and
+  // in logs written before it was reported.
+  optional uint32 submission = 10001;
 }
 
 message RemoteCommandDetails {
@@ -3373,6 +3496,18 @@ message Invocation {
   string working_dir = 2;
   optional string trace_id = 3;
   google.protobuf.Timestamp start_time = 4;
+  // Fork-local event schema marker. Absent in every log written before the
+  // marker existed: by upstream buck2, and by this fork before and at
+  // b1100380, whose fork-only numbers (ActionExecutionKind 12,
+  // ExecutorStageStart 25/26, InvocationRecord 761) collide with upstream's.
+  // The bytes of such an unmarked log cannot always tell the two writers
+  // apart, so the reader treats them by explicit rules
+  // (buck2_event_log::schema_compat). Current writers set 2: the fork-only
+  // numbers are at 10001+ (ActionExecutionKind
+  // LOCAL_TEST_RESULT_CACHE = 10001, ExecutorStageStart 10001/10002,
+  // InvocationRecord 10001) and upstream's numbers mean what upstream says.
+  // A log with 2 or more is read with the current schema as is.
+  optional uint32 muninn_event_schema = 10001;
 }
 
 message RecordEvent {
@@ -3488,6 +3623,10 @@ message InvocationRecord {
   uint64 run_remote_count = 11;
   // Count of actions that downloaded action cache
   uint64 run_action_cache_count = 12;
+  // Local test-result reuse, distinct from execution and remote action cache.
+  // Fork-local (was 761 before the 2026-11-01 sync; upstream owns 761 for
+  // `re_exceeded_quotas`).
+  optional uint64 run_local_test_result_cache_count = 10001;
   // Count of actions that were skipped. Actions are usually skipped due to a
   // dep-files hit.
   uint64 run_skipped_count = 13;

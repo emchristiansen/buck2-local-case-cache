@@ -222,6 +222,26 @@ fn executor_heap(executor: &buck2_data::ExecutorStageStart) -> Option<usize> {
             no_owned_heap(phase);
             0
         }
+        Some(Stage::LocalTestResultCacheQuery(buck2_data::LocalTestResultCacheQuery {
+            action_digest,
+            cache_key,
+            current_attempt,
+        })) => action_digest.capacity() + cache_key.capacity() + current_attempt.capacity(),
+        Some(Stage::LocalTestResultCache(buck2_data::LocalTestResultCache {
+            action_digest,
+            cache_key,
+            origin_attempt,
+            entry_manifest,
+            current_attempt,
+        })) => {
+            action_digest.capacity()
+                + cache_key.capacity()
+                + origin_attempt.capacity()
+                + entry_manifest.capacity()
+                + current_attempt.capacity()
+        }
+        // Reader-only nested alternative readings keep the reference walk.
+        Some(Stage::UnmarkedLogStage(_)) => return None,
     })
 }
 
@@ -255,8 +275,10 @@ fn remote_heap(re: &buck2_data::ReStage) -> Option<usize> {
             action_key,
             use_case,
             persistent_worker,
+            submission,
         })) => {
             no_owned_heap(persistent_worker);
+            let _: &Option<u32> = submission;
             action_digest.capacity()
                 + platform.as_ref().map_or(0, platform_heap)
                 + optional_string(action_key)
@@ -584,6 +606,20 @@ mod tests {
                 cache_type: 1,
             }),
             Executor::Prepare(buck2_data::PrepareAction {}),
+            Executor::LocalTestResultCacheQuery(buck2_data::LocalTestResultCacheQuery {
+                action_digest: spare("query"),
+                cache_key: spare(""),
+                current_attempt: spare("attempt"),
+            }),
+            Executor::LocalTestResultCache(buck2_data::LocalTestResultCache {
+                action_digest: spare("hit"),
+                cache_key: spare("key"),
+                origin_attempt: spare(""),
+                entry_manifest: spare("manifest"),
+                current_attempt: spare("attempt"),
+            }),
+            Executor::LocalTestResultCacheQuery(Default::default()),
+            Executor::LocalTestResultCache(Default::default()),
         ] {
             assert_event(executor(Some(stage)), true);
         }
@@ -628,6 +664,7 @@ mod tests {
                 action_key: Some(spare("key")),
                 use_case: spare("buck"),
                 persistent_worker: true,
+                submission: Some(u32::MAX),
             })),
             Some(Stage::Execute(Default::default())),
             Some(Stage::Download(buck2_data::ReDownload {})),
@@ -743,6 +780,23 @@ mod tests {
                     )),
                 },
             ))),
+            false,
+        );
+        assert_event(
+            executor(Some(
+                buck2_data::executor_stage_start::Stage::UnmarkedLogStage(Box::new(
+                    buck2_data::UnmarkedLogStage {
+                        field_number: 25,
+                        as_legacy_local_test_result_cache_query: Some(
+                            buck2_data::LocalTestResultCacheQuery {
+                                action_digest: spare("legacy"),
+                                ..Default::default()
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                )),
+            )),
             false,
         );
         let mut reused_ids = Vec::with_capacity(71);

@@ -6,10 +6,12 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@nix_toolchains//:rust_protobuf_generate.bzl", "rust_protobuf_generate")
 load("@prelude//utils:buckconfig.bzl", "read_bool")
 # @lint-ignore-every FBCODEBZLADDLOADS
 
 load("@prelude//utils:type_defs.bzl", "is_dict", "is_list", "is_select")
+load("@shim//build_defs:nativelink_mode.bzl", "nativelink_mode")
 load("@shim//build_defs/lib:oss.bzl", "translate_target")
 
 prelude = native
@@ -241,6 +243,120 @@ def rust_library(
         **_drop_fbcode_only_rust_attrs(kwargs),
     )
 
+    _rust_library_unittest(
+        name = name,
+        edition = edition,
+        rustc_flags = rustc_flags,
+        deps = deps,
+        mapped_srcs = mapped_srcs,
+        resources = resources,
+        kwargs = kwargs,
+    )
+
+# In the explicit NativeLink mode, the remote test profile the `<name>-unittest` targets name.
+# Profiles are declared on toolchains//:remote_test_execution (shim/nix/BUCK);
+# `nativelink_test_result_reuse` requires the worker's build properties plus
+# `muninn-test-runtime=linux-unprivileged-v2` and forbids local execution.
+def _rust_unittest_remote_profile():
+    return read_config("shim", "rust_unittest_remote_profile", "nativelink_test_result_reuse")
+
+# The prelude's remote per-case route (rust/rust_binary.bzl rust_test_impl,
+# `remote_case_result_reuse`): besides the External provider, each harness offers the
+# Internal one, whose engine lists the cases and runs each as its own remote action,
+# `runner -- BINARY <runner options> --raw-one-case --exact NAME`, reusing a cached result
+# only when the strict parser confirms it as one PASS for that case. The prelude admits it
+# only on `nativelink_test_result_reuse`, so another profile turns it off.
+def _rust_unittest_remote_case_result_reuse(profile):
+    return profile == "nativelink_test_result_reuse" and read_bool(
+        "shim",
+        "rust_unittest_remote_case_result_reuse",
+        True,
+    )
+
+_RUST_UNITTEST_RUN_ENV = {"HOME": ".", "LC_ALL": "C", "TMPDIR": "."}
+_RUST_UNITTEST_ARGS = ["--project-relative-env", "HOME", "--project-relative-env", "TMPDIR"]
+
+# rust_library attributes that also describe how the crate's own unit-test
+# harness is compiled. Everything else (doctests, doc_deps, preferred_linkage,
+# proc_macro, ...) is library-only.
+_RUST_UNITTEST_SHARED_ATTRS = (
+    "srcs",
+    "crate",
+    "crate_root",
+    "features",
+    "env",
+    "labels",
+    "link_style",
+    "target_compatible_with",
+    "compatible_with",
+)
+
+def _rust_library_unittest(name, edition, rustc_flags, deps, mapped_srcs, resources, kwargs):
+    """Emit `<name>-unittest`, the crate's libtest harness, as fbcode's rust_library does.
+
+    The fbcode macro builds a `rust_test` from the library's own sources plus
+    `test_deps`/`test_env`/`test_srcs`/`test_rustc_flags`; upstream's OSS shim
+    dropped all of those, so no engine unit test had a Buck label. Here the
+    harness is emitted when the library declares its tests (`test_deps`,
+    `test_env`, `test_srcs` or `unittests = True`) and has not opted out with
+    `unittests = False`. Proc-macro crates are skipped (their harness is not a
+    proc-macro crate). The label is `<name>-unittest`, fbcode's spelling.
+    """
+    unittests = kwargs.get("unittests", None)
+    if unittests == False or kwargs.get("proc_macro", False):
+        return
+    declares_tests = unittests == True or any([kwargs.get(attr) != None for attr in ("test_deps", "test_env", "test_srcs")])
+    if not declares_tests:
+        return
+
+    test_kwargs = {k: kwargs[k] for k in _RUST_UNITTEST_SHARED_ATTRS if k in kwargs}
+    test_kwargs.setdefault("crate", name)
+    if kwargs.get("test_srcs"):
+        test_kwargs["srcs"] = test_kwargs.get("srcs", []) + kwargs["test_srcs"]
+    test_env = kwargs.get("test_env")
+    if test_env:
+        test_kwargs["env"] = _merge_env(test_kwargs.get("env", {}), test_env)
+    if "env" in test_kwargs:
+        test_kwargs["env"] = _fix_env(test_kwargs["env"])
+    if kwargs.get("test_labels"):
+        test_kwargs["labels"] = test_kwargs.get("labels", []) + kwargs["test_labels"]
+
+    if nativelink_mode():
+        profile = _rust_unittest_remote_profile()
+
+        # Muninn's portable rust_test contract (prelude rust/rust_binary.bzl
+        # _rust_test_re_executors), as Muninn's generated targets declare it:
+        # explicit test execution caching, the libtest framework, and HOME and
+        # TMPDIR made project-relative on the worker before any test argument.
+        test_kwargs |= {
+            "args": _RUST_UNITTEST_ARGS,
+            "remote_case_result_reuse": _rust_unittest_remote_case_result_reuse(profile),
+            "remote_execution": profile,
+            "run_env": _RUST_UNITTEST_RUN_ENV,
+            "supports_test_execution_caching": True,
+        }
+
+    # By default the harness is a plain rust_test of the bundled prelude: the same sources,
+    # dependencies and environment, run by libtest itself, as upstream Buck2 runs one.
+    prelude.rust_test(
+        name = name + "-unittest",
+        edition = edition or _default_rust_edition(),
+        rustc_flags = rustc_flags + (kwargs.get("test_rustc_flags") or []) + [_CFG_BUCK_BUILD],
+        deps = deps + _fix_deps(kwargs.get("test_deps") or []),
+        mapped_srcs = mapped_srcs,
+        resources = resources,
+        visibility = ["PUBLIC"],
+        **test_kwargs,
+    )
+
+def _merge_env(env, extra):
+    # env and test_env may each be a select (e.g. gazebo/hmap's test_env).
+    if is_select(extra):
+        return select_map(extra, lambda e: _merge_env(env, e))
+    if is_select(env):
+        return select_map(env, lambda e: _merge_env(e, extra))
+    return dict(env) | extra
+
 def rust_binary(name, edition = None, rustc_flags = [], deps = [], resources = {}, visibility = ["PUBLIC"], **kwargs):
     deps = _fix_deps(deps)
     resources = _maybe_select_map(resources, _fix_resources)
@@ -344,16 +460,26 @@ def _rust_protobuf_library(
     if proto_srcs:
         build_env["BUCK_PROTO_SRCS"] = "$(location {})".format(proto_srcs)
 
-    prelude.genrule(
-        name = proto_name,
-        srcs = (protos or [])
-        + [
-            "shim//third-party/proto:google_protobuf",
-        ],
-        out = ".",
-        cmd = "$(exe :" + build_name + ")",
-        env = build_env,
-    )
+    proto_inputs = (protos or []) + ["shim//third-party/proto:google_protobuf"]
+    if nativelink_mode():
+        # Not prelude.genrule: its script runs under the undeclared host
+        # `/usr/bin/env bash`. This runs the build script through the pinned bash
+        # with nix-manifest.json hidden, with the genrule's cwd, env, OUT and output.
+        rust_protobuf_generate(
+            name = proto_name,
+            srcs = proto_inputs,
+            build_script = ":" + build_name,
+            env = build_env,
+            nix_manifest = "toolchains//:nix-manifest.json",
+        )
+    else:
+        prelude.genrule(
+            name = proto_name,
+            srcs = proto_inputs,
+            out = ".",
+            cmd = "$(exe :" + build_name + ")",
+            env = build_env,
+        )
 
     new_deps = [
         {
@@ -419,6 +545,56 @@ def _fix_deps(xs):
     if is_select(xs):
         return select_map(xs, lambda child_targets: _fix_deps(child_targets))
     return map(translate_target, xs)
+
+# Macros whose one argument is a target label (Buck2 coerce/attr_type/arg.rs). Each keeps
+# its own kind: `location` (target configuration), `location_exec` (execution
+# configuration), `exe` (RunInfo, execution configuration) and `exe_target` (RunInfo,
+# target configuration); only the label inside is translated.
+_ENV_TARGET_MACROS = ("location", "location_exec", "exe", "exe_target")
+
+# Internal tool labels that `translate_target` cannot map, because the OSS project has no
+# such package, mapped to the declared pinned tool that stands in for them.
+_ENV_MACRO_TARGETS = {
+    # fbcode's LLVM 21 clang binary (gazebo/hmap HMAP_TEST_CLANG): the pinned toolchain's
+    # clang (nix/pinned_tools.bzl "clang"), as a file artifact (shim BUCK :clang).
+    "fbcode//buck2/platform/cxx/fbcode:llvm-21-bin/clang": "toolchains//:clang",
+}
+
+def _fix_env_target(target):
+    return _ENV_MACRO_TARGETS.get(target) or translate_target(target)
+
+def _fix_env_value(value):
+    """Translate the target label of every `$(KIND LABEL)` in `value`, KIND in _ENV_TARGET_MACROS.
+
+    The same translation `_fix_deps` applies to dependencies, so an environment macro
+    names the same OSS producer a dependency on that label would. Other text, other
+    macros and their spacing are kept unchanged.
+    """
+    if type(value) != type(""):
+        return value
+    parts = []
+    rest = value
+    for _ in range(len(value)):
+        start = rest.find("$(")
+        if start < 0:
+            break
+        end = rest.find(")", start)
+        if end < 0:
+            break
+        body = rest[start + 2 : end]
+        words = body.split(" ")
+        if len(words) == 2 and words[0] in _ENV_TARGET_MACROS and words[1]:
+            body = words[0] + " " + _fix_env_target(words[1])
+        parts.append(rest[:start] + "$(" + body + ")")
+        rest = rest[end + 1 :]
+    parts.append(rest)
+    return "".join(parts)
+
+def _fix_env(env):
+    # env may be a select (e.g. gazebo/hmap's test_env); every branch is translated.
+    if is_select(env):
+        return select_map(env, _fix_env)
+    return {k: _fix_env_value(v) for k, v in env.items()}
 
 def _fix_resources(resources):
     if is_list(resources):

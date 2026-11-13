@@ -5,6 +5,7 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
+load("@shim//build_defs:nativelink_mode.bzl", "nativelink_mode")
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 load(":defs.bzl", "protoc_distribution")
 
@@ -13,16 +14,24 @@ protoc_distribution(
     version = "21.4",
 )
 
+# In the explicit NativeLink mode (mode/nativelink.buckconfig), protoc and the well-known-type
+# include root are pinned Nix tools, nixpkgs protobuf_21 21.12 (toolchains//:protoc,
+# toolchains//:protobuf_well_known_types; see shim/nix/pinned_tools.bzl), each carrying
+# shim/nix/nix-manifest.json as a hidden input. They replace the prebuilt protoc 21.4 above, whose
+# bin/protoc requests the interpreter /lib64/ld-linux-x86-64.so.2, absent on the NativeLink v2
+# worker.
+_NATIVELINK = nativelink_mode()
+
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 alias(
     name = "protoc",
-    actual = ":distribution[protoc]",
+    actual = "toolchains//:protoc" if _NATIVELINK else ":distribution[protoc]",
     visibility = ["PUBLIC"],
 )
 
 # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
 alias(
     name = "google_protobuf",
-    actual = ":distribution[google_protobuf]",
+    actual = "toolchains//:protobuf_well_known_types[include]" if _NATIVELINK else ":distribution[google_protobuf]",
     visibility = ["PUBLIC"],
 )

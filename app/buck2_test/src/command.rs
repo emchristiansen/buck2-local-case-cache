@@ -25,18 +25,16 @@ use buck2_build_api::build::BuildTargetResult;
 use buck2_build_api::build::BuildTargetResultBuilder;
 use buck2_build_api::build::ConfiguredBuildEventVariant;
 use buck2_build_api::build::ProvidersToBuild;
+use buck2_build_api::build::TestArtifacts;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::maybe_stream_build_reports;
 use buck2_build_api::build::build_report::streaming_build_result_channel;
 use buck2_build_api::build::build_report::write_build_report;
-use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
-use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::TestProvider;
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::build_external_runner_spec;
-use buck2_build_api::interpreter::rule_defs::provider::test_provider::test_provider_from_collection;
 use buck2_build_api::materialize::MaterializationAndUploadContext;
 use buck2_cli_proto::HasClientContext;
 use buck2_cli_proto::TestRequest;
@@ -103,7 +101,6 @@ use buck2_server_ctx::tpx_experiment_util::get_tpx_experiments;
 use buck2_test_api::data::TestResult;
 use buck2_test_api::data::TestStatus;
 use buck2_test_api::protocol::TestExecutor;
-use buck2_test_api::protocol::TestOrchestrator;
 use dice::DiceTransaction;
 use dice::LinearRecomputeDiceComputations;
 use dice_futures::cancellation::CancellationContext;
@@ -125,9 +122,11 @@ use crate::executor_launcher::ExecutorLauncher;
 use crate::executor_launcher::ExecutorOutput;
 use crate::executor_launcher::OutOfProcessTestExecutor;
 use crate::executor_launcher::TestExecutorClientWrapper;
+use crate::internal_runner::InternalTestOrchestrator;
 use crate::local_resource_registry::HasLocalResourceRegistry;
 use crate::orchestrator::BuckTestOrchestrator;
 use crate::orchestrator::ExecutorMessage;
+use crate::orchestrator::OwnedTestInfo;
 use crate::session::TestSession;
 use crate::session::TestSessionOptions;
 use crate::translations::build_configured_target_handle;
@@ -999,7 +998,8 @@ struct TestDriverState<'a, 'e> {
     global_cfg_options: &'a GlobalCfgOptions,
     session: &'a Arc<TestSession>,
     test_executor: &'a Arc<dyn TestExecutor + 'e>,
-    internal_orchestrator: &'a tokio::sync::OnceCell<Arc<dyn TestOrchestrator + Send + Sync>>,
+    internal_orchestrator:
+        &'a tokio::sync::OnceCell<Arc<dyn InternalTestOrchestrator + Send + Sync>>,
     internal_test_status_sender: &'a mpsc::UnboundedSender<buck2_error::Result<ExecutorMessage>>,
     liveliness_observer: &'a Arc<dyn LivelinessObserver>,
     cell_resolver: &'a CellResolver,
@@ -1465,6 +1465,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                             state.build_default_info,
                             state.build_run_info,
                             streaming_build_result_tx,
+                            state.internal_runner_config,
                         )
                         .await
                     }
@@ -1551,6 +1552,7 @@ async fn build_target_result(
     build_default_info: bool,
     build_run_info: bool,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
+    internal_runner_config: &InternalRunnerConfig,
 ) -> buck2_error::Result<(BuildTargetResult, FrozenProviderCollectionValue)> {
     // NOTE: We fail if we hit an incompatible target here. This can happen if we reach an
     // incompatible target via `tests = [...]`. This should perhaps change, but that's how it works
@@ -1560,13 +1562,19 @@ async fn build_target_result(
         .get_providers(&label)
         .await?
         .require_compatible()?;
-    let collections = providers.provider_collection();
 
     // We build target if any of the following is true
     // 1. It's a test (aka it produces a TestInfo provider) and it is not skipped by label filtering
     // 2. --build-default-info is requested
     // 3. --build-run-info is requested and the target produces a RunInfo
-    if let Some(test_info) = test_provider_from_collection(collections)? {
+    // Build the test artifacts of the provider `OwnedTestInfo::select` chooses, which is the one
+    // `test_target` runs and the orchestrator expands.
+    let test_info = OwnedTestInfo::select(&providers, internal_runner_config)?;
+    let tests = match &test_info {
+        Some(test_info) => TestArtifacts::Selected(test_info.kind()),
+        None => TestArtifacts::None,
+    };
+    if let Some(test_info) = test_info {
         let skip_build_based_on_labels = !label_filtering.build_filtered_targets
             && label_filtering.is_excluded(test_info.labels());
         if skip_build_based_on_labels {
@@ -1605,7 +1613,7 @@ async fn build_target_result(
                     default: build_default_info,
                     default_other: build_default_info,
                     run: build_run_info,
-                    tests: true,
+                    tests,
                 },
                 BuildConfiguredLabelOptions {
                     skippable: false,
@@ -1641,31 +1649,23 @@ async fn test_target<'a, 'e>(
     oncall: Option<String>,
     tenting_acl_names: TentingStatus,
 ) -> buck2_error::Result<Option<ConfiguredProvidersLabel>> {
-    let collection = providers.provider_collection();
+    // One provider choice drives both this dispatch and the orchestrator's expansion of the
+    // spec built here (see `OwnedTestInfo::select`).
+    let Some(test_info) = OwnedTestInfo::select(&providers, driver_state.internal_runner_config)?
+    else {
+        // not a test
+        return Ok(None);
+    };
+    if label_filtering.is_excluded(test_info.labels()) {
+        return Ok(None);
+    }
 
-    // Check for InternalRunnerTestInfo first — run in-process.
-    // Gated by [test].use_internal_runner (default true, comma-separated framework types,
-    // or false to force TPX fallback).
-    let internal_provider: Option<OwnedInternalRunnerTestInfo> =
-        providers.builtin_provider_value::<InternalRunnerTestInfo>()?;
-    if let Some(internal_provider) = internal_provider {
-        // `'v`-branded views of the provider must not be held across awaits (only the
-        // `OwnedFrozen` may be), so views are derived in scopes that end before the next await.
-        let use_internal_runner = {
-            let provider = internal_provider.as_ref().value().as_ref();
-            driver_state
-                .internal_runner_config
-                .should_use(provider.test_type())
-        };
-        if use_internal_runner {
-            let excluded = {
-                let provider = internal_provider.as_ref().value().as_ref();
-                label_filtering.is_excluded(provider.labels().collect())
-            };
-            if excluded {
-                return Ok(None);
-            }
-
+    let external_provider = match test_info {
+        OwnedTestInfo::External(external_provider) => external_provider,
+        OwnedTestInfo::Internal(internal_provider) => {
+            // Run in-process. `'v`-branded views of the provider must not be held across awaits
+            // (only the `OwnedFrozen` may be), so views are derived in scopes that end before the
+            // next await.
             let handle = build_configured_target_handle(
                 target.dupe(),
                 driver_state.session,
@@ -1688,7 +1688,7 @@ async fn test_target<'a, 'e>(
                     .await
                     .buck_error_context("Failed to create internal BuckTestOrchestrator")?;
                     Ok::<_, buck2_error::Error>(
-                        Arc::new(orchestrator) as Arc<dyn TestOrchestrator + Send + Sync>
+                        Arc::new(orchestrator) as Arc<dyn InternalTestOrchestrator + Send + Sync>
                     )
                 })
                 .await?;
@@ -1727,31 +1727,22 @@ async fn test_target<'a, 'e>(
             .await?;
             return Ok(Some(target));
         }
-    }
+    };
 
-    let fut = match test_provider_from_collection(collection)? {
-        Some(test_info) => {
-            if label_filtering.is_excluded(test_info.labels()) {
-                return Ok(None);
-            }
-            run_tests(
-                test_executor,
-                target,
-                test_info,
-                driver_state.session,
-                cell_resolver,
-                working_dir_cell,
-                test_config_unification_rollout,
-                oncall,
-                tenting_acl_names,
-            )
-            .map(|l| Some(l).transpose())
-            .left_future()
-        }
-        None => {
-            // not a test
-            future::ready(Ok(None)).right_future()
-        }
+    let fut = {
+        let test_info = external_provider.as_ref().value().as_ref();
+        run_tests(
+            test_executor,
+            target,
+            test_info,
+            driver_state.session,
+            cell_resolver,
+            working_dir_cell,
+            test_config_unification_rollout,
+            oncall,
+            tenting_acl_names,
+        )
+        .map(|l| Some(l).transpose())
     };
 
     // NOTE: We produce the future above, then await it here because Module & TestInfo aren't Sync.

@@ -226,6 +226,8 @@ pub enum CommandReproducer {
     CacheQuery(buck2_data::CacheQuery),
     CacheHit(buck2_data::CacheHit),
     LocalDepFileCacheHit,
+    LocalTestResultCacheQuery(buck2_data::LocalTestResultCacheQuery),
+    LocalTestResultCache(buck2_data::LocalTestResultCache),
     ReExecute(buck2_data::ReExecute),
     /// Submitted for remote execution, but the service served its action cache instead.
     ReServedFromCache(buck2_data::ReExecute),
@@ -246,6 +248,8 @@ impl CommandReproducer {
                 buck2_data::CacheType::ActionCache => "cache".to_owned(),
             },
             Self::LocalDepFileCacheHit => "dep_file".to_owned(),
+            Self::LocalTestResultCacheQuery(..) => "local_test_result_cache_query".to_owned(),
+            Self::LocalTestResultCache(..) => "local_test_result_cache".to_owned(),
             Self::ReExecute(execute) => executor_with_platform(execute, ""),
             Self::ReServedFromCache(execute) => {
                 executor_with_platform(execute, "_served_from_cache")
@@ -270,6 +274,38 @@ impl CommandReproducer {
         }
     }
 
+    /// The reproducer for a command submitted to the remote execution service, known only from
+    /// its terminal report because no execution stage was reported for it: the service may answer
+    /// with a completed result (including one served from its cache or deduplicated) without
+    /// ever reporting that it is executing. Only the submission's identity and origin are taken
+    /// from the report; no execution stage or interval is implied. buck2's own cache lookups are
+    /// reported by their cache-hit stages instead, so they give `None` here.
+    pub fn from_terminal_remote_command(
+        remote: &buck2_data::RemoteCommand,
+        options: &WhatRanOptions,
+    ) -> Option<Self> {
+        if options.skip_remote_executions {
+            return None;
+        }
+        match remote.cache_hit_type() {
+            buck2_data::RemoteCommandOrigin::ActionCache
+            | buck2_data::RemoteCommandOrigin::RemoteDepFileCache => return None,
+            buck2_data::RemoteCommandOrigin::Executed
+            | buck2_data::RemoteCommandOrigin::ReServedFromCache
+            | buck2_data::RemoteCommandOrigin::ReDeduplicated => {}
+        }
+        let details = remote.details.as_ref();
+        let execute = buck2_data::ReExecute {
+            action_digest: remote.action_digest.clone(),
+            platform: details.and_then(|d| d.platform.clone()),
+            action_key: None,
+            use_case: details.map(|d| d.use_case.clone()).unwrap_or_default(),
+            persistent_worker: details.is_some_and(|d| d.persistent_worker),
+            submission: remote.submission,
+        };
+        Some(Self::ReExecute(execute).with_remote_origin(remote))
+    }
+
     pub fn from_buck_data(
         data: &buck2_data::buck_event::Data,
         options: &WhatRanOptions,
@@ -279,6 +315,16 @@ impl CommandReproducer {
                 &span.data
         {
             match &executor_stage.stage {
+                Some(buck2_data::executor_stage_start::Stage::LocalTestResultCacheQuery(query))
+                    if options.emit_cache_queries =>
+                {
+                    return Some(CommandReproducer::LocalTestResultCacheQuery(query.clone()));
+                }
+                Some(buck2_data::executor_stage_start::Stage::LocalTestResultCache(reused))
+                    if !options.skip_cache_hits =>
+                {
+                    return Some(CommandReproducer::LocalTestResultCache(reused.clone()));
+                }
                 Some(buck2_data::executor_stage_start::Stage::CacheQuery(cache_hit))
                     if options.emit_cache_queries =>
                 {
@@ -334,6 +380,20 @@ impl fmt::Display for CommandReproducer {
                 write!(formatter, "{}", cache_hit.action_digest)
             }
             CommandReproducer::LocalDepFileCacheHit => Ok(()),
+            CommandReproducer::LocalTestResultCacheQuery(query) => write!(
+                formatter,
+                "action={} key={} current_attempt={}",
+                query.action_digest, query.cache_key, query.current_attempt
+            ),
+            CommandReproducer::LocalTestResultCache(reused) => write!(
+                formatter,
+                "action={} key={} origin_attempt={} entry_manifest={} current_attempt={}",
+                reused.action_digest,
+                reused.cache_key,
+                reused.origin_attempt,
+                reused.entry_manifest,
+                reused.current_attempt
+            ),
             CommandReproducer::ReExecute(re_execute)
             | CommandReproducer::ReServedFromCache(re_execute)
             | CommandReproducer::ReDeduplicated(re_execute) => {
@@ -516,6 +576,7 @@ mod tests {
             action_key: None,
             use_case: "".to_owned(),
             persistent_worker: false,
+            submission: None,
         };
         let result = executor_with_platform(&execute, "");
         assert_eq!(

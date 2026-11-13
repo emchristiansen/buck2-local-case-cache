@@ -36,6 +36,10 @@ pub struct DiffEventLogOptions {
     /// Open the event-log file from a recent command for the second command.
     #[clap(long, group = "second", value_name = "NUMBER")]
     recent2: Option<usize>,
+    /// Read either log, if it has no schema marker, as written by this fork at or before
+    /// b1100380 (see `buck2 log show --help`).
+    #[clap(long)]
+    unmarked_log_as_legacy_fork: bool,
 }
 
 impl DiffEventLogOptions {
@@ -49,6 +53,7 @@ impl DiffEventLogOptions {
             trace_id: self.trace_id1.clone(),
             no_remote: false,
             allow_remote: true,
+            unmarked_log_as_legacy_fork: self.unmarked_log_as_legacy_fork,
         };
         let options2 = &EventLogOptions {
             recent: self.recent2,
@@ -56,6 +61,7 @@ impl DiffEventLogOptions {
             trace_id: self.trace_id2.clone(),
             no_remote: false,
             allow_remote: true,
+            unmarked_log_as_legacy_fork: self.unmarked_log_as_legacy_fork,
         };
 
         let log_path1 = options1.get(ctx).await?;

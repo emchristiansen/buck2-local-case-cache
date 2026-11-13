@@ -69,6 +69,7 @@ pub use starlark_derive::starlark_value;
 
 pub use crate::any::AnyLifetime;
 pub use crate::any::ProvidesStaticType;
+pub use crate::eval::compiler::def::SelfContainedSource;
 pub use crate::pagable::StaticValueRegistered;
 pub use crate::values::alloc_value::AllocFrozenValue;
 pub use crate::values::alloc_value::AllocValue;

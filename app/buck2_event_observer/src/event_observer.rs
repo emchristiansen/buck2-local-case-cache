@@ -74,12 +74,18 @@ where
                 SpanEnd(end) => {
                     use buck2_data::span_end_event::Data::*;
 
-                    if let ActionExecution(action_execution_end) = end
+                    match end
                         .data
                         .as_ref()
                         .internal_error("Missing `data` in SpanEnd")?
                     {
-                        self.action_stats.update(action_execution_end);
+                        ActionExecution(action_execution_end) => {
+                            self.action_stats.update(action_execution_end);
+                        }
+                        TestRun(test_run_end) => {
+                            self.action_stats.update_test_run(test_run_end);
+                        }
+                        _ => {}
                     }
                 }
                 Instant(instant) => {
@@ -230,5 +236,214 @@ impl EventObserverExtra for NoopEventObserverExtra {
     fn observe(&mut self, _event: &Arc<BuckEvent>) -> buck2_error::Result<()> {
         // Noop
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+    use std::time::SystemTime;
+
+    use buck2_data::buck_event::Data;
+    use buck2_data::command_execution_kind::Command;
+    use buck2_events::BuckEvent;
+    use buck2_events::span::SpanId;
+    use buck2_wrapper_common::invocation_id::TraceId;
+
+    use super::EventObserver;
+    use super::NoopEventObserverExtra;
+
+    fn event(span: u64, parent: Option<u64>, data: Data) -> Arc<BuckEvent> {
+        Arc::new(BuckEvent::new(
+            SystemTime::now(),
+            TraceId::null(),
+            Some(SpanId::from_u64(span).unwrap()),
+            parent.map(|p| SpanId::from_u64(p).unwrap()),
+            data,
+        ))
+    }
+
+    fn start(
+        span: u64,
+        parent: Option<u64>,
+        data: buck2_data::span_start_event::Data,
+    ) -> Arc<BuckEvent> {
+        event(
+            span,
+            parent,
+            Data::SpanStart(buck2_data::SpanStartEvent { data: Some(data) }),
+        )
+    }
+
+    fn end(
+        span: u64,
+        parent: Option<u64>,
+        data: buck2_data::span_end_event::Data,
+    ) -> Arc<BuckEvent> {
+        event(
+            span,
+            parent,
+            Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(data),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn stage(
+        span: u64,
+        parent: u64,
+        stage: buck2_data::executor_stage_start::Stage,
+    ) -> [Arc<BuckEvent>; 2] {
+        [
+            start(
+                span,
+                Some(parent),
+                buck2_data::ExecutorStageStart { stage: Some(stage) }.into(),
+            ),
+            end(
+                span,
+                Some(parent),
+                buck2_data::ExecutorStageEnd::default().into(),
+            ),
+        ]
+    }
+
+    fn command_report(command: Command) -> buck2_data::CommandExecution {
+        buck2_data::CommandExecution {
+            details: Some(buck2_data::CommandExecutionDetails {
+                command_kind: Some(buck2_data::CommandExecutionKind {
+                    command: Some(command),
+                }),
+                ..Default::default()
+            }),
+            status: Some(buck2_data::command_execution::Success {}.into()),
+            ..Default::default()
+        }
+    }
+
+    /// The events `BuckTestOrchestrator::execute_request` (via `execute_local_case`) emits for
+    /// one test stage: a `TestRun` span containing the local-test-result-cache query stage, on a
+    /// hit the hit stage, and a `TestRunEnd` carrying the final command report.
+    fn test_run(span: u64, hit: bool) -> Vec<Arc<BuckEvent>> {
+        let suite = buck2_data::TestSuite {
+            suite_name: "suite".to_owned(),
+            test_names: vec!["case".to_owned()],
+            target_label: None,
+        };
+        let mut events = vec![start(
+            span,
+            None,
+            buck2_data::TestRunStart {
+                suite: Some(suite.clone()),
+            }
+            .into(),
+        )];
+        events.extend(stage(
+            span + 1,
+            span,
+            buck2_data::LocalTestResultCacheQuery {
+                action_digest: "digest".to_owned(),
+                cache_key: "key".to_owned(),
+                current_attempt: "current".to_owned(),
+            }
+            .into(),
+        ));
+        let command = if hit {
+            let hit = buck2_data::LocalTestResultCache {
+                action_digest: "digest".to_owned(),
+                cache_key: "key".to_owned(),
+                origin_attempt: "origin".to_owned(),
+                entry_manifest: "manifest".to_owned(),
+                current_attempt: "current".to_owned(),
+            };
+            events.extend(stage(span + 2, span, hit.clone().into()));
+            Command::LocalTestResultCache(hit)
+        } else {
+            Command::LocalCommand(buck2_data::LocalCommand::default())
+        };
+        events.push(end(
+            span,
+            None,
+            buck2_data::TestRunEnd {
+                suite: Some(suite),
+                command_report: Some(command_report(command)),
+                command_host_sharing_requirements: None,
+            }
+            .into(),
+        ));
+        events
+    }
+
+    fn local_action(span: u64) -> [Arc<BuckEvent>; 2] {
+        [
+            start(
+                span,
+                None,
+                buck2_data::ActionExecutionStart::default().into(),
+            ),
+            end(
+                span,
+                None,
+                buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                    buck2_data::ActionExecutionEnd {
+                        kind: buck2_data::ActionKind::Run as i32,
+                        commands: vec![command_report(Command::LocalCommand(
+                            buck2_data::LocalCommand::default(),
+                        ))],
+                        ..Default::default()
+                    },
+                )),
+            ),
+        ]
+    }
+
+    fn observe(observer: &mut EventObserver<NoopEventObserverExtra>, event: &Arc<BuckEvent>) {
+        // The observer never awaits anything for these events.
+        let mut fut = pin!(observer.observe(event));
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r.unwrap(),
+            Poll::Pending => panic!("observer unexpectedly pending"),
+        }
+    }
+
+    #[test]
+    fn local_test_result_reuse_is_counted_from_test_run_end() {
+        let mut observer = EventObserver::<NoopEventObserverExtra>::new(TraceId::null());
+        for e in local_action(1)
+            .iter()
+            .chain(&test_run(10, true))
+            .chain(&test_run(20, false))
+        {
+            observe(&mut observer, e);
+        }
+        let stats = observer.action_stats();
+        // The hit is counted once, although both its hit stage and `TestRunEnd` were seen.
+        assert_eq!(stats.local_test_result_cached_actions, 1);
+        // The build action is accounted exactly as before; the fresh test run changes nothing.
+        assert_eq!(stats.local_actions, 1);
+        assert_eq!(stats.remote_actions, 0);
+        assert_eq!(stats.cached_actions, 0);
+        assert_eq!(stats.remote_dep_file_cached_actions, 0);
+        assert_eq!(stats.fallback_actions, 0);
+        // Build-action totals and cache-hit rate count the build action only.
+        assert_eq!(stats.total_executed_and_cached_actions(), 1);
+        assert_eq!(stats.total_cached_actions(), 0);
+        assert_eq!(stats.total_cache_hit_percentage(), 0);
+    }
+
+    #[test]
+    fn fresh_test_run_is_not_counted() {
+        let mut observer = EventObserver::<NoopEventObserverExtra>::new(TraceId::null());
+        for e in &test_run(10, false) {
+            observe(&mut observer, e);
+        }
+        let stats = observer.action_stats();
+        assert_eq!(stats.local_test_result_cached_actions, 0);
+        assert_eq!(stats.total_executed_and_cached_actions(), 0);
     }
 }

@@ -47,6 +47,7 @@ use crate::eval::Arguments;
 use crate::eval::Evaluator;
 use crate::eval::ParametersSpec;
 use crate::eval::compiler::def::Def;
+use crate::eval::compiler::def::SelfContainedSource;
 use crate::eval::runtime::arguments::ArgumentsFull;
 use crate::eval::runtime::frame_span::FrameSpan;
 use crate::pagable::starlark_deserialize::StarlarkDeserialize;
@@ -713,6 +714,23 @@ impl<'v> Value<'v> {
     /// For now it only returns parameter spec for `def` and `lambda`.
     pub fn parameters_spec(self) -> Option<&'v ParametersSpec<Value<'v>>> {
         Some(&self.downcast_ref::<Def>()?.parameters)
+    }
+
+    /// For a frozen user-defined function, the source that alone determines its behaviour, if
+    /// there is such a source; otherwise why not.
+    ///
+    /// The source is the complete text of the defining file. It alone determines the function
+    /// when the function is the top-level `def` bound to its own name in that file, captures
+    /// nothing, and the file's module is self-contained: its top-level statements are only `def`
+    /// statements whose defaults are literals, and string docstrings, and its frozen module binds
+    /// no other names (no `load`, no implicit import, no module-level value). The only other
+    /// names the file may read are the Starlark-standard builtins ([`Globals::standard`]), whose
+    /// results depend on their arguments alone; any other builtin the host interpreter provides
+    /// (one that may read configuration or other context) makes the function ineligible.
+    ///
+    /// [`Globals::standard`]: crate::environment::Globals::standard
+    pub fn self_contained_function_source(self) -> Result<SelfContainedSource<'v>, String> {
+        crate::eval::compiler::def::self_contained_function_source(self)
     }
 
     /// Returns the name of a callable value, if known.

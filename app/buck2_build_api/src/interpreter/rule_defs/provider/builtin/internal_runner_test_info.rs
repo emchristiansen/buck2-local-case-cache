@@ -14,6 +14,10 @@ use std::time::Duration;
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_core::execution_types::execution_group::ExecutionGroup;
+use buck2_core::execution_types::executor_config::CommandExecutorConfig;
+use buck2_core::execution_types::executor_config::Executor;
+use buck2_core::execution_types::executor_config::RemoteEnabledExecutor;
+use buck2_core::execution_types::executor_config::RemoteEnabledExecutorOptions;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_error::BuckErrorContext;
 use buck2_error::BuckErrorOptionContext;
@@ -114,6 +118,15 @@ pub struct InternalRunnerTestInfo<'v> {
     /// Defaults to `True`.
     run_from_project_root: ValueOfUnchecked<'v, bool>,
 
+    /// Permission to request exact-case result reuse; `case_result_reuse` says which kind the
+    /// executors select. It is not proof that the case is eligible.
+    supports_test_execution_caching: ValueOfUnchecked<'v, bool>,
+
+    /// Environment variables each test case process receives naming a new, empty directory of
+    /// its own, in declaration order. Listing gets none. This is of type `list[str]`; each name is
+    /// a valid variable name, appears once, and is neither `PWD` nor a key of `env`.
+    fresh_dir_env: ValueOfUnchecked<'v, ListType<String>>,
+
     /// Default executor to use to run tests. If none is
     /// passed we will default to the execution platform.
     default_executor: Option<ValueTyped<'v, StarlarkCommandExecutorConfig>>,
@@ -127,7 +140,10 @@ pub struct InternalRunnerTestInfo<'v> {
     /// `default_executor` wins and the group is not resolved, so copying a test info field by
     /// field works in any rule. A rule that declares named groups but not `DefaultExecGroup` must
     /// set `exec_group` or `default_executor`; `executor_overrides` does not replace them, as the
-    /// tests run in the default group whenever no override is picked.
+    /// tests run in the default group whenever no override is picked. A recorded executor has
+    /// `ExecutorConfigOrigin::ExecutionGroupPlatform`, also in a field-by-field copy, so it is
+    /// never taken for an executor the rule selected: `[test] local_internal_cases` does not
+    /// admit it under `--remote-only`.
     exec_group: ValueOfUnchecked<'v, NoneOr<ExecutionGroupArg>>,
 
     /// Executors that can be used to override the default executor.
@@ -231,6 +247,59 @@ impl<'v> InternalRunnerTestInfo<'v> {
             .unwrap()
             .into_option()
             .unwrap_or(true)
+    }
+
+    /// The names `fresh_dir_env` declares, in declaration order.
+    pub fn fresh_dir_env(&self) -> impl Iterator<Item = &'v str> {
+        unwrap_all(iter_opt_str_list(self.fresh_dir_env.get(), "fresh_dir_env"))
+    }
+
+    pub fn supports_test_execution_caching(&self) -> bool {
+        NoneOr::<bool>::unpack_value(self.supports_test_execution_caching.get())
+            .unwrap()
+            .unwrap()
+            .into_option()
+            .unwrap_or(false)
+    }
+
+    /// The exact-case result reuse this provider requests. Only a provider whose default
+    /// executor, and listing override if it has one, run remotely only with the remote cache
+    /// enabled reuses through the remote action cache; any other request keeps the strict
+    /// host-local case store, exactly as before.
+    pub fn case_result_reuse(&self) -> CaseResultReuse {
+        if !self.supports_test_execution_caching() {
+            CaseResultReuse::None
+        } else if is_remote_only_with_cache(self.default_executor().map(|c| &*c.0)) {
+            CaseResultReuse::RemoteActionCache
+        } else {
+            CaseResultReuse::HostStore
+        }
+    }
+
+    /// The content that alone determines the listing and result parsers, if both are
+    /// self-contained: each is the top-level `def` bound to its own name in a file whose module
+    /// loads nothing, imports nothing, binds only such `def`s with literal defaults and reads no
+    /// global other than the Starlark-standard builtins. The identity is each callable's name and
+    /// its file's name and complete text. A parser that reaches any other file, module-level
+    /// value or host builtin (such as `read_config`, whose result depends on the configuration)
+    /// has no such identity, and the error says why.
+    pub fn self_contained_parser_identity(&self) -> Result<String, String> {
+        fn callable(role: &str, value: Value<'_>) -> Result<String, String> {
+            let source = value
+                .self_contained_function_source()
+                .map_err(|reason| format!("{role}: {reason}"))?;
+            Ok(format!(
+                "{role}: {}; file={}; source[{}]={}\n",
+                value.to_repr(),
+                source.filename,
+                source.source.len(),
+                source.source
+            ))
+        }
+        Ok(
+            callable("parse_test_listing", self.parse_test_listing.get())?
+                + &callable("parse_test_result", self.parse_test_result.get())?,
+        )
     }
 
     pub fn default_executor(&self) -> Option<&'v StarlarkCommandExecutorConfig> {
@@ -518,6 +587,101 @@ impl<'v> InternalRunnerTestInfo<'v> {
     }
 }
 
+/// `fresh_dir_env` names variables the engine sets itself, so each must be a variable name that
+/// nothing else sets: not `PWD`, which the executor sets, not a key of `env`, and not repeated.
+fn check_fresh_dir_env(info: &InternalRunnerTestInfo<'_>) -> buck2_error::Result<()> {
+    let env_names = iter_test_env(info.env.get())
+        .map(|entry| entry.map(|(name, _)| name))
+        .collect::<buck2_error::Result<Vec<&str>>>()?;
+    let mut seen = Vec::new();
+    for name in iter_opt_str_list(info.fresh_dir_env.get(), "fresh_dir_env") {
+        let name = name?;
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+        let problem = if !valid {
+            Some("is not a valid environment variable name")
+        } else if name == "PWD" {
+            Some("is set by the executor")
+        } else if env_names.contains(&name) {
+            Some("is also a key of `env`")
+        } else if seen.contains(&name) {
+            Some("is declared more than once")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "`fresh_dir_env` entry `{}` {}",
+                name,
+                problem
+            ));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+/// The exact-case result reuse an `InternalRunnerTestInfo` requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseResultReuse {
+    /// Every case executes; nothing is reused.
+    None,
+    /// The strict host-local case store (`[test] local_case_result_cache_root`).
+    HostStore,
+    /// The remote action cache entry of the case's exact remote action. A hit is reused only
+    /// when the current parser confirms it as one PASS for the case; otherwise the case executes
+    /// again remotely without reading any cache.
+    RemoteActionCache,
+}
+
+/// Whether `config` runs commands remotely only, never locally, with the remote cache enabled.
+fn is_remote_only_with_cache(config: Option<&CommandExecutorConfig>) -> bool {
+    matches!(
+        config,
+        Some(CommandExecutorConfig {
+            executor: Executor::RemoteEnabled(RemoteEnabledExecutorOptions {
+                executor: RemoteEnabledExecutor::Remote(_),
+                remote_cache_enabled: true,
+                ..
+            }),
+            ..
+        })
+    )
+}
+
+/// A provider reusing through the remote action cache must list remotely too, and must declare
+/// nothing only a local execution supplies: a fresh directory or a local resource.
+fn check_remote_case_result_reuse(info: &InternalRunnerTestInfo<'_>) -> buck2_error::Result<()> {
+    if info.case_result_reuse() != CaseResultReuse::RemoteActionCache {
+        return Ok(());
+    }
+    if let Some(listing) = info.executor_override("listing") {
+        if !is_remote_only_with_cache(Some(&*listing.0)) {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "remote case result reuse requires the `listing` executor override to run remotely only, with the remote cache enabled"
+            ));
+        }
+    }
+    if info.fresh_dir_env().next().is_some() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "remote case result reuse cannot declare `fresh_dir_env`, which only a local execution supplies"
+        ));
+    }
+    if info.required_local_resources().next().is_some() || !info.local_resources().is_empty() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "remote case result reuse cannot declare local resources"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_internal_runner_test_info<'v>(
     info: &InternalRunnerTestInfo<'v>,
 ) -> buck2_error::Result<()> {
@@ -540,6 +704,7 @@ fn validate_internal_runner_test_info<'v>(
         }
     }
     check_all(iter_test_env(info.env.get()))?;
+    check_fresh_dir_env(info)?;
     check_all(iter_opt_str_list(info.labels.get(), "labels"))?;
     check_all(iter_opt_str_list(info.contacts.get(), "contacts"))?;
     check_all(iter_executor_overrides(info.executor_overrides.get()))?;
@@ -569,6 +734,9 @@ fn validate_internal_runner_test_info<'v>(
     })?;
     NoneOr::<bool>::unpack_value(info.run_from_project_root.get())?
         .internal_error("`run_from_project_root` must be a bool if provided")?;
+    NoneOr::<bool>::unpack_value(info.supports_test_execution_caching.get())?
+        .internal_error("`supports_test_execution_caching` must be a bool if provided")?;
+    check_remote_case_result_reuse(info)?;
 
     // Both parse_test_listing and parse_test_result are required callables.
     let ptl = info.parse_test_listing.get();
@@ -619,6 +787,8 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
         #[starlark(default = NoneType)] local_resources: Value<'v>,
         #[starlark(default = NoneType)] required_local_resources: Value<'v>,
         #[starlark(default = NoneOr::None)] worker: NoneOr<ValueTyped<'v, WorkerInfo<'v>>>,
+        #[starlark(default = NoneType)] supports_test_execution_caching: Value<'v>,
+        #[starlark(default = NoneType)] fresh_dir_env: Value<'v>,
         #[starlark(require = named, default = NoneOr::None)] exec_group: NoneOr<
             ValueOf<'v, ExecutionGroupArg>,
         >,
@@ -639,6 +809,8 @@ fn internal_runner_test_info_creator(globals: &mut GlobalsBuilder) {
             contacts: ValueOfUnchecked::new(contacts),
             use_project_relative_paths: ValueOfUnchecked::new(use_project_relative_paths),
             run_from_project_root: ValueOfUnchecked::new(run_from_project_root),
+            supports_test_execution_caching: ValueOfUnchecked::new(supports_test_execution_caching),
+            fresh_dir_env: ValueOfUnchecked::new(fresh_dir_env),
             default_executor,
             exec_group: ValueOfUnchecked::new(exec_group.map_or(Value::new_none(), |g| g.value)),
             executor_overrides: ValueOfUnchecked::new(executor_overrides),

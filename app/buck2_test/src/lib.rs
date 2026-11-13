@@ -14,13 +14,18 @@ pub mod command;
 pub mod downward_api;
 pub mod executor_launcher;
 pub(crate) mod internal_runner;
+pub(crate) mod local_case_closure;
+pub(crate) mod local_case_fresh_dirs;
 pub(crate) mod local_resource_api;
 pub mod local_resource_registry;
 pub(crate) mod local_resource_setup;
+pub(crate) mod local_result_cache;
 pub mod orchestrator;
 pub(crate) mod remote_storage;
 pub mod session;
 pub(crate) mod tcp;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod translations;
 #[cfg(unix)]
 pub(crate) mod unix;

@@ -386,6 +386,10 @@ pub(super) fn iter_opt_str_list<'v>(
 /// test then resolves the group against the tested target when it runs. Any other resolution
 /// error fails the creation of the test info.
 ///
+/// A recorded executor has `ExecutorConfigOrigin::ExecutionGroupPlatform`, and a passed one keeps
+/// its own origin, so consumers can tell an executor the rule selected from one that execution
+/// platform resolution selected, also after the test info is copied field by field.
+///
 /// In rule analysis, a test info with neither `default_executor` nor `exec_group` runs in the
 /// default execution group whenever no executor override is picked, so its creation fails when the
 /// rule does not declare that group, whether or not it has `executor_overrides`.
@@ -426,9 +430,11 @@ pub(super) fn default_executor_with_execution_group<'v>(
     }
     // Fails when resolution was not performed.
     Ok(resolution.platform_for_group(group)?.map(|platform| {
-        eval.heap().alloc_typed(StarlarkCommandExecutorConfig(
-            platform.executor_config().dupe(),
-        ))
+        eval.heap().alloc_typed(
+            StarlarkCommandExecutorConfig::from_execution_group_platform(
+                platform.executor_config().dupe(),
+            ),
+        )
     }))
 }
 

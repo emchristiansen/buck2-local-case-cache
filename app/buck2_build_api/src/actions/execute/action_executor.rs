@@ -108,6 +108,7 @@ use crate::actions::execute::dice_data::DiceHasCommandExecutor;
 use crate::actions::execute::dice_data::GetInvalidationTrackingConfig;
 use crate::actions::execute::dice_data::GetReClient;
 use crate::actions::execute::dice_data::HasLowPassFilter;
+use crate::actions::execute::dice_data::LocalExecution;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
 use crate::actions::impls::run_action_knobs::RunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
@@ -487,7 +488,11 @@ impl<'d> HasActionExecutor<'d> for DiceComputations<'d> {
             cache_uploader,
             output_trees_download_config,
             write_action_cache,
-        } = self.get_command_executor_from_dice(artifact_fs, executor_config)?;
+        } = self.get_command_executor_from_dice(
+            artifact_fs,
+            executor_config,
+            LocalExecution::ByStrategy,
+        )?;
         let blocking_executor = self.get_blocking_executor();
         let materializer = self.per_transaction_data().get_materializer();
         let events = self.per_transaction_data().get_dispatcher();

@@ -83,6 +83,7 @@ use buck2_event_observer::unpack_event::UnpackedBuckEvent;
 use buck2_event_observer::unpack_event::unpack_event;
 use buck2_events::BuckEvent;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_fs::working_dir::AbsWorkingDir;
 use buck2_hash::BuckMutMap;
 use buck2_hash::BuckMutSet;
 use derive_more::Display;
@@ -1485,17 +1486,16 @@ impl ChromeTraceWriter {
                         }
                     }
                     buck2_data::span_start_event::Data::ExecutorStage(stage) => {
-                        let name = stage
-                            .stage
-                            .as_ref()
-                            .and_then(display::display_executor_stage);
+                        let stage = stage.stage.as_ref();
+                        let key = stage.and_then(display::display_executor_stage);
+                        let name = stage.and_then(display::display_executor_stage_name);
 
-                        match name {
-                            Some(name) => {
-                                self.span_counters.bump_counter_while_span(event, name, 1)?;
-                                Categorization::ShowIfParent { name: name.into() }
+                        match (key, name) {
+                            (Some(key), Some(name)) => {
+                                self.span_counters.bump_counter_while_span(event, key, 1)?;
+                                Categorization::ShowIfParent { name }
                             }
-                            None => Categorization::Omit,
+                            _ => Categorization::Omit,
                         }
                     }
                     buck2_data::span_start_event::Data::ReUpload(_) => {
@@ -2166,6 +2166,22 @@ impl ChromeTraceCommand {
         ctx.exec(self, matches, events_ctx)
     }
 
+    /// The log named on the command line, without a lookup: `--path` (kept for backward
+    /// compatibility; it wins over `PATH`) or the positional `PATH`. `None` if neither was given.
+    /// Either way it is read with the selected `--unmarked-log-as-legacy-fork` mode.
+    fn log_from_path_args(
+        &self,
+        working_dir: &AbsWorkingDir,
+    ) -> Option<buck2_error::Result<EventLogPathBuf>> {
+        match &self.event_log_path {
+            Some(path) => Some(
+                EventLogPathBuf::infer(path.resolve(working_dir))
+                    .map(|log| self.event_log.read_as_selected(log)),
+            ),
+            None => self.event_log.get_from_path_arg(working_dir),
+        }
+    }
+
     async fn load_events(
         log_path: EventLogPathBuf,
     ) -> buck2_error::Result<(
@@ -2212,11 +2228,9 @@ impl BuckSubcommand for ChromeTraceCommand {
         ctx: ClientCommandContext<'_>,
         _events_ctx: &mut EventsCtx,
     ) -> ExitResult {
-        // For backward compatibility, use the path field if it's set
-        let log = if let Some(path) = self.event_log_path {
-            EventLogPathBuf::infer(path.resolve(&ctx.working_dir))?
-        } else {
-            self.event_log.get(&ctx).await?
+        let log = match self.log_from_path_args(&ctx.working_dir) {
+            Some(log) => log?,
+            None => self.event_log.get(&ctx).await?,
         };
 
         #[cfg(fbcode_build)]
@@ -2416,6 +2430,7 @@ mod tests {
             working_dir: "/".to_owned(),
             trace_id: trace_id.clone(),
             start_time: None,
+            muninn_event_schema: None,
         };
         let mut writer =
             ChromeTraceWriter::new(invocation, ChromeTraceFirstPass::new(), max_tracks);
@@ -2465,6 +2480,115 @@ mod tests {
         tids.sort();
         tids.dedup();
         tids
+    }
+
+    /// A JSON event log holding one critical-path action of numeric kind 12, with or without
+    /// the schema marker. Unmarked, 12 is ambiguous by default and the fork's local test-result
+    /// cache hit with `--unmarked-log-as-legacy-fork`; marked, it is upstream's served-from-cache.
+    fn kind_12_log(muninn_event_schema: Option<u32>) -> String {
+        let mut header = serde_json::to_value(buck2_data::Invocation {
+            command_line_args: vec!["buck2".to_owned(), "build".to_owned()],
+            expanded_command_line_args: vec!["buck2".to_owned(), "build".to_owned()],
+            working_dir: "/".to_owned(),
+            trace_id: Some(TraceId::new().to_string()),
+            start_time: None,
+            muninn_event_schema,
+        })
+        .unwrap();
+        if muninn_event_schema.is_none() {
+            // A writer from before the marker writes no such member.
+            header
+                .as_object_mut()
+                .unwrap()
+                .remove("muninn_event_schema");
+        }
+        let event = StreamValue::Event(Box::new(buck2_data::BuckEvent {
+            timestamp: Some((SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)).into()),
+            data: Some(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::BuildGraphInfo(
+                        buck2_data::BuildGraphExecutionInfo {
+                            critical_path2: vec![buck2_data::CriticalPathEntry2 {
+                                total_duration: Some(Duration::from_secs(5).try_into().unwrap()),
+                                entry: Some(
+                                    buck2_data::critical_path_entry2::Entry::ActionExecution(
+                                        buck2_data::critical_path_entry2::ActionExecution {
+                                            execution_kind: 12,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        }));
+        format!("{header}\n{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    /// Parses `args` with the command's own clap parser, opens the log the way `exec_impl` does
+    /// for a named file, and renders the trace: the execution kinds the trace shows.
+    async fn rendered_execution_kinds(working_dir: &AbsWorkingDir, args: &[&str]) -> Vec<String> {
+        use clap::Parser;
+        // Outside fbcode the trace path is the first positional argument.
+        let argv = [&["chrome-trace", "out.trace"], args].concat();
+        let command = ChromeTraceCommand::try_parse_from(&argv).unwrap();
+        let log = command
+            .log_from_path_args(working_dir)
+            .expect("a log named on the command line")
+            .unwrap();
+        let writer = ChromeTraceCommand::trace_writer(log, command.max_tracks, Vec::new())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        writer.into_writer(&mut out).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        json["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["args"]["execution_kind"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// R5-CLI-01: `--unmarked-log-as-legacy-fork` applies whether the log is named by the
+    /// positional `PATH` or by the backward-compatible `--path`; without it, or for a marked log,
+    /// both spellings read the same.
+    #[tokio::test]
+    async fn both_path_spellings_honor_the_unmarked_log_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("unmarked.json-lines"), kind_12_log(None)).unwrap();
+        std::fs::write(dir.path().join("marked.json-lines"), kind_12_log(Some(2))).unwrap();
+        let working_dir = AbsWorkingDir::unchecked_new(
+            buck2_fs::paths::abs_norm_path::AbsNormPathBuf::new(dir.path().to_owned()).unwrap(),
+        );
+
+        const AMBIGUOUS: &str =
+            "ACTION_EXECUTION_KIND_SERVED_FROM_CACHE_OR_LEGACY_LOCAL_TEST_RESULT_CACHE";
+        const LEGACY: &str = "ACTION_EXECUTION_KIND_LOCAL_TEST_RESULT_CACHE";
+        const SERVED: &str = "ACTION_EXECUTION_KIND_REMOTE_SERVED_FROM_CACHE";
+        for (log, opt_in, want) in [
+            ("unmarked.json-lines", false, AMBIGUOUS),
+            ("unmarked.json-lines", true, LEGACY),
+            ("marked.json-lines", false, SERVED),
+            ("marked.json-lines", true, SERVED),
+        ] {
+            for spelling in [&[log][..], &["--path", log][..]] {
+                let mut args = spelling.to_vec();
+                if opt_in {
+                    args.push("--unmarked-log-as-legacy-fork");
+                }
+                assert_eq!(
+                    rendered_execution_kinds(&working_dir, &args).await,
+                    [want],
+                    "{args:?}"
+                );
+            }
+        }
     }
 
     /// `--max-tracks N` renders at most N tracks.

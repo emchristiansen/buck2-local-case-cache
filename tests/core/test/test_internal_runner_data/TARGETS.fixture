@@ -1,4 +1,14 @@
-load(":python_test.bzl", "python_test")
+load(
+    ":python_test.bzl",
+    "fresh_dir_broker",
+    "fresh_dir_case_test",
+    "fresh_dir_env_test",
+    "fresh_socket_test",
+    "fresh_tracked_test",
+    "provider_artifact_pair_test",
+    "provider_pair_test",
+    "python_test",
+)
 
 python_test(
     name = "trivial_pass",
@@ -13,4 +23,171 @@ python_test(
 python_test(
     name = "timeout",
     script = "import time; time.sleep(60)",
+)
+
+python_test(
+    name = "internal_default_pass",
+    internal = True,
+    script = "import sys; sys.exit(0)",
+)
+
+python_test(
+    name = "internal_cache_request",
+    internal = True,
+    local_case_cache = True,
+    script = "import sys; sys.exit(0)",
+)
+
+provider_pair_test(
+    name = "provider_pair",
+    expected = read_config("provider_pair", "expected", ""),
+)
+
+# Each declared name gets a new, empty, owner-only directory of its own inside the case's TMPDIR,
+# which holds nothing else. The case leaves files in both and, if asked, waits before checking
+# that nothing removed them, so a second run passes only if they were removed before it, and a
+# concurrent run of the same case passes only if it never shares the case's directories.
+python_test(
+    name = "internal_fresh_dirs",
+    fresh_dir_env = ["FRESH_A", "FRESH_B"],
+    internal = True,
+    script = """
+import os, stat, time
+tmp = os.environ["TMPDIR"]
+fresh = [os.environ["FRESH_A"], os.environ["FRESH_B"]]
+assert os.path.isabs(tmp), tmp
+assert fresh == [os.path.join(tmp, "0"), os.path.join(tmp, "1")], (tmp, fresh)
+assert sorted(os.listdir(tmp)) == ["0", "1"], os.listdir(tmp)
+for d in fresh:
+    assert os.listdir(d) == [], (d, os.listdir(d))
+    assert stat.S_IMODE(os.stat(d).st_mode) == 0o700, (d, oct(os.stat(d).st_mode))
+token = str(os.getpid())
+for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
+    with open(path, "w") as f:
+        f.write(token)
+time.sleep({hold})
+for path in (os.path.join(fresh[0], "mine"), os.path.join(tmp, "left")):
+    with open(path) as f:
+        assert f.read() == token, path
+""".format(hold = read_config("fresh_dirs", "hold", "0")),
+)
+
+provider_artifact_pair_test(
+    name = "provider_artifact_pair",
+)
+
+# Regressions for a scratch path released before its child terminated: the same holding case
+# on each local-case route (no reuse requested; reuse requested without a store; reuse
+# requested with a parser that cannot be keyed), and beside a sibling whose output the parser
+# refuses.
+_SIGNALS = read_config("fresh_dirs", "signals", "")
+
+fresh_dir_case_test(
+    name = "fresh_hold",
+    cases = ["hold"],
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_cache_requested",
+    cases = ["hold"],
+    local_case_cache = True,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_unsupported_parser",
+    cases = ["hold"],
+    local_case_cache = True,
+    self_contained_parser = False,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure_cache_requested",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    local_case_cache = True,
+    signals = _SIGNALS,
+)
+
+fresh_dir_case_test(
+    name = "fresh_hold_beside_parser_failure_unsupported_parser",
+    cases = [
+        "hold",
+        "fail_parser",
+    ],
+    local_case_cache = True,
+    self_contained_parser = False,
+    signals = _SIGNALS,
+)
+
+# Fresh directory variables against the variables the executor and local resources set.
+_STARTED = read_config("fresh_dirs", "started", "")
+
+fresh_dir_env_test(
+    name = "fresh_identity_names",
+    fresh_dir_env = [
+        "BUCK_BUILD_ID",
+        "BUCK2_DAEMON_UUID",
+        "FRESH_A",
+    ],
+    started = _STARTED,
+)
+
+fresh_dir_broker(
+    name = "broker_sets_fresh_a",
+    variable = "FRESH_A",
+)
+
+fresh_dir_broker(
+    name = "broker_sets_other",
+    variable = "OTHER",
+)
+
+fresh_dir_env_test(
+    name = "fresh_name_set_by_resource",
+    broker = ":broker_sets_fresh_a",
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
+)
+
+fresh_dir_env_test(
+    name = "fresh_beside_unrelated_resource",
+    broker = ":broker_sets_other",
+    broker_sets_other = True,
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
+)
+
+# A socket in a fresh directory: too long an address in `buck-out`, but not in a short
+# `[test] local_case_scratch_root`.
+fresh_socket_test(
+    name = "fresh_socket",
+)
+
+fresh_dir_env_test(
+    name = "fresh_started",
+    fresh_dir_env = ["FRESH_A"],
+    started = _STARTED,
+)
+
+# A fresh-directory case eligible for local result reuse (see `fresh_tracked_test`).
+fresh_tracked_test(
+    name = "fresh_tracked",
+    events = read_config("fresh_dirs", "events", ""),
+    mode = read_config("fresh_dirs", "mode", "pass"),
+    path = read_config("fresh_dirs", "path", ""),
+    shell = read_config("fresh_dirs", "shell", ""),
 )

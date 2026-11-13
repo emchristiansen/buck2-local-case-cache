@@ -127,6 +127,111 @@ pub struct TestResult {
     pub max_memory_used_bytes: Option<u64>,
     // the output of the test execution (combining stdout and stderr)
     pub details: String,
+    /// Whether the case was executed for this result or an earlier execution was reused. When
+    /// it was reused, `duration`, `msg` and `details` describe that earlier execution.
+    pub origin: TestResultOrigin,
+}
+
+/// Where the evidence behind a [`TestResult`] comes from.
+#[derive(PartialEq, Eq, Debug, Clone, Default)]
+pub enum TestResultOrigin {
+    /// The case was executed for this test run; the result describes that execution. Every
+    /// result an external test runner reports is fresh.
+    #[default]
+    Fresh,
+    /// No case was executed for this result: the recorded output of an earlier, confirmed
+    /// execution was reused under unchanged inputs and parsed again.
+    Reused(ReusedTestResult),
+    /// No case was executed for this result: a cached answer for the case's exact remote action
+    /// (an action-cache hit, or an execute request the service served from its cache or
+    /// deduplicated) was reused, and the current parser confirmed it before it was reported.
+    RemoteReused(RemoteReusedTestResult),
+}
+
+/// The provenance of a [`TestResult`] reused from the remote action cache.
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct RemoteReusedTestResult {
+    /// The digest of the remote action whose cached result was reused. The action binds the
+    /// case's command, environment and complete input tree.
+    pub action_digest: String,
+    /// Which answer held the cached result.
+    pub served_by: RemoteCacheAnswer,
+    /// How long the original execution of the action ran, as the worker recorded it in the
+    /// cached `ActionResult`'s execution metadata (`ExecutionResult2::execution_time` of a
+    /// cached answer). It describes that earlier execution, not this run.
+    pub original_execution_time: Duration,
+    /// The interval this test run itself spent obtaining the cached result: the client's wall
+    /// time for the command (the download after an action-cache hit, or the served execute
+    /// request). No case process ran in it. `None` when the execution reported no wall time: it
+    /// is then unknown, never zero and never the original's.
+    pub current_execution_time: Option<Duration>,
+}
+
+/// How a remote cached result reached the client.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum RemoteCacheAnswer {
+    /// The client's own action-cache lookup.
+    ActionCacheLookup,
+    /// The remote execution service answered an execute request from its own cache instead of
+    /// running the command.
+    ServedExecute,
+    /// The remote execution service deduplicated an execute request against an identical
+    /// execution already in flight: a real run, but not of this request.
+    Deduplicated,
+}
+
+impl RemoteCacheAnswer {
+    /// The event-log provenance of this answer (`TestResultReuse.served_by`).
+    pub fn to_proto(self) -> buck2_data::RemoteCommandOrigin {
+        match self {
+            Self::ActionCacheLookup => buck2_data::RemoteCommandOrigin::ActionCache,
+            Self::ServedExecute => buck2_data::RemoteCommandOrigin::ReServedFromCache,
+            Self::Deduplicated => buck2_data::RemoteCommandOrigin::ReDeduplicated,
+        }
+    }
+}
+
+/// The provenance of a reused [`TestResult`]: the original execution and this run's reuse.
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct ReusedTestResult {
+    /// The attempt that executed the case and recorded the reused output.
+    pub origin_attempt: String,
+    /// The immutable entry manifest binding the reused output to its original execution.
+    pub entry_manifest: String,
+    /// This test run's attempt, which looked the output up and reused it.
+    pub current_attempt: String,
+    /// The execution time this test run spent on the case: no case process ran, so this is the
+    /// reuse's own execution time (zero), not the original's.
+    pub current_execution_time: Duration,
+}
+
+impl TestResultOrigin {
+    /// The origin of results parsed from `execution`'s output: reused when `execution` is a local
+    /// test-result cache hit, which runs no case, and fresh otherwise.
+    pub fn of_execution(execution: &ExecutionResult2) -> Self {
+        use buck2_data::command_execution_kind::Command;
+        match &execution.execution_details.execution_kind {
+            Some(buck2_data::CommandExecutionKind {
+                command: Some(Command::LocalTestResultCache(hit)),
+            }) => Self::Reused(ReusedTestResult {
+                origin_attempt: hit.origin_attempt.clone(),
+                entry_manifest: hit.entry_manifest.clone(),
+                current_attempt: hit.current_attempt.clone(),
+                current_execution_time: execution.execution_time,
+            }),
+            // A remote cached answer's `execution_time` is the original execution's, read from the
+            // cached `ActionResult`; this run's own interval is its wall time.
+            _ => match execution.remote_cached_answer() {
+                Some((action_digest, served_by)) => Self::RemoteReused(RemoteReusedTestResult {
+                    action_digest: action_digest.to_owned(),
+                    served_by,
+                    original_execution_time: execution.execution_time,
+                    current_execution_time: execution.current_wall_time(),
+                }),
+                None => Self::Fresh,
+            },
+        }
+    }
 }
 
 /// different possible test results
@@ -474,6 +579,53 @@ pub struct ExecutionResult2 {
     pub command_execution: Option<buck2_data::CommandExecution>,
 }
 
+impl ExecutionResult2 {
+    /// The remote action digest, and how it reached the client, when this result is a cached
+    /// answer for the remote action rather than a run of this request's command: an action-cache
+    /// hit, or an execute request the remote service served from its own cache or deduplicated
+    /// against an identical execution in flight (upstream's `RemoteCommandOrigin`). A dep-file
+    /// cache hit is another action's result, and an executed request ran the command: neither
+    /// is one.
+    pub fn remote_cached_answer(&self) -> Option<(&str, RemoteCacheAnswer)> {
+        use buck2_data::RemoteCommandOrigin;
+        use buck2_data::command_execution_kind::Command;
+        match &self.execution_details.execution_kind {
+            Some(buck2_data::CommandExecutionKind {
+                command: Some(Command::RemoteCommand(remote)),
+            }) => {
+                let answer = match (remote.cache_hit, remote.cache_hit_type()) {
+                    (true, RemoteCommandOrigin::ActionCache) => {
+                        Some(RemoteCacheAnswer::ActionCacheLookup)
+                    }
+                    (false, RemoteCommandOrigin::ReServedFromCache) => {
+                        Some(RemoteCacheAnswer::ServedExecute)
+                    }
+                    (false, RemoteCommandOrigin::ReDeduplicated) => {
+                        Some(RemoteCacheAnswer::Deduplicated)
+                    }
+                    _ => None,
+                };
+                answer.map(|answer| (remote.action_digest.as_str(), answer))
+            }
+            _ => None,
+        }
+    }
+
+    /// How long this test run waited for the command, from the command report's metadata
+    /// (`CommandExecutionMetadata.wall_time`). Unlike `execution_time`, which a remote cached
+    /// answer takes from the original execution, this is always the current run's interval.
+    pub fn current_wall_time(&self) -> Option<Duration> {
+        self.command_execution
+            .as_ref()?
+            .details
+            .as_ref()?
+            .metadata
+            .as_ref()?
+            .wall_time
+            .and_then(|wall_time| Duration::try_from(wall_time).ok())
+    }
+}
+
 pub enum CancellationReason {
     NotSpecified,
     ReQueueTimeout,
@@ -562,6 +714,209 @@ mod tests {
         assert_eq!(
             TestStatus::parse("EXECUTION_FAILURE").unwrap(),
             TestStatus::FATAL
+        );
+    }
+
+    fn execution(kind: Option<buck2_data::CommandExecutionKind>) -> ExecutionResult2 {
+        ExecutionResult2 {
+            status: ExecutionStatus::Finished { exitcode: 0 },
+            stdout: ExecutionStream::Inline(b"test case ... ok".to_vec()),
+            stderr: ExecutionStream::Inline(Vec::new()),
+            outputs: Default::default(),
+            start_time: SystemTime::UNIX_EPOCH,
+            execution_time: Duration::ZERO,
+            max_memory_used_bytes: None,
+            execution_details: ExecutionDetails {
+                execution_kind: kind,
+            },
+            command_execution: None,
+        }
+    }
+
+    #[test]
+    fn test_result_origin_of_local_test_result_cache_hit_is_reused() {
+        use buck2_data::command_execution_kind::Command;
+        let hit = execution(Some(buck2_data::CommandExecutionKind {
+            command: Some(Command::LocalTestResultCache(
+                buck2_data::LocalTestResultCache {
+                    action_digest: "digest".to_owned(),
+                    cache_key: "key".to_owned(),
+                    origin_attempt: "origin".to_owned(),
+                    entry_manifest: "manifest".to_owned(),
+                    current_attempt: "current".to_owned(),
+                },
+            )),
+        }));
+        assert_eq!(
+            TestResultOrigin::of_execution(&hit),
+            TestResultOrigin::Reused(ReusedTestResult {
+                origin_attempt: "origin".to_owned(),
+                entry_manifest: "manifest".to_owned(),
+                current_attempt: "current".to_owned(),
+                current_execution_time: Duration::ZERO,
+            })
+        );
+    }
+
+    #[test]
+    fn test_result_origin_of_executed_case_is_fresh() {
+        use buck2_data::command_execution_kind::Command;
+        assert_eq!(TestResultOrigin::default(), TestResultOrigin::Fresh);
+        assert_eq!(
+            TestResultOrigin::of_execution(&execution(None)),
+            TestResultOrigin::Fresh
+        );
+        let local = execution(Some(buck2_data::CommandExecutionKind {
+            command: Some(Command::LocalCommand(Default::default())),
+        }));
+        assert_eq!(
+            TestResultOrigin::of_execution(&local),
+            TestResultOrigin::Fresh
+        );
+        // A command the remote service executed for this request is fresh.
+        let remote = execution(Some(buck2_data::CommandExecutionKind {
+            command: Some(Command::RemoteCommand(remote_command(
+                false,
+                buck2_data::RemoteCommandOrigin::Executed,
+            ))),
+        }));
+        assert_eq!(remote.remote_cached_answer(), None);
+        assert_eq!(
+            TestResultOrigin::of_execution(&remote),
+            TestResultOrigin::Fresh
+        );
+    }
+
+    fn remote_command(
+        cache_hit: bool,
+        origin: buck2_data::RemoteCommandOrigin,
+    ) -> buck2_data::RemoteCommand {
+        buck2_data::RemoteCommand {
+            action_digest: "digest".to_owned(),
+            cache_hit,
+            cache_hit_type: origin as i32,
+            ..Default::default()
+        }
+    }
+
+    /// The three cached answers, as upstream's producers encode them: a client action-cache hit
+    /// (`cache_hit`, `ACTION_CACHE`), and an executed request the service served from its cache
+    /// or deduplicated (`!cache_hit`, `RE_SERVED_FROM_CACHE` / `RE_DEDUPLICATED`).
+    fn cached_answers() -> [(buck2_data::RemoteCommand, RemoteCacheAnswer); 3] {
+        use buck2_data::RemoteCommandOrigin;
+        [
+            (
+                remote_command(true, RemoteCommandOrigin::ActionCache),
+                RemoteCacheAnswer::ActionCacheLookup,
+            ),
+            (
+                remote_command(false, RemoteCommandOrigin::ReServedFromCache),
+                RemoteCacheAnswer::ServedExecute,
+            ),
+            (
+                remote_command(false, RemoteCommandOrigin::ReDeduplicated),
+                RemoteCacheAnswer::Deduplicated,
+            ),
+        ]
+    }
+
+    /// A remote answer as the orchestrator returns it: `execution_time` from the cached
+    /// `ActionResult` (the original execution, 9 s) and the command report's wall time for this
+    /// run (250 ms).
+    fn remote_answer(remote: buck2_data::RemoteCommand) -> ExecutionResult2 {
+        use buck2_data::command_execution_kind::Command;
+        ExecutionResult2 {
+            execution_time: Duration::from_secs(9),
+            command_execution: Some(buck2_data::CommandExecution {
+                details: Some(buck2_data::CommandExecutionDetails {
+                    metadata: Some(buck2_data::CommandExecutionMetadata {
+                        wall_time: Some(Duration::from_millis(250).try_into().unwrap()),
+                        execution_time: Some(Duration::from_secs(9).try_into().unwrap()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..execution(Some(buck2_data::CommandExecutionKind {
+                command: Some(Command::RemoteCommand(remote)),
+            }))
+        }
+    }
+
+    #[test]
+    fn remote_reused_origin_separates_original_and_current_time() {
+        for (remote, served_by) in cached_answers() {
+            let answer = remote_answer(remote);
+            assert_eq!(answer.current_wall_time(), Some(Duration::from_millis(250)));
+            assert_eq!(
+                TestResultOrigin::of_execution(&answer),
+                TestResultOrigin::RemoteReused(RemoteReusedTestResult {
+                    action_digest: "digest".to_owned(),
+                    served_by,
+                    original_execution_time: Duration::from_secs(9),
+                    current_execution_time: Some(Duration::from_millis(250)),
+                })
+            );
+            // Without a command report the current interval is unknown, never the original's.
+            let unreported = ExecutionResult2 {
+                command_execution: None,
+                ..answer
+            };
+            assert_eq!(
+                TestResultOrigin::of_execution(&unreported),
+                TestResultOrigin::RemoteReused(RemoteReusedTestResult {
+                    action_digest: "digest".to_owned(),
+                    served_by,
+                    original_execution_time: Duration::from_secs(9),
+                    current_execution_time: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn remote_cached_answer_classifies_each_origin() {
+        use buck2_data::RemoteCommandOrigin;
+        use buck2_data::command_execution_kind::Command;
+        let of = |remote| {
+            execution(Some(buck2_data::CommandExecutionKind {
+                command: Some(Command::RemoteCommand(remote)),
+            }))
+        };
+        for (remote, served_by) in cached_answers() {
+            assert_eq!(
+                of(remote).remote_cached_answer(),
+                Some(("digest", served_by))
+            );
+        }
+        // A dep-file cache hit is not this action's own result, and an executed request ran the
+        // command; neither is a cached answer. Contradictory pairs are not trusted either.
+        for remote in [
+            remote_command(true, RemoteCommandOrigin::RemoteDepFileCache),
+            remote_command(false, RemoteCommandOrigin::Executed),
+            remote_command(false, RemoteCommandOrigin::ActionCache),
+            remote_command(true, RemoteCommandOrigin::ReServedFromCache),
+            remote_command(true, RemoteCommandOrigin::ReDeduplicated),
+        ] {
+            assert_eq!(of(remote).remote_cached_answer(), None);
+        }
+    }
+
+    #[test]
+    fn remote_cache_answer_maps_to_served_by_origin() {
+        use buck2_data::RemoteCommandOrigin;
+        assert_eq!(
+            RemoteCacheAnswer::ActionCacheLookup.to_proto(),
+            RemoteCommandOrigin::ActionCache
+        );
+        assert_eq!(
+            RemoteCacheAnswer::ServedExecute.to_proto(),
+            RemoteCommandOrigin::ReServedFromCache
+        );
+        assert_eq!(
+            RemoteCacheAnswer::Deduplicated.to_proto(),
+            RemoteCommandOrigin::ReDeduplicated
         );
     }
 

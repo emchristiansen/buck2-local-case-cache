@@ -1,6 +1,13 @@
 [cells]
+# The prelude is the engine's own source in `prelude/`, the tree a buck2 built from this checkout
+# bundles (app/buck2_external_cells_bundled/build.rs). It is declared as a plain cell rather than
+# `[external_cells] prelude = bundled` because a config file cannot unset an external cell origin,
+# and the explicit NativeLink mode (mode/nativelink.buckconfig) must replace this prelude.
 prelude = prelude
 none = none
+# The explicit NativeLink mode's toolchains (shim/nix/BUCK). Declaring the cell selects nothing:
+# `toolchains` below names the shim's system toolchains unless that mode is selected.
+nix_toolchains = shim/nix
 
 [cell_aliases]
 config = prelude
@@ -13,9 +20,6 @@ fbcode_macros = gh_facebook_buck2_shims_meta
 fbsource = gh_facebook_buck2_shims_meta
 shim = gh_facebook_buck2_shims_meta
 toolchains = gh_facebook_buck2_shims_meta
-
-[external_cells]
-prelude = bundled
 
 [build]
 execution_platforms = prelude//platforms:default

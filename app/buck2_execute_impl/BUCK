@@ -44,6 +44,12 @@ rust_library(
         "fbsource//third-party/rust:assert_matches",
         "fbsource//third-party/rust:tempfile",
     ],
+    # The declared shell for the local executor's child-process fixtures
+    # (src/executors/local.rs DECLARED_SHELL): the pinned bash's exact store path, with the
+    # Nix manifest of its closure as a hidden input, never a host shell found through PATH.
+    test_env = {
+        "BUCK2_TEST_DECLARED_SHELL": "$(exe toolchains//:archive_shell)",
+    },
     deps = [
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:crossbeam-channel",

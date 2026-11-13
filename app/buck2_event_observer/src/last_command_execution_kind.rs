@@ -19,6 +19,7 @@ pub enum LastCommandExecutionKind {
     RemoteDeduplicated,
     Cached,
     RemoteDepFileCached,
+    LocalTestResultCached,
     NoCommand,
 }
 
@@ -56,11 +57,29 @@ pub fn get_last_command_execution_kind(
                     LastCommandExecutionKind::RemoteDeduplicated
                 }
             },
+            Some(Command::LocalTestResultCache(_)) => {
+                LastCommandExecutionKind::LocalTestResultCached
+            }
             None => LastCommandExecutionKind::NoCommand,
         }
     } else {
         LastCommandExecutionKind::NoCommand
     }
+}
+
+/// Returns whether a test run's result was reused from the local test-result cache rather than
+/// produced by running the test. The `TestRunEnd` command report is the single authoritative
+/// record of such a hit; the lookup/hit executor stages that precede it are not counted.
+pub fn is_local_test_result_reuse(test_run: &buck2_data::TestRunEnd) -> bool {
+    matches!(
+        test_run
+            .command_report
+            .as_ref()
+            .and_then(|c| c.details.as_ref())
+            .and_then(|d| d.command_kind.as_ref())
+            .and_then(|k| k.command.as_ref()),
+        Some(buck2_data::command_execution_kind::Command::LocalTestResultCache(_))
+    )
 }
 
 pub struct ExecTime {
@@ -69,6 +88,16 @@ pub struct ExecTime {
 }
 
 pub fn get_last_command_execution_time(action: &buck2_data::ActionExecutionEnd) -> ExecTime {
+    if matches!(
+        get_last_command_execution_kind(action),
+        LastCommandExecutionKind::LocalTestResultCached
+    ) {
+        // An entry's original runtime is provenance, not a new child interval.
+        return ExecTime {
+            exec_time_ms: 0,
+            cached_exec_time_ms: 0,
+        };
+    }
     let exec_time_ms = action
         .commands
         .last()
@@ -85,5 +114,54 @@ pub fn get_last_command_execution_time(action: &buck2_data::ActionExecutionEnd) 
             }
             _ => 0,
         },
+    }
+}
+
+#[cfg(test)]
+mod local_test_result_cache_tests {
+    use super::*;
+
+    #[test]
+    fn local_reuse_is_distinct_and_never_a_new_execution_interval() {
+        let action = buck2_data::ActionExecutionEnd {
+            commands: vec![buck2_data::CommandExecution {
+                details: Some(buck2_data::CommandExecutionDetails {
+                    command_kind: Some(buck2_data::CommandExecutionKind {
+                        command: Some(
+                            buck2_data::command_execution_kind::Command::LocalTestResultCache(
+                                buck2_data::LocalTestResultCache {
+                                    action_digest: "digest".to_owned(),
+                                    cache_key: "full-key-digest".to_owned(),
+                                    origin_attempt: "original".to_owned(),
+                                    entry_manifest: "immutable-manifest".to_owned(),
+                                    current_attempt: "current".to_owned(),
+                                },
+                            ),
+                        ),
+                    }),
+                    metadata: Some(buck2_data::CommandExecutionMetadata {
+                        execution_time: Some(prost_types::Duration {
+                            seconds: 9,
+                            nanos: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            get_last_command_execution_kind(&action),
+            LastCommandExecutionKind::LocalTestResultCached
+        ));
+        let time = get_last_command_execution_time(&action);
+        assert_eq!(time.exec_time_ms, 0);
+        assert_eq!(time.cached_exec_time_ms, 0);
+        assert_eq!(
+            buck2_data::get_action_digest(&action.commands).as_deref(),
+            Some("digest")
+        );
     }
 }

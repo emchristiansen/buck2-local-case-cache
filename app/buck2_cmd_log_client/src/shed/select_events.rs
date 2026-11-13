@@ -174,6 +174,7 @@ mod tests {
             working_dir: "/tmp".to_owned(),
             trace_id: Some(TraceId::null().to_string()),
             start_time: None,
+            muninn_event_schema: None,
         };
 
         let mut raw = Vec::new();

@@ -64,6 +64,9 @@ pub trait RemoteActionResult: Send + Sync {
 pub struct ExecuteResponseWithQueueStats {
     pub execute_response: ExecuteResponse,
     pub queue_stats: QueueStats,
+    /// Which `Execute` request the service answered, as the remote execution client counts
+    /// them (`ExecuteWithProgressResponse::submission`), if it does.
+    pub submission: Option<u32>,
 }
 
 impl ExecuteResponseWithQueueStats {
@@ -115,6 +118,7 @@ impl RemoteActionResult for ExecuteResponseWithQueueStats {
             materialized_inputs_for_failed,
             materialized_outputs_for_failed_actions,
             origin: self.origin(),
+            submission: self.submission,
         }
     }
 

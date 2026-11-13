@@ -32,6 +32,8 @@ use crate::FutureChildOutput;
 use crate::file_names::get_logfile_name;
 use crate::file_names::remove_old_logs;
 use crate::read::EventLogPathBuf;
+use crate::schema_compat::MUNINN_EVENT_SCHEMA_CURRENT;
+use crate::schema_compat::UnmarkedLogReading;
 use crate::should_block_on_log_upload;
 use crate::should_upload_log;
 use crate::stream_value::StreamValue;
@@ -111,6 +113,8 @@ impl WriteEventLog {
             working_dir: self.working_dir.to_string(),
             trace_id,
             start_time: Some(self.start_time),
+            // This binary writes the current numbering.
+            muninn_event_schema: Some(MUNINN_EVENT_SCHEMA_CURRENT),
         };
         self.write_ln(&[invocation]).await
     }
@@ -177,6 +181,7 @@ impl WriteEventLog {
         let path = EventLogPathBuf {
             path: logdir.as_abs_path().join(file_name),
             encoding,
+            unmarked_log_reading: UnmarkedLogReading::default(),
         };
         let writer = start_persist_event_log_subprocess(
             path,
@@ -193,6 +198,7 @@ impl WriteEventLog {
                     EventLogPathBuf::infer_opt(extra_path)?.unwrap_or_else(|| EventLogPathBuf {
                         path: extra_path.clone(),
                         encoding: Encoding::JSON_GZIP,
+                        unmarked_log_reading: UnmarkedLogReading::default(),
                     }),
                     self.log_size_counter_bytes.clone(),
                     EventLogType::System,
@@ -209,6 +215,7 @@ impl WriteEventLog {
                         EventLogPathBuf {
                             path: extra_user_event_log_path.clone(),
                             encoding: Encoding::JSON,
+                            unmarked_log_reading: UnmarkedLogReading::default(),
                         }
                     }),
                     self.log_size_counter_bytes.clone(),
@@ -475,7 +482,10 @@ where
         ));
     }
 
-    let (invocation, mut events) = input.unpack_stream().await?;
+    let (mut invocation, mut events) = input.unpack_stream().await?;
+    // The events were read into the current numbering (an unmarked input's ambiguities are
+    // explicit in them; see `crate::schema_compat`), and are written as such.
+    invocation.muninn_event_schema = Some(MUNINN_EVENT_SCHEMA_CURRENT);
 
     let file = OpenOptions::new()
         .create(true)
@@ -630,6 +640,7 @@ mod tests {
         let log = EventLogPathBuf {
             path: AbsPathBuf::try_from(tmp_dir.path().join("log")).unwrap(),
             encoding,
+            unmarked_log_reading: UnmarkedLogReading::default(),
         };
 
         let mut write_event_log = WriteEventLog::new_test(log.clone()).await?;
@@ -666,6 +677,48 @@ mod tests {
         Ok(())
     }
 
+    /// The writer marks every log header with the current event schema, in protobuf and in
+    /// JSON, and the reader reads the log as marked.
+    #[tokio::test]
+    async fn test_writer_marks_the_header_with_the_current_schema() -> buck2_error::Result<()> {
+        for (name, encoding) in [
+            ("log.pb.zst", Encoding::PROTO_ZSTD),
+            ("log.json-lines", Encoding::JSON),
+        ] {
+            let tmp_dir = TempDir::new()?;
+            let log = EventLogPathBuf {
+                path: AbsPathBuf::try_from(tmp_dir.path().join(name)).unwrap(),
+                encoding,
+                unmarked_log_reading: UnmarkedLogReading::default(),
+            };
+            let mut write_event_log = WriteEventLog::new_test(log.clone()).await?;
+            let event = make_event();
+            write_event_log.log_invocation(event.trace_id()?).await?;
+            write_event_log
+                .write_ln(&[StreamValueForWrite::Event(event.event())])
+                .await?;
+            write_event_log.exit().await;
+
+            let (invocation, _events) = log.unpack_stream().await?;
+            assert_eq!(
+                invocation.muninn_event_schema,
+                Some(MUNINN_EVENT_SCHEMA_CURRENT),
+                "{name}"
+            );
+            assert_eq!(
+                invocation.schema(),
+                crate::schema_compat::LogSchema::Marked(2),
+                "{name}"
+            );
+            if encoding.mode == crate::utils::LogMode::Json {
+                let text = std::fs::read_to_string(tmp_dir.path().join(name))?;
+                let header = text.lines().next().unwrap();
+                assert!(header.contains("\"muninn_event_schema\":2"), "{header}");
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_tick_makes_valid_log_zstd() -> buck2_error::Result<()> {
         test_tick_makes_valid_log(Encoding::PROTO_ZSTD).await
@@ -683,6 +736,7 @@ mod tests {
             path: AbsPathBuf::try_from(tmp_dir.path().join("test_tick_makes_valid_log.pb.gz"))
                 .unwrap(),
             encoding,
+            unmarked_log_reading: UnmarkedLogReading::default(),
         };
 
         let mut write_event_log = WriteEventLog::new_test(log.clone()).await?;
@@ -754,6 +808,7 @@ mod tests {
             path: AbsPathBuf::try_from(tmp_dir.path().join("test_tail_reads_growing_log.pb.zst"))
                 .unwrap(),
             encoding: Encoding::PROTO_ZSTD,
+            unmarked_log_reading: UnmarkedLogReading::default(),
         };
 
         let mut write_event_log = WriteEventLog::new_test(log.clone()).await?;
@@ -828,6 +883,7 @@ mod tests {
             )
             .unwrap(),
             encoding: Encoding::PROTO_ZSTD,
+            unmarked_log_reading: UnmarkedLogReading::default(),
         };
 
         let mut write_event_log = WriteEventLog::new_test(log.clone()).await?;

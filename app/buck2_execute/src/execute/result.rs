@@ -317,6 +317,16 @@ impl CommandExecutionResult {
         )
     }
 
+    /// Local test-result reuse is neither a local child nor a remote cache hit.
+    pub fn was_local_test_result_cache_hit(&self) -> bool {
+        matches!(
+            self.report.status,
+            CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::LocalTestResultCache { .. },
+            }
+        )
+    }
+
     /// Whether this is a local run that a hybrid executor chose at run time over a remote one:
     /// a fallback after the remote run failed, or a race the local run won. Where the command
     /// would run was not decided by its configuration, so the result is not one every build

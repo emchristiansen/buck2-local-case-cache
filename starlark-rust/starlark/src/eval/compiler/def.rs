@@ -984,3 +984,129 @@ impl<'v> Def<'v> {
 }
 
 register_starlark_any!(CopySlotFromParent);
+
+/// The defining file of a self-contained frozen function; see
+/// [`Value::self_contained_function_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfContainedSource<'v> {
+    /// The defining file's name.
+    pub filename: &'v str,
+    /// The defining file's complete text.
+    pub source: &'v str,
+}
+
+pub(crate) fn self_contained_function_source<'v>(
+    value: Value<'v>,
+) -> Result<SelfContainedSource<'v>, String> {
+    use starlark_syntax::syntax::AstModule;
+    use starlark_syntax::syntax::Dialect;
+    use starlark_syntax::syntax::ast::ExprP;
+    use starlark_syntax::syntax::ast::ParameterP;
+    use starlark_syntax::syntax::ast::StmtP;
+
+    let def = value
+        .downcast_ref::<Def>()
+        .ok_or_else(|| format!("`{}` is not a user-defined function", value.to_repr()))?;
+    let info = &def.def_info.value;
+    let name = info.name.as_str();
+    let codemap = &info.codemap.as_ref().0;
+    let filename = codemap.filename();
+    if !def.captured.is_empty() {
+        return Err(format!(
+            "`{name}` in `{filename}` captures enclosing values"
+        ));
+    }
+    let module = def
+        .module
+        .load_relaxed()
+        .ok_or_else(|| format!("`{name}` in `{filename}` is not frozen in its module"))?;
+    let module = &module.as_ref().value;
+
+    let ast = AstModule::parse(
+        filename,
+        codemap.source().to_owned(),
+        &Dialect::AllOptionsInternal,
+    )
+    .map_err(|e| format!("`{filename}` does not parse: {e}"))?;
+    let top = match &ast.statement().node {
+        StmtP::Statements(stmts) => stmts.iter().collect::<Vec<_>>(),
+        _ => vec![ast.statement()],
+    };
+    let mut defs = Vec::new();
+    for stmt in top {
+        match &stmt.node {
+            StmtP::Def(d) => {
+                for param in &d.params {
+                    if let ParameterP::Normal(_, _, Some(default)) = &param.node {
+                        let literal = match &default.node {
+                            ExprP::Literal(_) => true,
+                            ExprP::Identifier(id) => {
+                                matches!(id.node.ident.as_str(), "None" | "True" | "False")
+                            }
+                            _ => false,
+                        };
+                        if !literal {
+                            return Err(format!(
+                                "`{}` in `{filename}` has a non-literal default",
+                                d.name.node.ident
+                            ));
+                        }
+                    }
+                }
+                defs.push(d.name.node.ident.as_str());
+            }
+            StmtP::Expression(e) if matches!(e.node, ExprP::Literal(_)) => {}
+            _ => {
+                return Err(format!(
+                    "`{filename}` has a top-level statement other than `def` or a docstring"
+                ));
+            }
+        }
+    }
+    let mut bound_self = false;
+    for (bound, bound_value) in module.all_items() {
+        let bound = bound.as_str();
+        if !defs.contains(&bound) {
+            return Err(format!(
+                "`{filename}` binds `{bound}`, which it does not `def`"
+            ));
+        }
+        let bound_def = bound_value
+            .downcast_ref::<Def>()
+            .ok_or_else(|| format!("`{bound}` in `{filename}` is not a user-defined function"))?;
+        if bound_def.def_info.value.codemap.as_ref().0.filename() != filename {
+            return Err(format!(
+                "`{bound}` in `{filename}` is defined in another file"
+            ));
+        }
+        if bound == name && bound_value.ptr_eq(value) {
+            bound_self = true;
+        }
+    }
+    if !bound_self {
+        return Err(format!(
+            "`{name}` in `{filename}` is not the top-level function bound to its name"
+        ));
+    }
+    // The file's text determines its functions only if every name they read is a local, one of
+    // the file's own functions, or a builtin whose result depends on its arguments alone. The
+    // host interpreter may also provide builtins that read their context (Buck's `read_config`,
+    // for example), so the file is compiled anew against the Starlark-standard builtins only:
+    // the compiler's own name resolution then rejects any other global the file mentions.
+    let pure_builtins = Globals::standard();
+    crate::environment::Module::with_temp_heap(|module| {
+        Evaluator::new(&module)
+            .eval_module(ast, &pure_builtins)
+            .map(|_| ())
+    })
+    .map_err(|e| {
+        format!(
+            "`{filename}` reads a name that is neither its own nor a standard Starlark builtin: {}",
+            e.without_diagnostic()
+        )
+    })?;
+    Ok(SelfContainedSource {
+        filename,
+        source: codemap.source(),
+    })
+}

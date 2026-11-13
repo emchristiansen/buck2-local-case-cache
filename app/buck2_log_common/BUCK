@@ -8,6 +8,7 @@ rust_library(
         "src/**/*.rs",
     ]),
     test_deps = [
+        "fbsource//third-party/rust:tokio",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
     ],
     deps = [
