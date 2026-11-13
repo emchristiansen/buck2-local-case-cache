@@ -26,8 +26,10 @@ use std::time::SystemTime;
 
 use allocative::Allocative;
 use async_trait::async_trait;
-use buck2_build_api::configure_dice::configure_dice_for_buck;
-use buck2_build_api::spawner::BuckSpawner;
+use buck2_build_api::configure_dice::DiceEngineConfiguration;
+use buck2_build_api::configure_dice::DiceEngineConfigurationInputs;
+use buck2_build_api::configure_dice::DiceRootConfiguration;
+use buck2_build_api::configure_dice::configure_dice_data_for_buck;
 use buck2_certs::validate::CertState;
 use buck2_certs::validate::CertStateReport;
 use buck2_certs::validate::INVALID_CERTS_TAG;
@@ -36,12 +38,11 @@ use buck2_certs::validate::validate_certs;
 use buck2_cli_proto::daemon_api_server::*;
 use buck2_cli_proto::*;
 use buck2_common::buckd_connection::BUCK_AUTH_TOKEN_HEADER;
-use buck2_common::events::HasEvents;
+use buck2_common::cancellation::CancellationScope;
 use buck2_common::ignores::ignore_set::IgnoreSet;
 use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::io::IoProvider;
-use buck2_common::io::trace::TracingIoProvider;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::memory;
 use buck2_common::sqlite::sqlite_db::SqliteIdentity;
@@ -53,6 +54,7 @@ use buck2_core::logging::LogConfigurationReloadHandle;
 use buck2_core::pattern::unparsed::UnparsedPatternPredicate;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
+use buck2_error::buck2_error;
 use buck2_events::Event;
 use buck2_events::daemon_id::DaemonId;
 use buck2_events::dispatch::EventDispatcher;
@@ -66,12 +68,14 @@ use buck2_fs::fs_util;
 use buck2_fs::fs_util::DiskSpaceStats;
 use buck2_fs::fs_util::disk_space_stats;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_interpreter::starlark_profiler::config::StarlarkProfilerConfiguration;
 use buck2_profile::proto_to_profile_mode;
 use buck2_profile::starlark_profiler_configuration_from_request;
 use buck2_resource_control::buck_cgroup_tree::BuckCgroupTree;
 use buck2_resource_control::buck_cgroup_tree::PreppedBuckCgroups;
 use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
+use buck2_server_ctx::concurrency::ConcurrencyHandler;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::late_bindings::AUDIT_SERVER_COMMAND;
 use buck2_server_ctx::late_bindings::LSP_SERVER_COMMAND;
@@ -90,9 +94,10 @@ use buck2_util::system_stats::system_memory_stats;
 use buck2_util::threads::thread_spawn;
 use dice::BranchId;
 use dice::Dice;
+use dice::EvictionPolicy;
 use dice_futures::cancellation::CancellationContext;
+use dice_futures::cancellation::DropcancelHandle;
 use dice_futures::drop::DropTogether;
-use dice_futures::spawn::spawn_dropcancel;
 use dupe::Dupe;
 use futures::Future;
 use futures::FutureExt;
@@ -109,6 +114,7 @@ use rand::Rng as _;
 use rand::SeedableRng;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio::time::timeout_at;
 use tonic::Code;
@@ -123,12 +129,14 @@ use crate::active_commands::ActiveCommandStateWriter;
 use crate::clean_stale::clean_stale_command;
 use crate::ctx::ServerCommandContext;
 use crate::daemon::crash::crash;
+use crate::daemon::dice::TenantDiceProvider;
 use crate::daemon::multi_event_stream::MultiEventStream;
 use crate::daemon::server_allocative::spawn_allocative;
 use crate::daemon::state::DaemonState;
 use crate::file_status::file_status_command;
 use crate::hydration::hydration_command;
 use crate::new_generic::new_generic_command;
+use crate::paging::EvictionGate;
 use crate::paging::cancel_active_page_out;
 use crate::profile::profile_command;
 use crate::profiling_manager::StarlarkProfilingManager;
@@ -274,40 +282,69 @@ impl BuckdServerInitPreferences {
     }
 }
 
+pub(crate) struct TenantDiceInputs<'a> {
+    pub(crate) io: Arc<dyn IoProvider>,
+    pub(crate) digest_config: DigestConfig,
+    pub(crate) ignore_set: Arc<IgnoreSet>,
+    pub(crate) root_config: &'a LegacyBuckConfig,
+    pub(crate) tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
+    pub(crate) dice_state_path: &'a Path,
+    pub(crate) provider: &'a TenantDiceProvider,
+    pub(crate) lifetime_guard: Option<Arc<dyn Send + Sync>>,
+    pub(crate) memory_pressure: Option<watch::Receiver<bool>>,
+}
+
 impl TenantStateInitPreferences {
-    pub async fn construct_dice(
+    pub(crate) async fn construct_dice(
         &self,
-        io: Arc<dyn IoProvider>,
-        digest_config: DigestConfig,
-        ignore_set: Arc<IgnoreSet>,
-        root_config: &LegacyBuckConfig,
-        tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
-        dice_state_path: &Path,
-    ) -> buck2_error::Result<(Arc<Dice>, BranchId)> {
-        // `hydration` is `Some` when paging is enabled (via `enable_paging` or
-        // `page_out_on_idle`), which is what gates setting up on-disk storage.
+        inputs: TenantDiceInputs<'_>,
+    ) -> buck2_error::Result<(Arc<ConcurrencyHandler>, BranchId, Arc<EvictionGate>)> {
+        let TenantDiceInputs {
+            io,
+            digest_config,
+            ignore_set,
+            root_config,
+            tenting_acl_provider,
+            dice_state_path,
+            provider,
+            lifetime_guard,
+            memory_pressure,
+        } = inputs;
         let hydration = self
             .daemon_startup_config
             .startup_options
             .hydration
             .as_ref();
-        configure_dice_for_buck(
-            io,
-            digest_config,
-            ignore_set,
-            Some(root_config),
-            tenting_acl_provider,
-            self.daemon_startup_config.daemon_buck_settings().dupe(),
-            hydration.map(|_| dice_state_path),
-            hydration.map_or_else(Default::default, |h| h.pagable_storage_backend),
-            hydration.map_or_else(Default::default, |h| h.page_out_policy),
-            hydration.map_or_else(Default::default, |h| h.eviction_policy),
-            self.daemon_startup_config
+        let configuration = DiceEngineConfiguration::resolve(DiceEngineConfigurationInputs {
+            dice_state_path: hydration.map(|_| provider.state_path(dice_state_path)),
+            pagable_storage_backend: hydration
+                .map_or_else(Default::default, |h| h.pagable_storage_backend),
+            page_out_policy: hydration.map_or_else(Default::default, |h| h.page_out_policy),
+            eviction_policy: hydration.map_or_else(Default::default, |h| h.eviction_policy),
+            defer_field_reads: self
+                .daemon_startup_config
                 .daemon_buck_settings()
                 .hydration
                 .defer_field_reads(),
-        )
-        .await
+        })?;
+        let data = configure_dice_data_for_buck(DiceRootConfiguration {
+            io,
+            digest_config,
+            ignore_set,
+            root_config: Some(root_config),
+            tenting_acl_provider,
+            buck_settings: self.daemon_startup_config.daemon_buck_settings().dupe(),
+        })?;
+        provider
+            .create_with_lifetime_guard(
+                configuration,
+                data,
+                lifetime_guard,
+                memory_pressure.filter(|_| {
+                    hydration.is_some_and(|h| h.eviction_policy == EvictionPolicy::OnMemoryPressure)
+                }),
+            )
+            .await
     }
 }
 
@@ -365,6 +402,19 @@ pub(crate) struct BuckdServerData {
 pub struct BuckdServer(Arc<BuckdServerData>);
 
 impl BuckdServer {
+    fn shutdown_after_final_tenant_eviction(&self) {
+        self.0
+            .stop_accepting_requests
+            .store(true, Ordering::Release);
+        self.0.daemon_shutdown.start_shutdown(
+            buck2_data::DaemonShutdown {
+                reason: "The final tenant was evicted".to_owned(),
+                callers: Vec::new(),
+            },
+            None,
+        );
+    }
+
     #[tracing::instrument(name = "daemon_listener", skip_all)]
     pub async fn run(
         fb: fbinit::FacebookInit,
@@ -396,15 +446,13 @@ impl BuckdServer {
                     .as_deref(),
             )?;
 
-        let tenant_paths = paths.tenant_paths();
-
-        // Create buck-out and potentially chdir to there.
-        fs_util::create_dir_all(tenant_paths.buck_out_path())
+        let working_dir = paths.daemon_working_dir()?;
+        fs_util::create_dir_all(&working_dir)
             .tag(ErrorTag::InvalidBuckOut)
-            .buck_error_context("Error creating buck_out_path")?;
+            .buck_error_context("Error creating daemon working directory")?;
 
         let cwd = {
-            let dir = WorkingDirectory::open(tenant_paths.buck_out_path())?;
+            let dir = WorkingDirectory::open(working_dir)?;
             dir.chdir_and_promise_it_will_not_change()?;
             dir
         };
@@ -448,12 +496,6 @@ impl BuckdServer {
             )
             .await?,
         );
-        let dice = daemon_state
-            .data()
-            .initial_tenant()
-            .dice_manager
-            .unsafe_dice()
-            .dupe();
 
         let auth_token = process_info.auth_token.clone();
         let api_server = BuckdServer(Arc::new(BuckdServerData {
@@ -466,7 +508,7 @@ impl BuckdServer {
             },
             start_instant: Instant::now(),
             daemon_shutdown: DaemonShutdown { shutdown_channel },
-            daemon_state,
+            daemon_state: daemon_state.clone(),
             cert_state,
             inactivity_config: inactivity_config.clone(),
             command_channel,
@@ -508,7 +550,7 @@ impl BuckdServer {
         let shutdown_deadline = shutdown_deadline
             .await
             .unwrap_or_else(|_| tokio::time::Instant::now() + DEFAULT_KILL_TIMEOUT);
-        if timeout_at(shutdown_deadline, dice.wait_for_idle())
+        if timeout_at(shutdown_deadline, daemon_state.data().wait_for_dice_idle())
             .await
             .is_err()
         {
@@ -719,11 +761,13 @@ impl BuckdServer {
                 )
             });
 
+            let cancellation = tenant.cancellation.clone();
             let resp = streaming(
                 events,
                 state,
                 dispatch.dupe(),
                 daemon_shutdown_channel,
+                &cancellation,
                 move |cancellations| {
                     async move {
                         let _background_cleanup_guard = if prevents_background_cleanup {
@@ -1062,6 +1106,7 @@ fn streaming<F>(
     state: ActiveCommandStateWriter,
     dispatcher: EventDispatcher,
     daemon_shutdown_channel: oneshot::Receiver<buck2_data::DaemonShutdown>,
+    cancellation_scope: &CancellationScope,
     func: F,
     rt: &Handle,
 ) -> Response<ResponseStream>
@@ -1072,20 +1117,20 @@ where
     // The function `func` is the computation that we are going to run. It communicates its success or failure using
     // control events; our first step is to spawn it.
 
-    struct EventsCtx {
-        dispatcher: EventDispatcher,
-    }
-    impl HasEvents for EventsCtx {
-        fn get_dispatcher(&self) -> &EventDispatcher {
-            &self.dispatcher
-        }
-    }
-
     let trace_id = dispatcher.trace_id().dupe();
-
-    let events_ctx = EventsCtx { dispatcher };
-
-    let spawned = spawn_dropcancel(func, &BuckSpawner::new(rt.clone()), &events_ctx);
+    let task_dispatcher = dispatcher.dupe();
+    let (spawned, cancellation) = cancellation_scope.spawn(rt, move |context| {
+        buck2_events::dispatch::with_dispatcher_async(task_dispatcher, func(context)).boxed()
+    });
+    let cancellation = CancelCommandOnDrop(cancellation);
+    let _monitor = rt.spawn(async move {
+        if let Err(error) = spawned.await {
+            dispatcher.command_result(error_to_command_result(buck2_error!(
+                ErrorTag::Input,
+                "Tenant command stopped: {error}"
+            )));
+        }
+    });
     let (output_send, output_recv) = tokio::sync::mpsc::unbounded_channel();
 
     // We run the event consumer on new non-tokio thread to avoid the consumer task from getting stuck behind
@@ -1140,8 +1185,16 @@ where
     let events = MultiEventStream::new(events);
 
     Response::new(Box::pin(SyncStream {
-        wrapped: sync_wrapper::SyncWrapper::new(DropTogether::new(events, spawned)),
+        wrapped: sync_wrapper::SyncWrapper::new(DropTogether::new(events, cancellation)),
     }))
+}
+
+struct CancelCommandOnDrop(Arc<DropcancelHandle>);
+
+impl Drop for CancelCommandOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct QueryCommandOptions {
@@ -1239,9 +1292,11 @@ impl DaemonApi for BuckdServer {
         let rt = self.0.rt.clone();
 
         self.oneshot(req, DefaultCommandOptions, move |req| async move {
-            let tenant = daemon_state.data().initial_tenant();
-            let repo = tenant.repo.dupe();
-            let snapshot = if req.snapshot {
+            let data = daemon_state.data();
+            let metadata = data.initial_tenant_metadata();
+            let snapshot = if req.snapshot
+                && let Some(tenant) = data.status_tenant()
+            {
                 Some(
                     snapshot::SnapshotCollector::new(daemon_state.data(), tenant, rt.clone())
                         .create_snapshot()
@@ -1252,8 +1307,8 @@ impl DaemonApi for BuckdServer {
             };
 
             let extra_constraints = buck2_cli_proto::ExtraDaemonConstraints {
-                trace_io_enabled: TracingIoProvider::from_io(&*repo.io).is_some(),
-                materializer_state_identity: repo
+                trace_io_enabled: metadata.trace_io_enabled,
+                materializer_state_identity: metadata
                     .materializer_state_identity
                     .as_ref()
                     .map(|i| i.to_string()),
@@ -1263,9 +1318,11 @@ impl DaemonApi for BuckdServer {
             daemon_constraints.extra = Some(extra_constraints);
 
             let valid_working_directory = daemon_state.validate_cwd().is_ok();
-            let valid_buck_out_mount = daemon_state.validate_buck_out_mount(&repo).is_ok();
+            let valid_buck_out_mount = daemon_state
+                .validate_buck_out_mount(&metadata.paths)
+                .is_ok();
 
-            let io_provider = repo.io.name().to_owned();
+            let io_provider = metadata.io_provider.clone();
 
             let uptime = Instant::now() - self.0.start_instant;
 
@@ -1277,8 +1334,8 @@ impl DaemonApi for BuckdServer {
                 uptime: Some(uptime.try_into()?),
                 snapshot,
                 daemon_constraints: Some(daemon_constraints),
-                project_root: repo.paths.project_root().to_string(),
-                isolation_dir: repo.paths.isolation().to_string(),
+                project_root: metadata.paths.project_root().to_string(),
+                isolation_dir: metadata.paths.isolation().to_string(),
                 forkserver_pid: match &daemon_state.data.forkserver {
                     #[cfg(unix)]
                     ForkserverAccess::Client(f) => Some(f.pid()),
@@ -1731,6 +1788,67 @@ impl DaemonApi for BuckdServer {
         Ok(Response::new(UnstableListTenantsResponse { tenants }))
     }
 
+    async fn evict_tenant(
+        &self,
+        req: Request<EvictTenantRequest>,
+    ) -> Result<Response<EvictTenantResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let context = req
+            .into_inner()
+            .context
+            .ok_or_else(|| Status::invalid_argument("missing tenant client context"))?;
+        let eviction = self
+            .0
+            .daemon_state
+            .data()
+            .evict_tenant_for_client_context(&context)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let shutting_down = eviction
+            .as_ref()
+            .is_some_and(|eviction| eviction.final_tenant);
+        if shutting_down {
+            self.shutdown_after_final_tenant_eviction();
+        }
+        if let Some(eviction) = &eviction {
+            eviction.completed.clone().await;
+        }
+        Ok(Response::new(EvictTenantResponse {
+            evicted: eviction.is_some(),
+            generation: eviction.as_ref().map_or(0, |eviction| eviction.generation),
+            shutting_down,
+        }))
+    }
+
+    async fn evict_project_tenants(
+        &self,
+        req: Request<EvictProjectTenantsRequest>,
+    ) -> Result<Response<EvictProjectTenantsResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let req = req.into_inner();
+        let context = req
+            .context
+            .ok_or_else(|| Status::invalid_argument("missing tenant client context"))?;
+        let isolation = req
+            .isolation
+            .map(FileNameBuf::try_from)
+            .transpose()
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        let eviction = self
+            .0
+            .daemon_state
+            .data()
+            .evict_project_tenants_for_client_context(&context, isolation)
+            .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        if eviction.final_tenant {
+            self.shutdown_after_final_tenant_eviction();
+        }
+        eviction.completed.await;
+        Ok(Response::new(EvictProjectTenantsResponse {
+            generations: eviction.generations,
+            shutting_down: eviction.final_tenant,
+        }))
+    }
+
     async fn unstable_dice_dump(
         &self,
         req: Request<UnstableDiceDumpRequest>,
@@ -1808,11 +1926,13 @@ impl DaemonApi for BuckdServer {
 
         let this = self.0.dupe();
         let req = req.into_inner();
+        let cancellation = tenant.cancellation.clone();
         Ok(streaming(
             event_source,
             state,
             dispatcher.dupe(),
             daemon_shutdown_channel,
+            &cancellation,
             move |_| {
                 async move {
                     let result = try {

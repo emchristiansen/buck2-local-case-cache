@@ -47,6 +47,7 @@ use buck2_cli_proto::client_context::HostPlatformOverride;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_cli_proto::common_build_options::ExecutionStrategy;
 use buck2_cli_proto::config_override::ConfigType;
+use buck2_common::dice::data::SetIsolationDir;
 use buck2_common::file_ops::io::initialize_read_dir_cache;
 use buck2_common::http::SetHttpClient;
 use buck2_common::ignores::ignore_set::IgnoreSet;
@@ -253,6 +254,7 @@ pub struct ServerCommandContext<'a> {
     host_xcode_version_override: Option<String>,
 
     reuse_current_config: bool,
+    reuse_current_config_implicitly: bool,
     config_overrides: Vec<ConfigOverride>,
 
     // This ensures that there's only one RE connection during the lifetime of this context. It's possible
@@ -424,6 +426,7 @@ impl<'a> ServerCommandContext<'a> {
             host_arch_override: client_context.host_arch(),
             host_xcode_version_override: client_context.host_xcode_version.clone(),
             reuse_current_config: client_context.reuse_current_config,
+            reuse_current_config_implicitly: client_context.reuse_current_config_implicitly,
             config_overrides: client_context.config_overrides.clone(),
             oncall,
             client_id_from_client_metadata,
@@ -745,13 +748,15 @@ impl ServerCommandContext<'_> {
             } else {
                 // If there is no previous command but the flag was set, then the flag is ignored,
                 // the command behaves as if there isn't the reuse config flag.
-                warn_user!(
-                    "reuse_current_config_without_previous_command",
-                    buck2_error::buck2_error!(
-                        buck2_error::ErrorTag::Input,
-                        "--reuse-current-config flag was set, but there was no previous invocation detected. Ignoring --reuse-current-config flag"
-                    )
-                );
+                if !self.reuse_current_config_implicitly {
+                    warn_user!(
+                        "reuse_current_config_without_previous_command",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "--reuse-current-config flag was set, but there was no previous invocation detected. Ignoring --reuse-current-config flag"
+                        )
+                    );
+                }
                 Ok(new_configs)
             }
         } else {
@@ -874,6 +879,14 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
         )?;
 
         ctx.set_buck_out_path(Some(self.cmd_ctx.buck_out_dir.clone()))?;
+        ctx.set_isolation_dir(
+            self.cmd_ctx
+                .base_context
+                .repo()
+                .paths
+                .project_root()
+                .resolve(&self.cmd_ctx.buck_out_dir),
+        )?;
 
         let optional_validations = self
             .cmd_ctx

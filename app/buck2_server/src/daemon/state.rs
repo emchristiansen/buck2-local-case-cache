@@ -13,6 +13,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,6 +24,7 @@ use allocative::Allocative;
 use buck2_build_api::spawner::BuckSpawner;
 use buck2_cli_proto::ClientContext;
 use buck2_cli_proto::unstable_dice_dump_request::DiceDumpFormat;
+use buck2_common::cancellation::CancellationScope;
 use buck2_common::cas_digest::DigestAlgorithm;
 use buck2_common::cas_digest::DigestAlgorithmFamily;
 use buck2_common::ignores::ignore_set::IgnoreSet;
@@ -30,8 +33,10 @@ use buck2_common::init::DaemonStartupConfig;
 use buck2_common::init::SystemWarningConfig;
 use buck2_common::init::Timeout;
 use buck2_common::invocation_paths::InvocationPaths;
+use buck2_common::invocation_paths::TenantDiskLock;
 use buck2_common::invocation_paths::TenantPaths;
 use buck2_common::io::IoProvider;
+use buck2_common::io::trace::TracingIoProvider;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
@@ -50,6 +55,7 @@ use buck2_core::rollout_percentage::RolloutPercentage;
 use buck2_core::soft_error_or_panic;
 use buck2_core::tag_result;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_events::EventSinkWithStats;
@@ -63,6 +69,8 @@ use buck2_execute::dep_file_state::DepFileStore;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::blocking::BlockingExecutorFactory;
+use buck2_execute::execute::blocking::IoRequest;
+use buck2_execute::execute::blocking::with_lifetime_guard;
 use buck2_execute::materialize::materializer::FinalArtifactMaterialization;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::client::init_induced_cache_misses;
@@ -89,7 +97,9 @@ use buck2_file_watcher::dep_files::create_dep_file_cache;
 use buck2_file_watcher::file_watcher::FileWatcher;
 use buck2_file_watcher::ignores::FileWatcherIgnores;
 use buck2_fs::cwd::WorkingDirectory;
+use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckFixedSortedMap;
@@ -106,19 +116,27 @@ use buck2_server_ctx::ctx::LockedPreviousCommandData;
 use buck2_settings::DaemonBuckSettings;
 use buck2_settings::PackageVisibilityDefaultIntersection;
 use buck2_wrapper_common::invocation_id::TraceId;
+use dice::Dice;
 use dice::EvictionPolicy;
+use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use fbinit::FacebookInit;
+use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::future::FutureExt;
+use futures::future::Shared;
 use host_sharing::NamedSemaphores;
 use remote::ScribeConfig;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use crate::active_commands::ActiveCommandDropGuard;
 use crate::ctx::BaseServerCommandContext;
 use crate::daemon::check_working_dir;
+use crate::daemon::dice::TenantDiceProvider;
 use crate::daemon::disk_state::DiskStateOptions;
 use crate::daemon::disk_state::delete_unknown_disk_state;
 use crate::daemon::disk_state::maybe_initialize_dep_file_sqlite_db;
@@ -128,6 +146,7 @@ use crate::daemon::forkserver::maybe_launch_forkserver;
 use crate::daemon::io_provider::create_io_provider;
 use crate::daemon::panic::DaemonStatePanicDiceDump;
 use crate::daemon::server::BuckdServerInitPreferences;
+use crate::daemon::server::TenantDiceInputs;
 use crate::daemon::server::TenantStateInitPreferences;
 use crate::daemon::tenting_provider::create_tenting_acl_provider;
 use crate::paging::EvictionGate;
@@ -165,11 +184,15 @@ pub(crate) struct PersistedDepFileCache {
 pub struct TenantState {
     pub repo: Arc<RepoState>,
 
+    pub(crate) cancellation: Arc<CancellationScope>,
+
     /// The DICE graph and the command concurrency state for this tenant.
     pub(crate) dice_manager: Arc<ConcurrencyHandler>,
 
     #[allocative(skip)]
     pub(crate) eviction_gate: Arc<EvictionGate>,
+    #[allocative(skip)]
+    disk_ownership: Arc<Semaphore>,
 }
 
 /// Services and caches associated with a repository-backed tenant.
@@ -301,6 +324,24 @@ struct TenantStateInit<'a> {
     final_artifact_materialization: FinalArtifactMaterialization,
     runtime: &'a Handle,
     shared: DaemonSharedServices<'a>,
+    disk_ownership: Arc<Semaphore>,
+    cancellation: Arc<CancellationScope>,
+    dice_provider: &'a TenantDiceProvider,
+}
+
+struct TenantInitializationGate {
+    path: String,
+}
+
+impl IoRequest for TenantInitializationGate {
+    fn execute(self: Box<Self>, _project_fs: &ProjectRoot) -> buck2_error::Result<()> {
+        std::fs::write(format!("{}.started", self.path), [])?;
+        let released = format!("{}.release", self.path);
+        while !Path::new(&released).try_exists()? {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
 }
 
 struct DaemonSharedServices<'a> {
@@ -312,6 +353,7 @@ struct DaemonSharedServices<'a> {
 
 #[derive(Allocative)]
 struct TenantStateFactory {
+    dice_provider: TenantDiceProvider,
     #[allocative(skip)]
     fb: FacebookInit,
     init_ctx: TenantStateInitPreferences,
@@ -326,13 +368,9 @@ impl TenantStateFactory {
         &self,
         paths: TenantPaths,
         shared: DaemonSharedServices<'_>,
+        disk_ownership: Arc<Semaphore>,
+        cancellation: Arc<CancellationScope>,
     ) -> buck2_error::Result<Arc<TenantState>> {
-        let buck_out_path = paths.buck_out_path();
-        tokio::fs::create_dir_all(&buck_out_path)
-            .await
-            .tag(ErrorTag::InvalidBuckOut)
-            .buck_error_context("Error creating buck_out_path")?;
-
         let fs = paths.project_root().clone();
         let legacy_cells = BuckConfigBasedCells::parse_with_config_args(&fs, &[]).await?;
         let cells = &legacy_cells.cell_resolver;
@@ -340,8 +378,15 @@ impl TenantStateFactory {
             .parse_single_cell(cells.root_cell(), &fs)
             .await?;
 
-        self.create_with_loaded_config(paths, &legacy_cells, root_config, shared)
-            .await
+        self.create_with_loaded_config(
+            paths,
+            &legacy_cells,
+            root_config,
+            shared,
+            disk_ownership,
+            cancellation,
+        )
+        .await
     }
 
     async fn create_with_loaded_config(
@@ -350,6 +395,8 @@ impl TenantStateFactory {
         legacy_cells: &BuckConfigBasedCells,
         root_config: &LegacyBuckConfig,
         shared: DaemonSharedServices<'_>,
+        disk_ownership: Arc<Semaphore>,
+        cancellation: Arc<CancellationScope>,
     ) -> buck2_error::Result<Arc<TenantState>> {
         TenantState::create(TenantStateInit {
             fb: self.fb,
@@ -360,6 +407,9 @@ impl TenantStateFactory {
             final_artifact_materialization: self.final_artifact_materialization,
             runtime: &self.runtime,
             shared,
+            disk_ownership,
+            cancellation,
+            dice_provider: &self.dice_provider,
         })
         .await
     }
@@ -376,7 +426,31 @@ impl TenantState {
             final_artifact_materialization,
             runtime,
             shared,
+            disk_ownership,
+            cancellation,
+            dice_provider,
         } = init;
+        let lifetime = cancellation.register()?;
+        let permit = disk_ownership
+            .clone()
+            .acquire_owned()
+            .await
+            .internal_error("Tenant disk ownership gate should remain open")?;
+        let process_lock = TenantDiskLock::acquire(&paths, Duration::from_secs(10)).await?;
+        let disk_lease = Arc::new((permit, process_lock, lifetime));
+        let buck_out_path = paths.buck_out_path();
+        tokio::fs::create_dir_all(&buck_out_path)
+            .await
+            .tag(ErrorTag::InvalidBuckOut)
+            .buck_error_context("Error creating buck_out_path")?;
+
+        if !cancellation.observer().is_alive_sync() {
+            return Err(buck2_error!(
+                ErrorTag::Input,
+                "Tenant generation was evicted during initialization"
+            ));
+        }
+
         let fs = paths.project_root().clone();
         let cells = &legacy_cells.cell_resolver;
 
@@ -436,8 +510,40 @@ impl TenantState {
         let file_watcher_ignores = FileWatcherIgnores::new(ignore_set.dupe());
 
         let disk_state_options = DiskStateOptions::new(root_config)?;
-        let blocking_executor = shared.blocking_executor_factory.for_project(fs.dupe());
+        let blocking_executor = with_lifetime_guard(
+            shared.blocking_executor_factory.for_project(fs.dupe()),
+            disk_lease,
+            Some(cancellation.observer()),
+        );
 
+        if let Some(gate) = buck2_env!(
+            "BUCK2_TEST_BLOCK_TENANT_INITIALIZATION",
+            applicability = testing
+        )? {
+            let (isolation, gate) = gate.split_once(',').ok_or_else(|| {
+                buck2_error!(
+                    ErrorTag::Input,
+                    "Expected isolation,path for the tenant initialization gate"
+                )
+            })?;
+            if paths.isolation().as_str() == isolation {
+                blocking_executor
+                    .execute_io(
+                        Box::new(TenantInitializationGate {
+                            path: gate.to_owned(),
+                        }),
+                        CancellationContext::never_cancelled(),
+                    )
+                    .await?;
+            }
+        }
+
+        if !cancellation.observer().is_alive_sync() {
+            return Err(buck2_error!(
+                ErrorTag::Input,
+                "Tenant generation was evicted during initialization"
+            ));
+        }
         let cache_dir_path = paths.cache_dir_path();
         let valid_cache_dirs = paths.valid_cache_dirs();
 
@@ -666,15 +772,20 @@ impl TenantState {
         let tenting_acl_provider = create_tenting_acl_provider(fb, paths.project_root());
 
         tracing::info!("Constructing DICE...");
-        let (dice, root) = init_ctx
-            .construct_dice(
-                io.dupe(),
+        let (dice_manager, _root, eviction_gate) = init_ctx
+            .construct_dice(TenantDiceInputs {
+                io: io.dupe(),
                 digest_config,
-                ignore_set.dupe(),
+                ignore_set: ignore_set.dupe(),
                 root_config,
                 tenting_acl_provider,
-                paths.dice_state_path().as_ref(),
-            )
+                dice_state_path: paths.dice_state_path().as_ref(),
+                provider: dice_provider,
+                lifetime_guard: blocking_executor.lifetime_guard(),
+                memory_pressure: shared
+                    .memory_tracker
+                    .map(|tracker| tracker.memory_pressure()),
+            })
             .await?;
 
         let dep_file_cache = create_dep_file_cache();
@@ -758,6 +869,10 @@ impl TenantState {
         }
 
         let tags = vec![
+            format!(
+                "dice-sharing:{}",
+                init_ctx.daemon_startup_config.startup_options.share_dice
+            ),
             // TODO(scottcao): Delete this tag since now hash all commands is always enabled.
             "hash-all-commands:true".to_owned(),
             format!(
@@ -778,17 +893,6 @@ impl TenantState {
             format!("has-cgroup:{}", shared.memory_tracker.is_some()),
         ];
 
-        let dice_manager = ConcurrencyHandler::new(dice, root);
-        let eviction_gate = Arc::new(EvictionGate::default());
-        if let Some(memory_tracker) = shared.memory_tracker
-            && evicts_on_memory_pressure
-        {
-            crate::paging::spawn_evict_on_memory_pressure(
-                Arc::downgrade(&dice_manager),
-                eviction_gate.dupe(),
-                memory_tracker.memory_pressure(),
-            );
-        }
         let repo = Arc::new(RepoState {
             paths,
             file_watcher,
@@ -854,6 +958,8 @@ impl TenantState {
             repo,
             dice_manager,
             eviction_gate,
+            disk_ownership,
+            cancellation,
         }))
     }
 
@@ -914,24 +1020,31 @@ impl RepoState {
 
 /// Tenant states known to this daemon.
 ///
-/// The registry initially contains the tenant that started the daemon. Clients without an explicit
-/// tenant identity continue to use that initial tenant for protocol compatibility.
+/// Clients without an explicit identity may select the sole initialized tenant. Daemon status
+/// keeps the initial tenant's metadata without retaining its disk services.
 #[derive(Allocative)]
 struct TenantStateRegistry {
-    initial_tenant: TenantKey,
-    /// Stable handle for legacy single-repo callers. Registry entries are never replaced after
-    /// insertion, and the same allocation is accounted for through `tenants`.
+    /// Prefer the initial tenant for snapshots while it remains alive.
     #[allocative(skip)]
-    initial_state: Arc<TenantState>,
+    initial_state: Weak<TenantState>,
+    initial_metadata: TenantStatusMetadata,
+    #[allocative(skip)]
+    disk_owners: StdMutex<BuckMutMap<TenantKey, Weak<Semaphore>>>,
+    #[allocative(skip)]
+    dice_engines: StdMutex<Vec<Weak<Dice>>>,
     tenants: StdMutex<BuckMutMap<TenantKey, Arc<TenantStateSlot<TenantState>>>>,
     #[allocative(skip)]
     next_generation: AtomicU64,
+    #[allocative(skip)]
+    draining: AtomicBool,
 }
 
 struct TenantStateSlot<T: Allocative> {
     spec: TenantSpec,
     generation: u64,
     state: OnceCell<Arc<T>>,
+    disk_ownership: Arc<Semaphore>,
+    cancellation: Arc<CancellationScope>,
 }
 
 impl<T: Allocative> Allocative for TenantStateSlot<T> {
@@ -947,11 +1060,18 @@ impl<T: Allocative> Allocative for TenantStateSlot<T> {
 }
 
 impl<T: Allocative> TenantStateSlot<T> {
-    fn new(spec: TenantSpec, generation: u64) -> Self {
+    fn new(
+        spec: TenantSpec,
+        generation: u64,
+        disk_ownership: Arc<Semaphore>,
+        cancellation: Arc<CancellationScope>,
+    ) -> Self {
         Self {
             spec,
             generation,
             state: OnceCell::new(),
+            disk_ownership,
+            cancellation,
         }
     }
 
@@ -960,6 +1080,7 @@ impl<T: Allocative> TenantStateSlot<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = buck2_error::Result<Arc<T>>>,
     {
+        let _initialization = self.cancellation.register()?;
         self.state.get_or_try_init(init).await.map(Arc::clone)
     }
 
@@ -971,17 +1092,31 @@ impl<T: Allocative> TenantStateSlot<T> {
 impl TenantStateRegistry {
     async fn new(initial_tenant: Arc<TenantState>) -> buck2_error::Result<Self> {
         let spec = TenantSpec::from_tenant_paths(&initial_tenant.repo.paths);
-        let initial_key = spec.key().clone();
-        let registry = Self {
-            initial_tenant: initial_key,
-            initial_state: initial_tenant.dupe(),
-            tenants: StdMutex::new(BuckMutMap::default()),
-            next_generation: AtomicU64::new(1),
-        };
-        registry
-            .get_or_create(spec, || async { Ok(initial_tenant) })
-            .await?;
-        Ok(registry)
+        let disk_ownership = initial_tenant.disk_ownership.clone();
+        let entry = Arc::new(TenantStateSlot::new(
+            spec.clone(),
+            1,
+            disk_ownership.clone(),
+            initial_tenant.cancellation.clone(),
+        ));
+        entry
+            .state
+            .set(initial_tenant.clone())
+            .map_err(|_| buck2_error!(ErrorTag::Tier0, "Initial tenant slot should be empty"))?;
+        Ok(Self {
+            initial_state: Arc::downgrade(&initial_tenant),
+            initial_metadata: TenantStatusMetadata::new(&initial_tenant.repo),
+            tenants: StdMutex::new(BuckMutMap::from_iter([(spec.key().clone(), entry)])),
+            disk_owners: StdMutex::new(BuckMutMap::from_iter([(
+                spec.key().clone(),
+                Arc::downgrade(&disk_ownership),
+            )])),
+            dice_engines: StdMutex::new(vec![Arc::downgrade(
+                initial_tenant.dice_manager.unsafe_dice(),
+            )]),
+            next_generation: AtomicU64::new(2),
+            draining: AtomicBool::new(false),
+        })
     }
 
     async fn get_or_create<F, Fut>(
@@ -990,8 +1125,8 @@ impl TenantStateRegistry {
         create: F,
     ) -> buck2_error::Result<Arc<TenantState>>
     where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = buck2_error::Result<Arc<TenantState>>>,
+        F: FnOnce(Arc<Semaphore>, Arc<CancellationScope>) -> Fut + Send + 'static,
+        Fut: Future<Output = buck2_error::Result<Arc<TenantState>>> + Send + 'static,
     {
         let key = spec.key().clone();
         let requested_spec = spec.clone();
@@ -1000,11 +1135,33 @@ impl TenantStateRegistry {
                 .tenants
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.draining.load(Ordering::Acquire) {
+                return Err(buck2_error!(
+                    ErrorTag::Input,
+                    "The daemon is shutting down after its final tenant was evicted"
+                ));
+            }
             tenants
                 .entry(key.clone())
                 .or_insert_with(|| {
                     let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                    Arc::new(TenantStateSlot::new(spec, generation))
+                    let mut owners = self
+                        .disk_owners
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    owners.retain(|_, gate| gate.strong_count() != 0);
+                    let disk_ownership =
+                        owners.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                            let gate = Arc::new(Semaphore::new(1));
+                            owners.insert(key.clone(), Arc::downgrade(&gate));
+                            gate
+                        });
+                    Arc::new(TenantStateSlot::new(
+                        spec,
+                        generation,
+                        disk_ownership,
+                        Arc::new(CancellationScope::new()),
+                    ))
                 })
                 .clone()
         };
@@ -1016,9 +1173,24 @@ impl TenantStateRegistry {
             ));
         }
 
-        entry
+        let state = entry
             .get_or_try_init(|| async {
-                let state = create().await?;
+                let disk_ownership = entry.disk_ownership.clone();
+                let cancellation = entry.cancellation.clone();
+                let (initialize, _) =
+                    entry
+                        .cancellation
+                        .spawn(&Handle::current(), move |context| {
+                            context
+                                .critical_section(move || create(disk_ownership, cancellation))
+                                .boxed()
+                        });
+                let state = initialize.await.map_err(|error| {
+                    buck2_error!(
+                        ErrorTag::Input,
+                        "Tenant generation was evicted during initialization: {error}"
+                    )
+                })??;
                 let actual_key = TenantKey::from_tenant_paths(&state.repo.paths);
                 if actual_key != key {
                     return Err(buck2_error!(
@@ -1028,13 +1200,39 @@ impl TenantStateRegistry {
                         key
                     ));
                 }
+                let mut engines = self
+                    .dice_engines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                engines.retain(|engine| engine.strong_count() != 0);
+                engines.push(Arc::downgrade(state.dice_manager.unsafe_dice()));
                 Ok(state)
             })
-            .await
+            .await?;
+        let tenants = self
+            .tenants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !tenants
+            .get(&key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &entry))
+        {
+            return Err(buck2_error!(
+                ErrorTag::Input,
+                "Tenant generation was evicted during initialization"
+            ));
+        }
+        Ok(state)
     }
 
-    fn initial_tenant(&self) -> Arc<TenantState> {
-        self.initial_state.dupe()
+    fn status_tenant(&self) -> Option<Arc<TenantState>> {
+        self.initial_state.upgrade().or_else(|| {
+            self.tenants
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .find_map(|entry| entry.state.get().cloned())
+        })
     }
 
     fn legacy_tenant(&self) -> Option<Arc<TenantState>> {
@@ -1042,16 +1240,95 @@ impl TenantStateRegistry {
             .tenants
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        debug_assert!(
-            tenants
-                .get(&self.initial_tenant)
-                .is_some_and(|entry| entry.is_initialized())
-        );
         let initialized_tenant_count = tenants
             .values()
             .filter(|entry| entry.is_initialized())
             .count();
-        (initialized_tenant_count == 1).then(|| self.initial_state.dupe())
+        (initialized_tenant_count == 1)
+            .then(|| {
+                tenants
+                    .values()
+                    .find_map(|entry| entry.state.get().map(Arc::clone))
+            })
+            .flatten()
+    }
+
+    fn evict(&self, key: &TenantKey) -> Option<TenantEviction> {
+        let mut tenants = self
+            .tenants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = tenants.remove(key)?;
+        entry.cancellation.cancel();
+        if let Some(state) = entry.state.get() {
+            state.dice_manager.retire();
+        }
+        let final_tenant = tenants.is_empty();
+        if final_tenant {
+            self.draining.store(true, Ordering::Release);
+        }
+        Some(TenantEviction {
+            generation: entry.generation,
+            final_tenant,
+            completed: Self::finish_eviction(vec![entry]),
+        })
+    }
+
+    fn evict_project(
+        &self,
+        project_root: &AbsNormPath,
+        isolation: Option<&FileName>,
+    ) -> ProjectTenantEviction {
+        let mut tenants = self
+            .tenants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut generations = Vec::new();
+        let mut evicted = Vec::new();
+        tenants.retain(|key, entry| {
+            let matches = key.project_root() == project_root
+                && isolation.is_none_or(|isolation| key.isolation() == isolation);
+            if matches {
+                entry.cancellation.cancel();
+                evicted.push(entry.clone());
+                if let Some(state) = entry.state.get() {
+                    state.dice_manager.retire();
+                }
+                generations.push(entry.generation);
+            }
+            !matches
+        });
+        generations.sort_unstable();
+        let final_tenant = !generations.is_empty() && tenants.is_empty();
+        if final_tenant {
+            self.draining.store(true, Ordering::Release);
+        }
+        ProjectTenantEviction {
+            generations,
+            final_tenant,
+            completed: Self::finish_eviction(evicted),
+        }
+    }
+
+    fn finish_eviction(
+        entries: Vec<Arc<TenantStateSlot<TenantState>>>,
+    ) -> Shared<BoxFuture<'static, ()>> {
+        let scopes = entries
+            .iter()
+            .map(|entry| entry.cancellation.clone())
+            .collect::<Vec<_>>();
+        drop(entries);
+        let cleanup = tokio::spawn(async move {
+            futures::stream::iter(scopes)
+                .map(|scope| async move { scope.wait().await })
+                .buffer_unordered(16)
+                .collect::<Vec<_>>()
+                .await;
+        });
+        cleanup
+            .map(|result| result.expect("Tenant cancellation cleanup should finish"))
+            .boxed()
+            .shared()
     }
 
     fn list(&self) -> Vec<TenantStateInfo> {
@@ -1078,10 +1355,41 @@ impl TenantStateRegistry {
     }
 }
 
+#[derive(Allocative)]
+pub(crate) struct TenantStatusMetadata {
+    pub paths: TenantPaths,
+    pub io_provider: String,
+    pub trace_io_enabled: bool,
+    pub materializer_state_identity: Option<SqliteIdentity>,
+}
+
+impl TenantStatusMetadata {
+    fn new(repo: &RepoState) -> Self {
+        Self {
+            paths: repo.paths.clone(),
+            io_provider: repo.io.name().to_owned(),
+            trace_io_enabled: TracingIoProvider::from_io(&*repo.io).is_some(),
+            materializer_state_identity: repo.materializer_state_identity.clone(),
+        }
+    }
+}
+
 pub struct TenantStateInfo {
     pub key: TenantKey,
     pub generation: u64,
     pub initialized: bool,
+}
+
+pub struct TenantEviction {
+    pub generation: u64,
+    pub final_tenant: bool,
+    pub(crate) completed: Shared<BoxFuture<'static, ()>>,
+}
+
+pub struct ProjectTenantEviction {
+    pub generations: Vec<u64>,
+    pub final_tenant: bool,
+    pub(crate) completed: Shared<BoxFuture<'static, ()>>,
 }
 
 fn tenant_paths_from_client_context(
@@ -1207,25 +1515,32 @@ impl DaemonStateData {
 
     /// Select or initialize the tenant addressed by a client command.
     pub async fn tenant_for_client_context(
-        &self,
+        self: &Arc<Self>,
         client_context: &ClientContext,
     ) -> buck2_error::Result<Arc<TenantState>> {
         let Some(paths) = tenant_paths_from_client_context(client_context)? else {
             return self.tenant_for_legacy_client();
         };
         let spec = TenantSpec::from_tenant_paths(&paths);
+        let data = self.dupe();
 
         self.tenants
-            .get_or_create(spec, || {
-                self.tenant_state_factory
-                    .create(paths, self.repo_shared_services())
+            .get_or_create(spec, move |disk_ownership, cancellation| async move {
+                data.tenant_state_factory
+                    .create(
+                        paths,
+                        data.repo_shared_services(),
+                        disk_ownership,
+                        cancellation,
+                    )
+                    .await
             })
             .await
     }
 
     /// Select a tenant for an RPC added before requests carried a client context.
     pub async fn tenant_for_optional_client_context(
-        &self,
+        self: &Arc<Self>,
         client_context: Option<&ClientContext>,
     ) -> buck2_error::Result<Arc<TenantState>> {
         match client_context {
@@ -1243,9 +1558,58 @@ impl DaemonStateData {
         })
     }
 
-    /// The initial tenant for daemon-scoped operations whose protocol has no tenant identity.
-    pub fn initial_tenant(&self) -> Arc<TenantState> {
-        self.tenants.initial_tenant()
+    /// A live tenant for daemon snapshots that do not carry a tenant identity.
+    pub fn status_tenant(&self) -> Option<Arc<TenantState>> {
+        self.tenants.status_tenant()
+    }
+
+    pub(crate) fn initial_tenant_metadata(&self) -> &TenantStatusMetadata {
+        &self.tenants.initial_metadata
+    }
+
+    pub(crate) async fn wait_for_dice_idle(&self) {
+        let engines = self
+            .tenants
+            .dice_engines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        futures::stream::iter(engines)
+            .map(|dice| async move { dice.wait_for_idle().await })
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+    }
+
+    pub fn evict_tenant_for_client_context(
+        &self,
+        client_context: &ClientContext,
+    ) -> buck2_error::Result<Option<TenantEviction>> {
+        let paths = tenant_paths_from_client_context(client_context)?.ok_or_else(|| {
+            buck2_error!(
+                ErrorTag::Input,
+                "Tenant eviction requires an explicit tenant identity"
+            )
+        })?;
+        Ok(self.tenants.evict(&TenantKey::from_tenant_paths(&paths)))
+    }
+
+    pub fn evict_project_tenants_for_client_context(
+        &self,
+        client_context: &ClientContext,
+        isolation: Option<FileNameBuf>,
+    ) -> buck2_error::Result<ProjectTenantEviction> {
+        let paths = tenant_paths_from_client_context(client_context)?.ok_or_else(|| {
+            buck2_error!(
+                ErrorTag::Input,
+                "Repository tenant eviction requires an explicit tenant identity"
+            )
+        })?;
+        Ok(self
+            .tenants
+            .evict_project(paths.project_root().root(), isolation.as_deref()))
     }
 
     pub fn tenants(&self) -> Vec<TenantStateInfo> {
@@ -1254,7 +1618,10 @@ impl DaemonStateData {
 
     pub fn dice_dump(&self, path: &Path, format: DiceDumpFormat) -> buck2_error::Result<()> {
         crate::daemon::dice_dump::dice_dump(
-            self.initial_tenant().dice_manager.unsafe_dice(),
+            self.status_tenant()
+                .internal_error("No live tenant is available for DICE dump")?
+                .dice_manager
+                .unsafe_dice(),
             path,
             format,
         )
@@ -1407,7 +1774,7 @@ impl DaemonState {
             tracing::info!("Launching forkserver...");
             let forkserver = maybe_launch_forkserver(
                 root_config,
-                &invocation_paths.forkserver_state_dir(),
+                &invocation_paths.forkserver_state_dir(&daemon_id.to_string())?,
                 memory_tracker.as_ref().map(|m| &m.cgroup_tree),
                 &invocation_paths.isolation,
             )
@@ -1415,6 +1782,12 @@ impl DaemonState {
 
             let (init_ctx, daemon_originating_cgroup) = init_ctx.split();
             let tenant_state_factory = TenantStateFactory {
+                dice_provider: TenantDiceProvider::new(
+                    init_ctx.daemon_startup_config.startup_options.share_dice,
+                    invocation_paths
+                        .shared_dice_state_path(&daemon_id.to_string())?
+                        .to_path_buf(),
+                ),
                 fb,
                 init_ctx,
                 final_artifact_materialization,
@@ -1431,6 +1804,8 @@ impl DaemonState {
                         memory_tracker: memory_tracker.as_ref(),
                         daemon_id: &daemon_id,
                     },
+                    Arc::new(Semaphore::new(1)),
+                    Arc::new(CancellationScope::new()),
                 )
                 .await?;
 
@@ -1530,7 +1905,7 @@ impl DaemonState {
         self.validate_cwd()
             .buck_error_context("Error validating working directory")?;
 
-        self.validate_buck_out_mount(&repo)
+        self.validate_buck_out_mount(&repo.paths)
             .buck_error_context("Error validating buck-out mount")?;
 
         dispatcher.instant_event(buck2_data::TagEvent {
@@ -1594,14 +1969,14 @@ impl DaemonState {
         Ok(())
     }
 
-    pub fn validate_buck_out_mount(&self, repo: &RepoState) -> buck2_error::Result<()> {
+    pub fn validate_buck_out_mount(&self, paths: &TenantPaths) -> buck2_error::Result<()> {
         #[cfg(fbcode_build)]
         {
             use buck2_core::warn_user;
             use buck2_fs::error::IoResultExt;
             use buck2_fs::fs_util;
 
-            let project_root = repo.paths.project_root().root();
+            let project_root = paths.project_root().root();
             if !detect_eden::is_eden(project_root.to_path_buf())? {
                 return Ok(());
             }
@@ -1644,7 +2019,7 @@ impl DaemonState {
         }
         #[cfg(not(fbcode_build))]
         {
-            let _repo = repo;
+            let _paths = paths;
         }
 
         Ok(())
@@ -1758,7 +2133,12 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_entry_initializes_once() -> buck2_error::Result<()> {
-        let entry = TenantStateSlot::<usize>::new(tenant_spec(), 1);
+        let entry = TenantStateSlot::<usize>::new(
+            tenant_spec(),
+            1,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(CancellationScope::new()),
+        );
         let init_count = AtomicUsize::new(0);
         let first = entry.get_or_try_init(|| async {
             init_count.fetch_add(1, Ordering::Relaxed);
@@ -1780,7 +2160,12 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_entry_retries_failed_initialization() -> buck2_error::Result<()> {
-        let entry = TenantStateSlot::<usize>::new(tenant_spec(), 1);
+        let entry = TenantStateSlot::<usize>::new(
+            tenant_spec(),
+            1,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(CancellationScope::new()),
+        );
         let first = entry
             .get_or_try_init(|| async {
                 Err(buck2_error!(

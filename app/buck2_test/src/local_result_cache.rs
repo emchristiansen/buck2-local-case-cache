@@ -3074,11 +3074,16 @@ mod tests {
         );
         assert!(!fallback.omit_local_invocation_identity_env());
 
-        // An earlier classification failure gives back the same legacy request.
-        let args = vec![script, "module::case", "/etc/hostname"];
+        // An earlier classification failure gives back the same legacy request. Its operand is an
+        // existing host file outside the project and the store, made here: a system file such as
+        // `/etc/hostname` is not on every platform (macOS has none).
+        let host_file = project.root().as_path().with_extension("file");
+        std::fs::write(&host_file, "host").unwrap();
+        let args = vec![script, "module::case", host_file.to_str().unwrap()];
         let (earlier, case) = candidate().constrain(make(args.clone()), facts(), None, |_| true);
         assert!(case.is_err());
         assert_eq!(legacy_policy(&earlier), legacy_policy(&make(args)));
+        std::fs::remove_file(&host_file).unwrap();
         // Neither touched the store.
         assert!(!cache_root.exists());
     }

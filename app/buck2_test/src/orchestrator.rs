@@ -3706,6 +3706,7 @@ fn failure_exit_code(exit_code: Option<i32>) -> i32 {
 mod tests {
     use buck2_build_api::context::SetBuildContextData;
     use buck2_common::dice::cells::SetCellResolver;
+    use buck2_common::dice::data::SetIsolationDir;
     use buck2_common::dice::data::testing::SetTestingIoProvider;
     use buck2_common::file_ops::baseline::FileSystemBaseline;
     use buck2_common::file_ops::baseline::SetFileSystemBaseline;
@@ -3748,6 +3749,7 @@ mod tests {
             .build(UserComputationData::new())
             .await
             .unwrap();
+        dice.set_isolation_dir(fs.path().resolve(&buckout_path))?;
         dice.set_buck_out_path(Some(buckout_path))?;
         dice.set_cell_resolver(cell_resolver)?;
         dice.set_file_system_baseline(FileSystemBaseline::unique())?;
@@ -5476,6 +5478,7 @@ mod tests {
         use buck2_build_api::interpreter::rule_defs::register_rule_defs;
         use buck2_build_api::keep_going::HasKeepGoing;
         use buck2_build_api::spawner::BuckSpawner;
+        use buck2_common::dice::data::SetIsolationDir;
         use buck2_common::legacy_configs::configs::LegacyBuckConfig;
         use buck2_common::package_listing::listing::PackageListing;
         use buck2_common::package_listing::listing::testing::PackageListingExt;
@@ -5866,9 +5869,11 @@ mod tests {
                 },
             )?;
             std::fs::write(root.join("cell/.buckconfig"), "")?;
-            dice.set_buck_out_path(Some(ProjectRelativePathBuf::unchecked_new(
-                "buck-out/v2".to_owned(),
-            )))?;
+            // The tenant's isolation directory is an injected key; computing anything that reads
+            // the project root needs it, as in every other DICE fixture here.
+            let buckout_path = ProjectRelativePathBuf::unchecked_new("buck-out/v2".to_owned());
+            dice.set_isolation_dir(fs.path().resolve(&buckout_path))?;
+            dice.set_buck_out_path(Some(buckout_path))?;
             let dice = dice.commit().await;
 
             let key = TestExecutionKey {

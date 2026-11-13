@@ -153,6 +153,7 @@ message ClientContext {
   bool skip_targets_with_duplicate_names = 82;
   string trace_id = 9;
   bool reuse_current_config = 10;
+  bool reuse_current_config_implicitly = 85;
   optional string daemon_uuid = 11;
   repeated string sanitized_argv = 12;
   enum HostArchOverride {
@@ -888,6 +889,26 @@ message UnstableListTenantsResponse {
   repeated UnstableTenantInfo tenants = 1;
 }
 
+message EvictTenantRequest {
+  ClientContext context = 1;
+}
+
+message EvictTenantResponse {
+  bool evicted = 1;
+  uint64 generation = 2;
+  bool shutting_down = 3;
+}
+
+message EvictProjectTenantsRequest {
+  ClientContext context = 1;
+  optional string isolation = 2;
+}
+
+message EvictProjectTenantsResponse {
+  repeated uint64 generations = 1;
+  bool shutting_down = 2;
+}
+
 message UnstableDiceDumpRequest {
   enum DiceDumpFormat {
     TSV = 0;
@@ -1154,6 +1175,9 @@ service DaemonApi {
       returns (UnstableAllocatorStatsResponse);
   rpc Unstable_ListTenants(UnstableListTenantsRequest)
       returns (UnstableListTenantsResponse);
+  rpc EvictTenant(EvictTenantRequest) returns (EvictTenantResponse);
+  rpc EvictProjectTenants(EvictProjectTenantsRequest)
+      returns (EvictProjectTenantsResponse);
 
   /// Requests the daemon dump the DICE graph to a directory.
   rpc Unstable_DiceDump(UnstableDiceDumpRequest)
