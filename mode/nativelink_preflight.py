@@ -28,18 +28,28 @@ arguments. The checks:
   `-c`/`--config` except `test.use_internal_runner=true` (required for `test`), no indirect
   argument file (`@FILE`, `--flagfile FILE`, which buck2 expands before parsing), no
   validate.buckconfig, no local or preferring execution, no target-platform or modifier override;
-- mode/nativelink.buckconfig holds every setting of the mode, and the startup .buckconfig ignores
-  `prelude` (read only when the daemon starts, so no flag can repair it later);
+- mode/nativelink.buckconfig holds every setting of the mode and no startup setting, and the startup
+  .buckconfig ignores `prelude` (read only when the daemon starts, so no flag can repair it later);
+- the root .buckconfig.local is a regular file with exactly the bytes of
+  mode/nativelink-startup.buckconfig, and the startup configuration buck2 reads without any
+  command-line configuration (.buckconfig.d/common.buckconfig, .buckconfig, .buckconfig.local, as
+  the daemon reads it to build its remote execution client) holds every startup setting;
+- every daemon of the isolation read that startup configuration: a daemon keeps the remote
+  execution client it started with, and buck2 records nothing of it. So the first launch of an
+  isolation needs a new one (no daemon directory) and records the identity of the startup inputs
+  (.buck2/nativelink-startup/<isolation>.json); a later launch in it, a TEST after its BUILD or a
+  repeated TEST, needs that record with the same inputs, unchanged since, so that any daemon
+  started in between read exactly them;
 - .buck2/prelude-source resolves to a prelude whose tree digest (`--print-prelude-digest`) is the
   accepted one;
 - shim/nix/nix-manifest.json has the accepted sha256 and every root it names exists;
 - the environment the launcher inherits sets no BUCK* variable (buck2's configuration and
   test-injection variables, such as BUCK2_TEST_EXTRA_EXTERNAL_CONFIG);
-- no configuration input buck2 would read beyond mode/nativelink.buckconfig, .buckconfig and
-  .buckconfig.d/common.buckconfig: no .buckconfig.local in any cell, no other .buckconfig.d file,
-  no .buckconfig.d in another cell, no /etc or home buckconfig; the root cells are exactly the
-  split's; the exact bytes of mode/nativelink.buckconfig, .buckconfig and
-  .buckconfig.d/common.buckconfig have the accepted digest (`--print-config-digest`); the cells in
+- no configuration input buck2 would read beyond mode/nativelink.buckconfig, .buckconfig,
+  .buckconfig.d/common.buckconfig and the root .buckconfig.local: no .buckconfig.local in another
+  cell, no other .buckconfig.d file, no .buckconfig.d in another cell, no /etc or home buckconfig;
+  the root cells are exactly the split's; the exact bytes of those four inputs and of
+  mode/nativelink-startup.buckconfig have the accepted digest (`--print-config-digest`); the cells in
   effect after the mode applies are exactly the split's final map; and the nix_toolchains cell
   (shim/nix) has the accepted tree digest (`--print-prelude-digest shim/nix`);
 - the engine file has the accepted sha256, and so does the launcher's executable; a launcher that
@@ -56,6 +66,9 @@ import sys
 from pathlib import Path
 
 MODE_FILE = "mode/nativelink.buckconfig"
+# The startup settings' reviewed source, and the root project file a run copies it to.
+STARTUP_TEMPLATE = "mode/nativelink-startup.buckconfig"
+STARTUP_LOCAL = ".buckconfig.local"
 ENDPOINT = "grpc://127.0.0.1:50051"
 DETECTOR = (
     "target:root//...->shim//platforms:linux_x86_64 "
@@ -68,16 +81,30 @@ MODE_SETTINGS = {
     ("shim", "toolchain_mode"): "nativelink",
     ("build", "execution_platforms"): "shim//platforms:remote_linux",
     ("parser", "target_platform_detector_spec"): DETECTOR,
+}
+# Every setting the startup configuration must hold. buck2 reads these only from the root project
+# configuration with no command-line configuration: the daemon builds its remote execution client
+# from `BuckConfigBasedCells::parse_with_config_args(&fs, &[])` (buck2_server daemon/state.rs) and
+# the client its startup configuration the same way (buck2_client_ctx immediate_config.rs).
+STARTUP_SETTINGS = {
     ("buck2_re_client", "engine_address"): ENDPOINT,
     ("buck2_re_client", "action_cache_address"): ENDPOINT,
     ("buck2_re_client", "cas_address"): ENDPOINT,
     ("buck2_re_client", "tls"): "false",
     ("buck2", "digest_algorithms"): "SHA256",
 }
+# Sections read only at startup, so a setting of theirs in the mode file would have no effect.
+STARTUP_SECTIONS = {"buck2_re_client", "buck2", "buck2_resource_control"}
 # The root cell's project configuration: buck2 reads .buckconfig.d/*, then .buckconfig, then
 # .buckconfig.local (app/buck2_common/src/legacy_configs/path.rs). The only accepted inputs are
-# .buckconfig.d/common.buckconfig and .buckconfig; no .buckconfig.local.
+# .buckconfig.d/common.buckconfig, .buckconfig and the run's .buckconfig.local.
 ROOT_CONFIG_FOLDER = [".buckconfig.d/common.buckconfig"]
+# The startup configuration's files, in buck2's reading order, and where the first launch of an
+# isolation records their identity.
+STARTUP_INPUTS = [".buckconfig.d/common.buckconfig", ".buckconfig", STARTUP_LOCAL]
+STARTUP_RECORDS = ".buck2/nativelink-startup"
+# buck2 reserves isolation names with this prefix (buck2_common invocation_paths.rs).
+RESERVED_ISOLATION_PREFIX = "._buck2"
 # The cells those two files declare, exactly; the mode then overrides `prelude` and adds
 # `engine_prelude_source`.
 ROOT_CELLS = {
@@ -95,9 +122,15 @@ FINAL_CELLS = {
     "prelude": ".buck2/prelude-source",
     "engine_prelude_source": "prelude",
 }
-# The accepted configuration inputs, in the order buck2 reads them; `--config-sha256` binds their
-# exact bytes (`--print-config-digest`).
-CONFIG_INPUTS = [".buckconfig.d/common.buckconfig", ".buckconfig", MODE_FILE]
+# The accepted configuration inputs, in the order buck2 reads them, and the startup settings'
+# reviewed source; `--config-sha256` binds their exact bytes (`--print-config-digest`).
+CONFIG_INPUTS = [
+    ".buckconfig.d/common.buckconfig",
+    ".buckconfig",
+    STARTUP_LOCAL,
+    MODE_FILE,
+    STARTUP_TEMPLATE,
+]
 # External configuration buck2 also reads (path.rs DEFAULT_EXTERNAL_CONFIG_SOURCES): none may exist.
 EXTERNAL_CONFIG = [
     "/etc/buckconfig.d",
@@ -191,8 +224,9 @@ def config_digest(root: Path) -> str:
     return hashlib.sha256("".join(lines).encode()).hexdigest()
 
 
-def argument_problems(args: list[str]) -> list[str]:
-    """Why the buck2 arguments are not a complete NativeLink mode BUILD or TEST."""
+def argument_problems(args: list[str]) -> tuple[list[str], str | None]:
+    """Why the buck2 arguments are not a complete NativeLink mode BUILD or TEST, and the isolation
+    directory they name."""
     problems = []
     subcommand = None
     config_files = []
@@ -238,6 +272,8 @@ def argument_problems(args: list[str]) -> list[str]:
         problems.append(f"the buck2 subcommand is {subcommand!r}, not build or test")
     if not isolation:
         problems.append("--isolation-dir is missing")
+    else:
+        problems += isolation_problems(isolation)
     if "--remote-only" not in args:
         problems.append("--remote-only is missing")
     normalized = [os.path.normpath(f) for f in config_files]
@@ -248,7 +284,19 @@ def argument_problems(args: list[str]) -> list[str]:
     expected_configs = [INTERNAL_RUNNER] if subcommand == "test" else []
     if configs != expected_configs:
         problems.append(f"-c/--config must be exactly {expected_configs!r}, but it is {configs!r}")
-    return problems
+    return problems, isolation
+
+
+def isolation_problems(isolation: str) -> list[str]:
+    """Why buck2 would refuse `isolation` as an isolation directory name, by its own rules: not
+    reserved (buck2/src/lib.rs `parse_isolation_dir`), and a single file name, not `.`, `..` or
+    anything with a slash or backslash (buck2_fs file_name.rs `verify_file_name`). The name is
+    checked as given, never normalized, since it also names this entry's own record."""
+    if isolation.startswith(RESERVED_ISOLATION_PREFIX):
+        return [f"--isolation-dir {isolation!r} starts with {RESERVED_ISOLATION_PREFIX!r}, which buck2 reserves"]
+    if isolation in (".", "..") or "/" in isolation or "\\" in isolation:
+        return [f"--isolation-dir {isolation!r} is not a single directory name"]
+    return []
 
 
 def environment_problems(environ) -> list[str]:
@@ -276,14 +324,26 @@ def input_problems(root: Path) -> list[str]:
     found = sorted(f".buckconfig.d/{p.name}" for p in folder.iterdir()) if folder.is_dir() else []
     if found != ROOT_CONFIG_FOLDER:
         problems.append(f".buckconfig.d must hold exactly {ROOT_CONFIG_FOLDER}, but it holds {found}")
-    if os.path.lexists(root / ".buckconfig.local"):
-        problems.append(".buckconfig.local exists: buck2 would read it, and it is not an accepted input")
+    template = root / STARTUP_TEMPLATE
+    local = root / STARTUP_LOCAL
+    if not template.is_file():
+        problems.append(f"{STARTUP_TEMPLATE} is missing")
+    elif not os.path.lexists(local):
+        problems.append(
+            f"{STARTUP_LOCAL} is missing: the run's startup settings are a copy of {STARTUP_TEMPLATE}"
+        )
+    elif not stat.S_ISREG(local.lstat().st_mode):
+        problems.append(f"{STARTUP_LOCAL} is not a regular file")
+    elif local.read_bytes() != template.read_bytes():
+        problems.append(f"{STARTUP_LOCAL} is not exactly {STARTUP_TEMPLATE}")
     if problems:
         return problems
     try:
         mode = read_buckconfig(mode_path)
+        # The startup configuration, as the daemon reads it with no command-line configuration.
         startup = read_buckconfig(root / ".buckconfig.d/common.buckconfig")
         startup.update(read_buckconfig(root / ".buckconfig"))
+        startup.update(read_buckconfig(local))
     except IncludeRefused as e:
         return [str(e)]
     cells = {key: value for (section, key), value in startup.items() if section == "cells"}
@@ -302,6 +362,18 @@ def input_problems(root: Path) -> list[str]:
         found = mode.get((section, key))
         if found != value:
             problems.append(f"{MODE_FILE} needs {section}.{key} = {value}, but it is {found!r}")
+    for section, key in sorted(mode):
+        if section in STARTUP_SECTIONS:
+            problems.append(
+                f"{MODE_FILE} sets {section}.{key}, which buck2 reads only at startup, so it would "
+                "have no effect"
+            )
+    for (section, key), value in STARTUP_SETTINGS.items():
+        found = startup.get((section, key))
+        if found != value:
+            problems.append(
+                f"the startup configuration needs {section}.{key} = {value}, but it is {found!r}"
+            )
     ignored = [p.strip() for p in startup.get(("project", "ignore"), "").split(",")]
     if "prelude" not in ignored:
         problems.append(".buckconfig project.ignore does not list prelude")
@@ -353,9 +425,14 @@ def main(argv: list[str]) -> int:
     launcher, buck2_args = command[:count], command[count:]
     if len(launcher) != count or not launcher:
         return report([f"the command has fewer than {count} launcher words"])
-    problems += argument_problems(buck2_args)
+    argument_issues, isolation = argument_problems(buck2_args)
+    problems += argument_issues
     problems += environment_problems(os.environ)
     problems += input_problems(root)
+    first_launch = None
+    if isolation and not problems:
+        first_launch, startup_problems = startup_qualification(root, isolation, wanted["--config-sha256"])
+        problems += startup_problems
 
     prelude_link = root / ".buck2/prelude-source"
     if not prelude_link.is_dir():
@@ -428,7 +505,79 @@ def main(argv: list[str]) -> int:
     )
     if check_only:
         return 0
+    if first_launch is not None:
+        record, identity = first_launch
+        try:
+            write_record(root, record, identity)
+        except OSError as e:
+            return report([f"the startup record {record} could not be written: {e}"])
     os.execvp(command[0], command)
+
+
+def record_location_problems(root: Path, record: Path) -> list[str]:
+    """Why the startup record's directories or file could lead outside the run's tree: each of
+    .buck2 and .buck2/nativelink-startup must be a real directory if it exists, and the record a
+    regular file if it exists, never a link."""
+    problems = []
+    for path in (root / ".buck2", root / STARTUP_RECORDS):
+        if os.path.lexists(path) and not stat.S_ISDIR(path.lstat().st_mode):
+            problems.append(f"{path} is not a directory (a link is refused)")
+    if not problems and os.path.lexists(record) and not stat.S_ISREG(record.lstat().st_mode):
+        problems.append(f"the startup record {record} is not a regular file (a link is refused)")
+    return problems
+
+
+def write_record(root: Path, record: Path, identity: dict) -> None:
+    """Write the startup record inside the run's tree, following no link."""
+    for path in (root / ".buck2", root / STARTUP_RECORDS):
+        try:
+            path.mkdir()
+        except FileExistsError:
+            pass
+        if not stat.S_ISDIR(path.lstat().st_mode):
+            raise OSError(f"{path} is not a directory")
+    fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(identity, indent=2, sort_keys=True) + "\n")
+
+
+def startup_identity(root: Path, config_sha256: str) -> dict:
+    """What identifies the startup inputs: the accepted configuration digest, and each file's
+    device, inode, change time and size. A write or replacement changes the change time."""
+    files = {}
+    for name in STARTUP_INPUTS:
+        st = (root / name).stat()
+        files[name] = [st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size]
+    return {"config_sha256": config_sha256, "files": files}
+
+
+def startup_qualification(root: Path, isolation: str, config_sha256: str):
+    """Whether every daemon of `isolation` read the checked startup configuration. Returns the
+    record to write before a first launch (or None) and the problems."""
+    # buck2's daemon directory for this project and isolation (buck2_common invocation_paths.rs
+    # `daemon_dir`): `$HOME/.buck/buckd/<project root>/<isolation>`.
+    daemon_dir = Path.home() / ".buck/buckd" / root.relative_to(root.anchor) / isolation
+    record = root / STARTUP_RECORDS / f"{isolation}.json"
+    location = record_location_problems(root, record)
+    if location:
+        return None, location
+    identity = startup_identity(root, config_sha256)
+    if not os.path.lexists(daemon_dir):
+        return (record, identity), []
+    try:
+        fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            recorded = json.loads(f.read())
+    except (OSError, ValueError):
+        recorded = None
+    if recorded != identity:
+        return None, [
+            f"the isolation {isolation!r} already has a daemon directory ({daemon_dir}) but no "
+            f"record that its daemons read these startup inputs, unchanged since its first launch "
+            f"({record}); a daemon keeps the startup configuration it began with, so use a new "
+            "isolation"
+        ]
+    return None, []
 
 
 def report(problems: list[str]) -> int:

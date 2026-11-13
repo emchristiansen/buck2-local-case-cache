@@ -354,6 +354,8 @@ mod tests {
         FreshDirs::for_stage(&target(target_name), stage, names.iter().copied(), fs, None).unwrap()
     }
 
+    // A scratch root exists only where the host store does (`validate_scratch_root`).
+    #[cfg(unix)]
     fn owned(
         fs: &ArtifactFs,
         target_name: &str,
@@ -466,11 +468,19 @@ mod tests {
             scratch.starts_with(&temp.path().root().to_string()),
             "{scratch}"
         );
+        // Each directory joins the scratch path with the host's own separator.
+        let dir = |name: &str| {
+            std::path::Path::new(&scratch)
+                .join(name)
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
         assert_eq!(
             a.values().unwrap(),
             vec![
-                ("FRESH_A".to_owned(), format!("{scratch}/0")),
-                ("FRESH_B".to_owned(), format!("{scratch}/1")),
+                ("FRESH_A".to_owned(), dir("0")),
+                ("FRESH_B".to_owned(), dir("1")),
             ]
         );
         assert_eq!(
@@ -613,7 +623,9 @@ mod tests {
     }
 
     /// With a scratch root, each case's scratch path is a 16-digit directory of the root, with
-    /// the same layout inside; the same case of another project gets another one.
+    /// the same layout inside; the same case of another project gets another one. A scratch root
+    /// exists only on Linux and macOS, as the host store does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_scratch_root_gives_each_case_of_each_project_a_short_directory_of_its_own() {
         let dir = TempDir::new();
@@ -651,6 +663,7 @@ mod tests {
     }
 
     /// Admission accepts exactly the engine's own owned scratch path, with no scratch input.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn admits_only_the_engines_own_owned_scratch_path() {
         let temp = ProjectRootTemp::new().unwrap();
@@ -673,6 +686,21 @@ mod tests {
         assert!(!buck_out.admits(
             &request_for(&fs, &buck_out, vec![]).with_owned_scratch_path(a.owned_scratch_path())
         ));
+    }
+
+    /// Elsewhere, as for the host store, any configured scratch root is refused.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_scratch_root_is_refused_where_the_host_store_is_unsupported() {
+        let dir = TempDir::new();
+        let Err(e) = scratch_root(&dir.path("r")) else {
+            panic!("a scratch root was accepted");
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("[test] local_case_scratch_root is supported only on Linux and macOS"),
+            "{e}"
+        );
     }
 
     /// The scratch root is validated as the store's root is: absolute and canonical, every

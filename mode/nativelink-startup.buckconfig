@@ -1,0 +1,25 @@
+# The explicit workstation NativeLink mode's startup settings: the remote execution client's
+# endpoint and digest. buck2 reads these only from the root cell's project configuration, with no
+# command-line configuration: the daemon builds its remote execution client from
+# `BuckConfigBasedCells::parse_with_config_args(&fs, &[])` (app/buck2_server/src/daemon/state.rs),
+# so a `--config-file` such as mode/nativelink.buckconfig cannot set them.
+#
+# A NativeLink run therefore copies this file, byte for byte, to the root `.buckconfig.local` of
+# its own runtime tree (RUN-NATIVELINK-SPLIT.md). That file is ignored by git and absent from the
+# published tree, so the upstream-compatible default configures no remote execution: with a CAS
+# configured, buck2 would ask it before every `download_file` and for some writes and copies.
+# mode/nativelink_preflight.py refuses to launch unless `.buckconfig.local` is exactly this file.
+# A running daemon keeps the client it started with, so the preflight also binds each isolation's
+# daemons to these startup inputs: the first launch in an isolation needs it to have no daemon yet
+# and records the inputs; a later launch there may reuse its daemon only while the record still
+# matches them, and is refused if they were replaced since.
+#
+# The endpoint is the workstation's NativeLink service, as in Muninn's recv-v2/ws/.buckconfig.
+[buck2_re_client]
+engine_address = grpc://127.0.0.1:50051
+action_cache_address = grpc://127.0.0.1:50051
+cas_address = grpc://127.0.0.1:50051
+tls = false
+
+[buck2]
+digest_algorithms = SHA256

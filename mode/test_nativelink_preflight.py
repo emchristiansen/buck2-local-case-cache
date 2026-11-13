@@ -9,7 +9,8 @@
 
 """Tests of mode/nativelink_preflight.py: `python3 -m unittest mode/test_nativelink_preflight.py`.
 
-Each test builds a small project with the real mode file and startup config, a prelude, a manifest
+Each test builds a small project with the real mode file, startup config and startup file (the
+root .buckconfig.local a run copies from mode/nativelink-startup.buckconfig), a prelude, a manifest
 whose roots exist, and an engine. The complete invocation passes; every omission, partial mode,
 wrong pin or wrong input is refused, and the launcher never runs.
 """
@@ -18,6 +19,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +40,8 @@ class Project:
         self.root = base / "project"
         (self.root / "mode").mkdir(parents=True)
         shutil.copy(TREE / "mode/nativelink.buckconfig", self.root / "mode")
+        shutil.copy(TREE / "mode/nativelink-startup.buckconfig", self.root / "mode")
+        shutil.copy(TREE / "mode/nativelink-startup.buckconfig", self.root / ".buckconfig.local")
         shutil.copy(TREE / ".buckconfig", self.root)
         (self.root / ".buckconfig.d").mkdir()
         shutil.copy(TREE / ".buckconfig.d/common.buckconfig", self.root / ".buckconfig.d")
@@ -77,6 +81,13 @@ class Project:
             capture_output=True,
             text=True,
         ).stdout.strip()
+
+    def daemon_dir(self, isolation: str = "nl") -> Path:
+        """Where buck2 keeps the daemon of this project and isolation, under the test's home."""
+        return self.home / ".buck/buckd" / self.root.relative_to(self.root.anchor) / isolation
+
+    def record(self, isolation: str = "nl") -> Path:
+        return self.root / ".buck2/nativelink-startup" / f"{isolation}.json"
 
     def env(self, **extra) -> dict[str, str]:
         # The caller's own BUCK* variables would be refused; each test sets the ones it means.
@@ -200,8 +211,10 @@ class NativeLinkPreflightTest(unittest.TestCase):
 
     def test_a_partial_mode_file_or_startup_config_is_refused(self):
         mode = self.project.root / "mode/nativelink.buckconfig"
-        mode.write_text(mode.read_text().replace("tls = false", "tls = true"))
-        self.refused(BUILD, "needs buck2_re_client.tls = false, but it is 'true'")
+        original = mode.read_text()
+        mode.write_text(original.replace("toolchain_mode = nativelink", "toolchain_mode = other"))
+        self.refused(BUILD, "needs shim.toolchain_mode = nativelink, but it is 'other'")
+        mode.write_text(original)
         startup = self.project.root / ".buckconfig"
         startup.write_text(startup.read_text().replace(", \\\n    prelude", ""))
         self.refused(BUILD, "project.ignore does not list prelude")
@@ -218,16 +231,17 @@ class NativeLinkPreflightTest(unittest.TestCase):
             path.write_text(original)
 
     def test_other_configuration_inputs_are_refused(self):
-        # CI-MODE-CONFIG-01: buck2 reads .buckconfig.local after .buckconfig, so either of these
-        # would change the mode's cells or startup ignore without any flag.
+        # CI-MODE-CONFIG-01: buck2 reads .buckconfig.local after .buckconfig, so anything but the
+        # startup file there would change the mode's cells or startup ignore without any flag.
         root = self.project.root
         (root / "unaccepted-tools").mkdir()
         local = root / ".buckconfig.local"
+        template = (root / "mode/nativelink-startup.buckconfig").read_text()
         for content in ("[cells]\nnix_toolchains = unaccepted-tools\n", "[project]\nignore =\n"):
-            local.write_text(content)
+            local.write_text(template + content)
             for args in (BUILD, TEST):
-                self.refused(args, ".buckconfig.local exists")
-        local.unlink()
+                self.refused(args, ".buckconfig.local is not exactly mode/nativelink-startup.buckconfig")
+        local.write_text(template)
         extra = root / ".buckconfig.d/other.buckconfig"
         extra.write_text("[cells]\nnix_toolchains = unaccepted-tools\n")
         self.refused(BUILD, ".buckconfig.d must hold exactly ['.buckconfig.d/common.buckconfig']")
@@ -247,6 +261,137 @@ class NativeLinkPreflightTest(unittest.TestCase):
         (self.project.home / ".buckconfig.local").unlink()
         code, stderr = self.project.run(BUILD)
         self.assertEqual(code, 0, stderr)
+
+    def test_the_startup_file_must_be_exactly_the_template(self):
+        # The daemon reads the remote execution client's settings only from the root project
+        # configuration, never from --config-file, so they come from the run's .buckconfig.local.
+        root = self.project.root
+        local = root / ".buckconfig.local"
+        template = root / "mode/nativelink-startup.buckconfig"
+        original = template.read_text()
+        local.unlink()
+        for args in (BUILD, TEST):
+            self.refused(args, ".buckconfig.local is missing")
+        local.write_text(original.replace("grpc://127.0.0.1:50051", "grpc://127.0.0.1:1", 1))
+        self.refused(BUILD, ".buckconfig.local is not exactly mode/nativelink-startup.buckconfig")
+        local.unlink()
+        local.symlink_to("mode/nativelink-startup.buckconfig")
+        self.refused(BUILD, ".buckconfig.local is not a regular file")
+        local.unlink()
+        # A wrong endpoint in both the template and its copy: the root reader sees it, and the
+        # configuration digest no longer matches.
+        wrong = original.replace("engine_address = grpc://127.0.0.1:50051", "engine_address = grpc://127.0.0.1:1")
+        template.write_text(wrong)
+        local.write_text(wrong)
+        self.refused(BUILD, "the startup configuration needs buck2_re_client.engine_address = grpc://127.0.0.1:50051")
+        self.refused(BUILD, "have digest")
+        template.write_text(original)
+        local.write_text(original)
+        code, stderr = self.project.run(BUILD)
+        self.assertEqual(code, 0, stderr)
+
+    def test_startup_settings_in_the_mode_file_are_refused(self):
+        # The startup settings moved into the mode file would have no effect there.
+        root = self.project.root
+        mode = root / "mode/nativelink.buckconfig"
+        template = root / "mode/nativelink-startup.buckconfig"
+        local = root / ".buckconfig.local"
+        mode_text, startup_text = mode.read_text(), template.read_text()
+        for extra in (
+            "[buck2_re_client]\nengine_address = grpc://127.0.0.1:50051\n",
+            "[buck2]\ndigest_algorithms = SHA256\n",
+            "[buck2_resource_control]\nstatus = off\n",
+        ):
+            mode.write_text(mode_text + "\n" + extra)
+            section_key = extra.split("]")[0][1:] + "." + extra.split("\n")[1].split(" =")[0]
+            self.refused(BUILD, f"sets {section_key}, which buck2 reads only at startup")
+        # Moved out of the root: the startup file without them, the mode file with them.
+        mode.write_text(mode_text + "\n" + startup_text)
+        emptied = "# no startup settings\n"
+        template.write_text(emptied)
+        local.write_text(emptied)
+        self.refused(TEST, "the startup configuration needs buck2_re_client.engine_address")
+        self.refused(TEST, "which buck2 reads only at startup")
+        mode.write_text(mode_text)
+        template.write_text(startup_text)
+        local.write_text(startup_text)
+        code, stderr = self.project.run(TEST)
+        self.assertEqual(code, 0, stderr)
+
+    def test_an_isolation_s_daemons_must_have_read_the_bound_startup_inputs(self):
+        project = self.project
+        daemon, record = project.daemon_dir(), project.record()
+        # A check does not start a daemon, so it records nothing.
+        code, stderr = project.run(BUILD, extra=["--check-only"])
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse(record.exists())
+        # An existing daemon with no record of what it read is refused.
+        daemon.mkdir(parents=True)
+        for args in (BUILD, TEST):
+            self.refused(args, "already has a daemon directory")
+        daemon.rmdir()
+        # A first launch in a new isolation records the startup inputs; the daemon it starts then
+        # serves the TEST after the BUILD and a repeated TEST.
+        code, stderr = project.run(BUILD)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(record.exists())
+        daemon.mkdir(parents=True)
+        for args in (TEST, TEST):
+            project.ran.unlink(missing_ok=True)
+            code, stderr = project.run(args)
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(project.ran.exists())
+        # A startup input replaced since the first launch, even by the same bytes, could have
+        # been read differently by a daemon started meanwhile.
+        local = project.root / ".buckconfig.local"
+        replacement = project.root / "replacement"
+        replacement.write_bytes(local.read_bytes())
+        replacement.replace(local)
+        project.ran.unlink()
+        self.refused(TEST, "already has a daemon directory")
+        # Another isolation is new, and qualifies afresh.
+        other = [a if a != "nl" else "nl2" for a in TEST]
+        code, stderr = project.run(other)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(project.record("nl2").exists())
+
+    def test_an_isolation_name_buck2_refuses_is_refused_before_any_write(self):
+        # The isolation name also names the entry's own record, so a name buck2 would refuse is
+        # refused before anything is written or launched, and is never normalized.
+        project = self.project
+        outside = self.base / "outside"
+        outside.mkdir()
+        before = sorted(p.relative_to(self.base) for p in self.base.rglob("*"))
+        for bad in ("../outside/x", str(outside / "x"), ".", "..", "a/b", "a\\b", "._buck2-x"):
+            for args in (BUILD, TEST):
+                bad_args = [bad if a == "nl" else a for a in args]
+                self.refused(bad_args, f"--isolation-dir {bad!r}")
+        self.assertEqual(sorted(p.relative_to(self.base) for p in self.base.rglob("*")), before)
+        self.assertFalse((project.root / ".buck2/nativelink-startup").exists())
+
+    def test_the_startup_record_is_never_written_through_a_link(self):
+        project = self.project
+        outside = self.base / "outside"
+        outside.mkdir()
+        records = project.root / ".buck2/nativelink-startup"
+        # The records directory as a link leading outside the tree.
+        records.symlink_to(outside)
+        for args in (BUILD, TEST):
+            self.refused(args, "is not a directory (a link is refused)")
+        self.assertEqual(list(outside.iterdir()), [])
+        records.unlink()
+        # The record itself as a link to a file outside the tree.
+        records.mkdir()
+        target = outside / "target"
+        target.write_text("unchanged\n")
+        (records / "nl.json").symlink_to(target)
+        for args in (BUILD, TEST):
+            self.refused(args, "is not a regular file (a link is refused)")
+        self.assertEqual(target.read_text(), "unchanged\n")
+        (records / "nl.json").unlink()
+        code, stderr = project.run(BUILD)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(stat.S_ISREG((records / "nl.json").lstat().st_mode))
 
     def test_a_cell_the_mode_file_redirects_is_refused(self):
         # CI-MODE-CONFIG-01, effective-cell class: buck2 applies the mode after the startup

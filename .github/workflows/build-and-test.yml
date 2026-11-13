@@ -105,3 +105,11 @@ jobs:
     - name: Run the tests
       run: python3 test.py --ci --git --test-only
       shell: bash
+      # Turn off libtest's output capture and have the default panic hook print a backtrace, so a
+      # test that never finishes still shows what it wrote to the captured streams, and where a
+      # panic the default hook reports happened. RUST_LIB_BACKTRACE=0 keeps ordinary library
+      # backtrace capture (std's Backtrace::capture, which anyhow uses) off, as it is without them.
+      env:
+        RUST_TEST_NOCAPTURE: "1"
+        RUST_BACKTRACE: "1"
+        RUST_LIB_BACKTRACE: "0"
