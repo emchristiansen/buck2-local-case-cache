@@ -375,12 +375,15 @@ mod tests {
     }
 
     /// A new directory under the temporary directory, with a short name, removed when dropped.
+    /// It is spelled through the temporary directory's canonical path, since a scratch root is
+    /// validated like the result root, which refuses a symlinked ancestor such as macOS's `/var`.
     struct TempDir(std::path::PathBuf);
 
     impl TempDir {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let path = base.join(format!(
                 "b2s{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

@@ -716,16 +716,22 @@ mod tests {
         assert!(e.contains("PATH is unset"), "{e}");
         let e = plan(&t, &root, &[&sh, script], &[path_env, ("LD_PRELOAD", "x")]).unwrap_err();
         assert!(e.contains("LD_PRELOAD"), "{e}");
-        let e = plan(&t, &root, &[&sh, script, "/etc/hostname"], &[path_env]).unwrap_err();
-        assert!(e.contains("/etc/hostname"), "{e}");
+        // An existing host file outside the project and the store, made here: a system file
+        // such as `/etc/hostname` is not on every platform (macOS has none).
+        let host_file = root.with_extension("file");
+        std::fs::write(&host_file, "host").unwrap();
+        let host_file = host_file.to_str().unwrap();
+        let e = plan(&t, &root, &[&sh, script, host_file], &[path_env]).unwrap_err();
+        assert!(e.contains(host_file), "{e}");
+        let assignment = format!("x={host_file}");
         let e = plan(
             &t,
             &root,
             &[&sh, script],
-            &[path_env, ("F", "x=/etc/hostname")],
+            &[path_env, ("F", assignment.as_str())],
         )
         .unwrap_err();
-        assert!(e.contains("/etc/hostname"), "{e}");
+        assert!(e.contains(host_file), "{e}");
         // Values naming nothing that exists are not file operands.
         assert!(
             plan(

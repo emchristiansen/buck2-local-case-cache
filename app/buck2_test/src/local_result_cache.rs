@@ -2119,12 +2119,15 @@ mod tests {
 
     use super::*;
 
-    /// A private, test-owned store root under the process temporary directory.
+    /// A private, test-owned store root under the process temporary directory, spelled through
+    /// its canonical path: the root contract refuses a symlinked ancestor, such as macOS's `/var`
+    /// (a link to `private/var`) above `$TMPDIR`.
     struct Root(PathBuf);
 
     impl Root {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
+            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let path = base.join(format!(
                 "buck2-local-case-{name}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
