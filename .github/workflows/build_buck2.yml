@@ -17,6 +17,10 @@ env:
   # compiles the workspace crates from scratch and incremental compilation only
   # costs time and disk.
   CARGO_INCREMENTAL: 0
+  # This workflow installs the pinned nightly without setup_rust_toolchain.
+  CARGO_UNSTABLE_MIN_PUBLISH_AGE: "true"
+  CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE: "14 days"
+  CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: "deny"
 
 jobs:
   get_prelude_hash:
