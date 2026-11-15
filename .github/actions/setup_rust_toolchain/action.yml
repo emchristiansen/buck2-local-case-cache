@@ -16,3 +16,10 @@ runs:
     with:
       toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
       components: ${{ inputs.components }}
+  # Keep this outside autocargo's generated Cargo configuration.
+  - name: Set Cargo registry publish-age policy
+    shell: bash
+    run: |
+      echo 'CARGO_UNSTABLE_MIN_PUBLISH_AGE=true' >> "$GITHUB_ENV"
+      echo 'CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE=14 days' >> "$GITHUB_ENV"
+      echo 'CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=deny' >> "$GITHUB_ENV"
