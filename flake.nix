@@ -37,6 +37,10 @@
       packages.ci-test-shell = pkgs.bashNonInteractive;
 
       devShells.default = pkgs.mkShell {
+        # The pinned nightly requires explicit activation of publish-age filtering.
+        CARGO_UNSTABLE_MIN_PUBLISH_AGE = "true";
+        CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = "14 days";
+        CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = "deny";
         buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux ([
           pkgs.mold
         ]) ++ [
