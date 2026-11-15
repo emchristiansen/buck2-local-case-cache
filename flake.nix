@@ -10,7 +10,8 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+      # The previous lock predates the nightly selected by rust-toolchain.toml.
+      url = "github:oxalica/rust-overlay/5b87ee0513c29127a01ad06e9cb362ea5ce91e78";
       inputs = {
         nixpkgs.follows = "nixpkgs";
       };
@@ -31,6 +32,10 @@
 
     in {
       devShells.default = pkgs.mkShell {
+        # The pinned nightly requires explicit activation of publish-age filtering.
+        CARGO_UNSTABLE_MIN_PUBLISH_AGE = "true";
+        CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE = "14 days";
+        CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE = "deny";
         buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux ([
           pkgs.mold
         ]) ++ [
