@@ -79,6 +79,16 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
                 `CARGO_BIN_EXE_*` into `env` or `run_env`.
             """,
         ),
+        "extra_resources": attrs.list(
+            attrs.source(),
+            default = [],
+            doc = """
+                Files outside the target's package that the test reads at run
+                time, as labels. Each is an input of the test action at its
+                own path: a source file (e.g. an `export_file` with
+                `mode = "reference"`) at its project path.
+            """,
+        ),
         "cargo_manifest_dir": attrs.option(
             attrs.string(),
             default = None,
@@ -130,8 +140,8 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
     return env
 
 def _source_inputs(ctx: AnalysisContext) -> cmd_args:
-    """The target's source files as hidden inputs of its test command."""
-    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source])
+    """The target's source files and extra resources as hidden inputs of its test command."""
+    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ctx.attrs.extra_resources)
 
 def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[typing.Any]):
     """The test's runtime entries and the runner options naming its path entries.
