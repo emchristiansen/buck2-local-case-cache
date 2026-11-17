@@ -101,6 +101,14 @@ class WrapperTest(unittest.TestCase):
         self.assertNotIn("--env-set", record["compiler_file"])
         self.assertEqual(record["env"]["HEAD"], "x")
 
+    def test_env_set_values_are_unescaped_like_env_values(self):
+        code, record, _ = self.run_wrapper(
+            ["--crate-name", "example", "--env-set=HEAD=a\\nb\\r\\n\\\\c\\u00e9\\x22"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(record["env"]["HEAD"], "a\nb\r\n\\c\u00e9\"")
+        self.assertNotIn("--env-set", record["compiler_file"])
+
     def test_empty_tail_emits_separator(self):
         code, record, _ = self.run_wrapper(
             ["--crate-name", "example", "--program-args"]

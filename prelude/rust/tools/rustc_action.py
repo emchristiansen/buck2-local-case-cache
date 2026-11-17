@@ -538,9 +538,11 @@ async def main() -> int:  # noqa: C901
         # during the execution of the rustc subprocess. Our handling of Cargo
         # build scripts relies on `--env-set` as the implementation of "cargo:rustc-env".
         # Tracking issue: https://github.com/rust-lang/rust/issues/118372
+        # The value is escaped like an `--env` value, so a line break or other byte that cannot
+        # sit on one argfile line travels intact; decode it the same way.
         if arg.startswith("--env-set="):
             flag, key, value = arg.split("=", 2)
-            env[key] = value
+            env[key] = unescape_env_value(value)
             continue
 
         rustc_args.append(arg)
