@@ -160,14 +160,17 @@ def _source_inputs(ctx: AnalysisContext) -> cmd_args:
 
 def _runtime_tools_dir(ctx: AnalysisContext) -> cmd_args:
     """The project-relative directory of the test's runtime tools, one executable per name."""
-    wrappers = []
+    wrappers = {}
     for name, path in ctx.attrs.runtime_tools.items():
         if not name or any([c not in _BIN_NAME_CHARS for c in name.elems()]):
             fail("{}: runtime_tools key {} is not a program name".format(ctx.label, repr(name)))
         if not path.startswith("/"):
             fail("{}: runtime_tools[{}] is not an absolute path: {}".format(ctx.label, repr(name), repr(path)))
-        wrappers.append(exec_script(ctx.actions, "__runtime_tools__/" + name, cmd_args(path)))
-    return cmd_args(wrappers[0], parent = 1, hidden = wrappers)
+        wrappers[name] = exec_script(ctx.actions, "__runtime_tool_scripts__/" + name, cmd_args(path))
+
+    # One directory holds them all; each output may otherwise get a directory
+    # of its own (content-based paths).
+    return cmd_args(ctx.actions.copied_dir("__runtime_tools__", wrappers))
 
 def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[typing.Any]):
     """The test's runtime entries and the runner options naming its path entries.
