@@ -345,6 +345,12 @@ rust_test = prelude_rule(
                 Arguments appended to the test command after the binary, and
                 after any test process runner's own arguments.
             """),
+            "path_run_env": attrs.list(attrs.string(), default = [], doc = """
+                Names of run_env variables whose values are paths relative to the
+                project root. The libtest process runner makes each absolute
+                against the directory the test actually runs in, so the value
+                names the same input locally and on a remote worker.
+            """),
             "framework": attrs.bool(
                 default = True,
                 doc = """

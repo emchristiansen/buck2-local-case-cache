@@ -842,12 +842,45 @@ def _rust_test_remote_profile(ctx):
         return None
     return remote_toolchain[RemoteTestExecutionToolchainInfo].default_profile
 
-def _rust_test_re_executors(ctx, toolchain_info):
+# Worker-local paths a remote libtest test gets unless the target sets them.
+# Both are project-relative, so the runner resolves them inside the action.
+_REMOTE_TEST_PATH_DEFAULTS = {"HOME": ".", "TMPDIR": "."}
+_PROJECT_RELATIVE_ENV = "--project-relative-env"
+
+def _rust_test_runtime(ctx, toolchain_info, remote):
+    # The test's environment and the runner arguments that make its
+    # project-relative path variables absolute where it runs.
+    environment = ctx.attrs.env | ctx.attrs.run_env
+    names = []
+    for name in ctx.attrs.path_run_env:
+        if name not in ctx.attrs.run_env:
+            fail("{}: path_run_env names {}, which run_env does not set".format(ctx.label, name))
+        if name in names:
+            fail("{}: path_run_env names {} twice".format(ctx.label, name))
+        names.append(name)
+    if remote and ctx.attrs.framework:
+        defaults = {name: value for name, value in _REMOTE_TEST_PATH_DEFAULTS.items() if name not in environment}
+        environment = defaults | environment
+        names = [name for name in _REMOTE_TEST_PATH_DEFAULTS if name not in names] + names
+
+    # A target that already passes the runner its HOME/TMPDIR pair keeps it as
+    # written, and the pair is not passed twice.
+    legacy = [_PROJECT_RELATIVE_ENV, "HOME", _PROJECT_RELATIVE_ENV, "TMPDIR"]
+    if ctx.attrs.args[:len(legacy)] == legacy:
+        names = [name for name in names if name not in ("HOME", "TMPDIR")]
+
+    if names and (not ctx.attrs.framework or toolchain_info.test_process_runner == None):
+        fail("{}: project-relative run_env {} needs the libtest process runner".format(ctx.label, names))
+    arguments = []
+    for name in names:
+        arguments.extend([_PROJECT_RELATIVE_ENV, name])
+    return environment, arguments
+
+def _rust_test_re_executors(ctx, toolchain_info, profile, environment, runner_arguments):
     # A rust_test runs wherever its remote-test profile sends it. A consumer makes
     # remote execution the default by setting the remote-test toolchain's
     # default_profile; a test that cannot run remotely says remote_execution =
     # "disabled". With no profile at all, re_utils gives the stock local executor.
-    profile = _rust_test_remote_profile(ctx)
     if profile == None:
         return get_re_executors_from_props(ctx)
 
@@ -859,7 +892,6 @@ def _rust_test_re_executors(ctx, toolchain_info):
     # to a worker.
     if toolchain_info.test_secret_read_route != None or "unqualified-live-effect" in ctx.attrs.labels:
         fail("{}: a remote rust_test must not carry the host secret route or live effects; set remote_execution = \"disabled\"".format(ctx.label))
-    environment = ctx.attrs.env | ctx.attrs.run_env
     for name in ["MUNINN_SECRET_READ_ROUTE", "OP_CONNECT_HOST"]:
         if name in environment:
             fail("{}: a remote rust_test must not carry host-route environment {}".format(ctx.label, name))
@@ -872,14 +904,16 @@ def _rust_test_re_executors(ctx, toolchain_info):
     if toolchain_info.trial_nix_manifest == None:
         fail("{}: a remote rust_test requires the declared runtime manifest".format(ctx.label))
     if ctx.attrs.framework:
-        path_arguments = ["--project-relative-env", "HOME", "--project-relative-env", "TMPDIR"]
+        # _rust_test_runtime supplies both unless the target sets its own value.
         # Runtime expected values preserve attrs.arg literal equality; constant-string
         # comparisons use a Starlark opcode that rejects resolved argument values.
-        for name, expected in {"HOME": ".", "TMPDIR": "."}.items():
+        for name, expected in _REMOTE_TEST_PATH_DEFAULTS.items():
             if environment.get(name) != expected:
-                fail("{}: a remote rust_test requires project-relative HOME/TMPDIR before test arguments".format(ctx.label))
-        if ctx.attrs.args[:len(path_arguments)] != path_arguments:
-            fail("{}: a remote rust_test requires project-relative HOME/TMPDIR before test arguments".format(ctx.label))
+                fail("{}: a remote rust_test requires project-relative HOME/TMPDIR".format(ctx.label))
+        passed = runner_arguments + ctx.attrs.args
+        for name in _REMOTE_TEST_PATH_DEFAULTS:
+            if not any([passed[i] == _PROJECT_RELATIVE_ENV and passed[i + 1] == name for i in range(len(passed) - 1)]):
+                fail("{}: a remote rust_test requires project-relative HOME/TMPDIR".format(ctx.label))
 
     executors = get_re_executors_from_props(ctx)
     # The resolver can still force a local executor. Do not let it silently
@@ -907,7 +941,9 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
         allow_cache_upload = False,
     )
 
-    re_executors = _rust_test_re_executors(ctx, toolchain_info)
+    profile = _rust_test_remote_profile(ctx)
+    environment, runner_arguments = _rust_test_runtime(ctx, toolchain_info, profile != None)
+    re_executors = _rust_test_re_executors(ctx, toolchain_info, profile, environment, runner_arguments)
 
     test_command = cmd_args(args, hidden = [toolchain_info.trial_nix_manifest] if toolchain_info.trial_nix_manifest != None else [])
 
@@ -923,9 +959,9 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     if toolchain_info.test_secret_read_route != None and not ctx.attrs.supports_test_execution_caching:
         test_command = cmd_args(toolchain_info.test_secret_read_route, test_command)
 
-    # The target's own test arguments follow the binary, so a runner passes them
-    # to libtest unchanged.
-    test_command = cmd_args(test_command, ctx.attrs.args)
+    # The runner's project-relative variables, then the target's own test
+    # arguments, follow the binary; the runner passes the latter to libtest unchanged.
+    test_command = cmd_args(test_command, runner_arguments, ctx.attrs.args)
 
     return (
         inject_test_run_info(
@@ -933,7 +969,7 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
             ExternalRunnerTestInfo(
                 type = "rust",
                 command = [test_command],
-                env = ctx.attrs.env | ctx.attrs.run_env,
+                env = environment,
                 labels = ctx.attrs.labels,
                 contacts = ctx.attrs.contacts,
                 default_executor = re_executors.default_executor,
