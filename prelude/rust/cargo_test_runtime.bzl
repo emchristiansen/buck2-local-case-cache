@@ -43,13 +43,24 @@ in `env` as well as `run_env`. `env` may still carry a compile-time
 `CARGO_MANIFEST_DIR` for rustc; the runtime value above replaces it in the
 test's environment.
 
+Before any listing or test, the runner also creates, with
+`--project-relative-dir`, the directory of every source file in `srcs`, at its
+project path inside the action: the empty skeleton of the checkout Cargo runs
+tests in. Directories only; no file content, and nothing outside the action's
+project root. A path a test builds from `file!()`, such as insta's
+`<root>/<dir of file!()>/../snapshots`, then resolves on a worker as in a
+checkout, finding the declared resources it names.
+
 At compile time, `CARGO_BIN_EXE_<name>` is the binary's project-relative path,
 without making the binary a compile input, so `env!`/`option_env!` sites
 compile. That value is not absolute, unlike Cargo's; tests must take the path
 from the runtime variable.
 """
 
+load("@prelude//:paths.bzl", "paths")
+
 PROJECT_RELATIVE_ENV = "--project-relative-env"
+PROJECT_RELATIVE_DIR = "--project-relative-dir"
 CARGO_BIN_EXE_PREFIX = "CARGO_BIN_EXE_"
 
 _FIXED_PATHS = ["CARGO_MANIFEST_DIR", "INSTA_WORKSPACE_ROOT", "METACORTEX_WORKSPACE_ROOT"]
@@ -121,7 +132,30 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
         env[CARGO_BIN_EXE_PREFIX + name] = cmd_args(outputs[0], ignore_artifacts = True)
     return env
 
-def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[str]):
+def _source_dirs(ctx: AnalysisContext) -> list[cmd_args]:
+    """The project-relative directory of every source file in `srcs`, once each.
+
+    A directory the target already passes in its own `--project-relative-dir`
+    is left out; the runner refuses a repeated one.
+    """
+    args = ctx.attrs.args
+    given = [args[i + 1] for i in range(len(args) - 1) if args[i] == PROJECT_RELATIVE_DIR]
+    given += [a[len(PROJECT_RELATIVE_DIR + "="):] for a in args if a.startswith(PROJECT_RELATIVE_DIR + "=")]
+    seen = {}
+    dirs = []
+    for src in ctx.attrs.srcs:
+        if not src.is_source:
+            continue
+        key = paths.dirname(src.short_path)
+        if not key or key in seen or key in given:
+            continue
+        seen[key] = True
+
+        # Rendered by Buck2, so the path is project-relative whatever the cell.
+        dirs.append(cmd_args(src, parent = 1, ignore_artifacts = True))
+    return dirs
+
+def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[typing.Any]):
     """The test's runtime entries and the runner options naming its path entries.
 
     `remote` says the test may run on a worker; the caller has already
@@ -170,4 +204,6 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool)
     runner_args = []
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
+    for directory in _source_dirs(ctx):
+        runner_args.extend([PROJECT_RELATIVE_DIR, directory])
     return env, runner_args
