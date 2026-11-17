@@ -865,11 +865,11 @@ def _rust_test_runtime(ctx, toolchain_info, remote):
         environment = defaults | environment
         names = [name for name in _REMOTE_TEST_PATH_DEFAULTS if name not in names] + names
 
-    # A target that already passes the runner its HOME/TMPDIR pair keeps it as
-    # written, and the pair is not passed twice.
-    legacy = [_PROJECT_RELATIVE_ENV, "HOME", _PROJECT_RELATIVE_ENV, "TMPDIR"]
-    if ctx.attrs.args[:len(legacy)] == legacy:
-        names = [name for name in names if name not in ("HOME", "TMPDIR")]
+    # A name the target already passes the runner in its own args keeps that
+    # spelling and is not passed twice; the runner refuses a repeated name.
+    args = ctx.attrs.args
+    passed = [args[i + 1] for i in range(len(args) - 1) if args[i] == _PROJECT_RELATIVE_ENV]
+    names = [name for name in names if name not in passed]
 
     if names and (not ctx.attrs.framework or toolchain_info.test_process_runner == None):
         fail("{}: project-relative run_env {} needs the libtest process runner".format(ctx.label, names))
