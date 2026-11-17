@@ -51,11 +51,19 @@ a path a test builds from `file!()`, such as insta's
 the declared resources it names. No directory is fabricated: one exists in the
 action only because a declared input lies under it.
 
+At compile time, a test under the runner also gets `CARGO_TARGET_TMPDIR`, the
+project-relative `buck-out/cargo-target-tmp`, which the runner creates (one
+`--project-relative-dir`) before any test runs. Cargo sets it only for
+integration tests and benches; here every runner test has it, a superset. No
+target may set it.
+
 At compile time, `CARGO_BIN_EXE_<name>` is the binary's project-relative path,
 without making the binary a compile input, so `env!`/`option_env!` sites
 compile. That value is not absolute, unlike Cargo's; tests must take the path
 from the runtime variable.
 """
+
+load("@prelude//rust:rust_toolchain.bzl", "RustToolchainInfo")
 
 # A directory of programs a test may run by name, each an exact store path the
 # declared runtime manifest holds. A toolchain rule provides it; `nix_manifest` is
@@ -69,6 +77,12 @@ PROJECT_RELATIVE_ENV = "--project-relative-env"
 CARGO_BIN_EXE_PREFIX = "CARGO_BIN_EXE_"
 
 _FIXED_PATHS = ["CARGO_MANIFEST_DIR", "INSTA_WORKSPACE_ROOT", "METACORTEX_WORKSPACE_ROOT"]
+
+# Cargo's per-target scratch directory for integration tests (`target/tmp`), as a
+# project-relative compile-time value; the runner creates it before any test runs.
+CARGO_TARGET_TMPDIR = "CARGO_TARGET_TMPDIR"
+CARGO_TARGET_TMPDIR_PATH = "buck-out/cargo-target-tmp"
+PROJECT_RELATIVE_DIR = "--project-relative-dir"
 _FIXED_VALUES = {"INSTA_UPDATE": "no"}
 _REMOTE_PATHS = ["HOME", "TMPDIR"]
 _BIN_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
@@ -160,7 +174,16 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
         if len(outputs) != 1:
             fail("{}: cargo_bin_exes[{}] must have exactly one default output".format(ctx.label, repr(name)))
         env[CARGO_BIN_EXE_PREFIX + name] = cmd_args(outputs[0], ignore_artifacts = True)
+    if _runner_applies(ctx):
+        env[CARGO_TARGET_TMPDIR] = CARGO_TARGET_TMPDIR_PATH
     return env
+
+def _runner_applies(ctx: AnalysisContext) -> bool:
+    """Whether `ctx` is a libtest test that runs under the toolchain's per-test runner."""
+    if not getattr(ctx.attrs, "framework", False):
+        return False
+    toolchain = getattr(ctx.attrs, "_rust_toolchain", None)
+    return toolchain != None and toolchain[RustToolchainInfo].test_process_runner != None
 
 def _source_inputs(ctx: AnalysisContext) -> cmd_args:
     """The target's source files and extra resources as hidden inputs of its test command."""
@@ -187,6 +210,9 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     for key in ctx.attrs.env:
         if key.startswith(CARGO_BIN_EXE_PREFIX):
             fail("{}: env must not set {}; use cargo_bin_exes".format(label, key))
+    for field in ["env", "run_env"]:
+        if CARGO_TARGET_TMPDIR in getattr(ctx.attrs, field):
+            fail("{}: {} must not set {}; the prelude writes it".format(label, field, CARGO_TARGET_TMPDIR))
     bins = {}
     for name, dep in ctx.attrs.cargo_bin_exes.items():
         _check_bin_name(label, name)
@@ -211,6 +237,8 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
             named = argument[len(PROJECT_RELATIVE_ENV + "="):]
         if named != None and (named in owned or named.startswith(CARGO_BIN_EXE_PREFIX)):
             fail("{}: args must not name {} in {}; the prelude writes it".format(label, named, PROJECT_RELATIVE_ENV))
+        if argument == PROJECT_RELATIVE_DIR or argument.startswith(PROJECT_RELATIVE_DIR + "="):
+            fail("{}: args must not pass {}; the prelude creates {}".format(label, PROJECT_RELATIVE_DIR, CARGO_TARGET_TMPDIR_PATH))
 
     if not runner_applies:
         # Only the runner puts the tools directory on PATH; without it the
@@ -232,4 +260,5 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     runner_args = [_source_inputs(ctx)]
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths + tool_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
+    runner_args.extend([PROJECT_RELATIVE_DIR, CARGO_TARGET_TMPDIR_PATH])
     return env, runner_args
