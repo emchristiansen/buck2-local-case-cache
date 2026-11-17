@@ -43,13 +43,13 @@ in `env` as well as `run_env`. `env` may still carry a compile-time
 `CARGO_MANIFEST_DIR` for rustc; the runtime value above replaces it in the
 test's environment.
 
-Before any listing or test, the runner also creates, with
-`--project-relative-dir`, the directory of every source file in `srcs`, at its
-project path inside the action: the empty skeleton of the checkout Cargo runs
-tests in. Directories only; no file content, and nothing outside the action's
-project root. A path a test builds from `file!()`, such as insta's
-`<root>/<dir of file!()>/../snapshots`, then resolves on a worker as in a
-checkout, finding the declared resources it names.
+Every source file in `srcs` is also an input of the test action, at its
+project path, as in the checkout Cargo runs tests in. A test that reads its
+crate's sources (a directory listing, a file's text) reads the real files, and
+a path a test builds from `file!()`, such as insta's
+`<root>/<dir of file!()>/../snapshots`, resolves through real directories to
+the declared resources it names. No directory is fabricated: one exists in the
+action only because a declared input lies under it.
 
 At compile time, `CARGO_BIN_EXE_<name>` is the binary's project-relative path,
 without making the binary a compile input, so `env!`/`option_env!` sites
@@ -57,10 +57,7 @@ compile. That value is not absolute, unlike Cargo's; tests must take the path
 from the runtime variable.
 """
 
-load("@prelude//:paths.bzl", "paths")
-
 PROJECT_RELATIVE_ENV = "--project-relative-env"
-PROJECT_RELATIVE_DIR = "--project-relative-dir"
 CARGO_BIN_EXE_PREFIX = "CARGO_BIN_EXE_"
 
 _FIXED_PATHS = ["CARGO_MANIFEST_DIR", "INSTA_WORKSPACE_ROOT", "METACORTEX_WORKSPACE_ROOT"]
@@ -132,28 +129,9 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
         env[CARGO_BIN_EXE_PREFIX + name] = cmd_args(outputs[0], ignore_artifacts = True)
     return env
 
-def _source_dirs(ctx: AnalysisContext) -> list[cmd_args]:
-    """The project-relative directory of every source file in `srcs`, once each.
-
-    A directory the target already passes in its own `--project-relative-dir`
-    is left out; the runner refuses a repeated one.
-    """
-    args = ctx.attrs.args
-    given = [args[i + 1] for i in range(len(args) - 1) if args[i] == PROJECT_RELATIVE_DIR]
-    given += [a[len(PROJECT_RELATIVE_DIR + "="):] for a in args if a.startswith(PROJECT_RELATIVE_DIR + "=")]
-    seen = {}
-    dirs = []
-    for src in ctx.attrs.srcs:
-        if not src.is_source:
-            continue
-        key = paths.dirname(src.short_path)
-        if not key or key in seen or key in given:
-            continue
-        seen[key] = True
-
-        # Rendered by Buck2, so the path is project-relative whatever the cell.
-        dirs.append(cmd_args(src, parent = 1, ignore_artifacts = True))
-    return dirs
+def _source_inputs(ctx: AnalysisContext) -> cmd_args:
+    """The target's source files as hidden inputs of its test command."""
+    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source])
 
 def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[typing.Any]):
     """The test's runtime entries and the runner options naming its path entries.
@@ -191,7 +169,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool)
             fail("{}: args must not name {} in {}; the prelude writes it".format(label, named, PROJECT_RELATIVE_ENV))
 
     if not runner_applies:
-        return {}, []
+        return {}, [_source_inputs(ctx)]
 
     manifest_dir = ctx.attrs.cargo_manifest_dir
     if manifest_dir == None:
@@ -201,9 +179,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool)
         "INSTA_WORKSPACE_ROOT": ".",
         "METACORTEX_WORKSPACE_ROOT": ".",
     } | _FIXED_VALUES | bins | {name: "." for name in remote_paths}
-    runner_args = []
+    runner_args = [_source_inputs(ctx)]
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
-    for directory in _source_dirs(ctx):
-        runner_args.extend([PROJECT_RELATIVE_DIR, directory])
     return env, runner_args
