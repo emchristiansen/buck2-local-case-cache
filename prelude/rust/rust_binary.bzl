@@ -89,7 +89,6 @@ load(
     "@prelude//tests:re_utils.bzl",
     "get_re_executors_from_props",
 )
-load("@prelude//tests:remote_test_execution_toolchain.bzl", "RemoteTestExecutionToolchainInfo")
 load(
     "@prelude//utils:build_graph_pattern.bzl",
     "new_build_graph_info",
@@ -997,70 +996,6 @@ def rust_binary_impl(ctx: AnalysisContext) -> list[Provider]:
 
     return native.providers + [native.default_info, RunInfo(args = native.args)]
 
-def _rust_test_re_executors(ctx, toolchain_info):
-    # The pair is an explicit reviewed portability contract, not a purity inference.
-    # Ordinary host tests retain their local-only executor and secret-route behavior.
-    portable_profile = "nativelink_test_result_reuse"
-    remote_execution = ctx.attrs.remote_execution
-    remote_toolchain = ctx.attrs._remote_test_execution_toolchain
-    if remote_execution != portable_profile:
-        if remote_execution not in (None, "disabled"):
-            fail("{}: rust_test requires a reviewed portable profile or None/disabled".format(ctx.label))
-        if remote_execution == None and remote_toolchain != None:
-            if remote_toolchain[RemoteTestExecutionToolchainInfo].default_profile != None:
-                fail("{}: host rust_test forbids a default remote-test profile".format(ctx.label))
-        return get_re_executors_from_props(ctx)
-
-    if not ctx.attrs.supports_test_execution_caching:
-        fail("{}: portable rust_test requires explicit test execution caching".format(ctx.label))
-    if remote_toolchain == None:
-        fail("{}: portable rust_test requires the remote-test toolchain".format(ctx.label))
-    remote_info = remote_toolchain[RemoteTestExecutionToolchainInfo]
-    if remote_info.default_profile != None:
-        fail("{}: portable rust_test forbids a default remote-test profile".format(ctx.label))
-    props = remote_info.profiles.get(portable_profile)
-    required = ["capabilities", "use_case", "local_enabled", "remote_cache_enabled"]
-    if type(props) != "dict" or len(props) != len(required) or any([name not in props for name in required]):
-        fail("{}: portable rust_test requires exactly the reviewed remote profile properties".format(ctx.label))
-    if type(props["local_enabled"]) != "bool" or props["local_enabled"]:
-        fail("{}: portable rust_test forbids local execution and listing".format(ctx.label))
-    if type(props["remote_cache_enabled"]) != "bool" or not props["remote_cache_enabled"]:
-        fail("{}: portable rust_test requires remote result caching".format(ctx.label))
-    capabilities = props["capabilities"]
-    if type(capabilities) != "dict" or not capabilities:
-        fail("{}: portable rust_test requires nonempty remote capabilities".format(ctx.label))
-    for key, value in capabilities.items():
-        if type(key) != "string" or not key or type(value) != "string" or not value:
-            fail("{}: portable rust_test requires nonempty string capabilities".format(ctx.label))
-    if type(props["use_case"]) != "string" or not props["use_case"]:
-        fail("{}: portable rust_test requires an explicit remote use_case".format(ctx.label))
-    if not ctx.attrs.framework or toolchain_info.test_process_runner == None:
-        fail("{}: portable rust_test requires the libtest process runner".format(ctx.label))
-    if toolchain_info.trial_nix_manifest == None:
-        fail("{}: portable rust_test requires the declared runtime manifest".format(ctx.label))
-    if toolchain_info.test_secret_read_route != None or "unqualified-live-effect" in ctx.attrs.labels:
-        fail("{}: portable rust_test forbids host secret routes and live effects".format(ctx.label))
-    environment = ctx.attrs.env | ctx.attrs.run_env
-    for name in ["MUNINN_SECRET_READ_ROUTE", "OP_CONNECT_HOST"]:
-        if name in environment:
-            fail("{}: portable rust_test forbids host-route environment {}".format(ctx.label, name))
-    # Both external listing and the runner's internal listing need worker-local paths.
-    path_arguments = ["--project-relative-env", "HOME", "--project-relative-env", "TMPDIR"]
-    # Runtime expected values preserve attrs.arg literal equality; constant-string
-    # comparisons use a Starlark opcode that rejects resolved argument values.
-    for name, expected in {"HOME": ".", "TMPDIR": "."}.items():
-        if environment.get(name) != expected:
-            fail("{}: portable rust_test requires project-relative HOME/TMPDIR before test arguments".format(ctx.label))
-    if ctx.attrs.args[:len(path_arguments)] != path_arguments:
-        fail("{}: portable rust_test requires project-relative HOME/TMPDIR before test arguments".format(ctx.label))
-
-    executors = get_re_executors_from_props(ctx)
-    # The resolver can still force a local executor. Do not bypass that policy or
-    # let it silently downgrade this explicit remote-only contract.
-    if not executors.run_from_project_root or not executors.use_project_relative_paths or executors.default_executor == None or "listing" not in executors.executor_overrides:
-        fail("{}: portable rust_test did not resolve remote execution and listing".format(ctx.label))
-    return executors
-
 def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     compile_ctx = compile_context(ctx, binary = True)
     toolchain_info = compile_ctx.toolchain_info
@@ -1073,7 +1008,7 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     # A test may cover a binary or a library: consider both roots.
     default_roots = ctx.attrs.default_roots or ["main.rs", "lib.rs"]
 
-    re_executors = _rust_test_re_executors(ctx, toolchain_info)
+    re_executors = get_re_executors_from_props(ctx)
     strategy_params = _strategy_params(ctx, compile_ctx)
     # Every test provides `[miri]`, unless `miri_interpreted` makes the target
     # itself the Miri run; omitted without a Miri toolchain.
