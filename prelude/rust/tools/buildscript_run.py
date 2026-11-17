@@ -11,6 +11,7 @@ Run a crate's Cargo buildscript.
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -190,6 +191,10 @@ class Args(NamedTuple):
     manifest_dir: Path
     create_cwd: Path
     outfile: IO[str]
+    metadata_out: IO[str]
+    package_links: Optional[str]
+    dep_info: list[list[str]]
+    manifest_subdir: Optional[str]
     rustc_link_lib: bool
     rustc_link_search: bool
 
@@ -202,10 +207,102 @@ def arg_parse() -> Args:
     parser.add_argument("--manifest-dir", type=Path, required=True)
     parser.add_argument("--create-cwd", type=Path, required=True)
     parser.add_argument("--outfile", type=argparse.FileType("w"), required=True)
+    parser.add_argument("--metadata-out", type=argparse.FileType("w"), required=True)
+    parser.add_argument("--package-links", type=str)
+    parser.add_argument("--dep-info", nargs=3, action="append", default=[])
+    parser.add_argument("--manifest-subdir", type=str)
     parser.add_argument("--rustc-link-lib", action="store_true")
     parser.add_argument("--rustc-link-search", action="store_true")
 
     return Args(**vars(parser.parse_args()))
+
+
+_CARGO_METADATA_DIRECTIVES = {
+    "error",
+    "metadata",
+    "rerun-if-changed",
+    "rerun-if-env-changed",
+    "rustc-cfg",
+    "rustc-check-cfg",
+    "rustc-env",
+    "rustc-flags",
+    "rustc-link-arg",
+    "rustc-link-arg-bin",
+    "rustc-link-arg-bins",
+    "rustc-link-arg-cdylib",
+    "rustc-link-arg-tests",
+    "rustc-link-lib",
+    "rustc-link-search",
+    "warning",
+}
+
+
+def _metadata_pair(line: str, package_links: Optional[str]) -> Optional[tuple[str, str]]:
+    if line.startswith("cargo::metadata="):
+        payload = line[len("cargo::metadata=") :]
+        key, separator, value = payload.partition("=")
+        if not separator or not key:
+            raise ValueError("cargo::metadata directive must contain KEY=VALUE")
+        return key, value
+    if line.startswith("cargo:metadata="):
+        payload = line[len("cargo:metadata=") :]
+        key, separator, value = payload.partition("=")
+        if not separator or not key:
+            raise ValueError("cargo:metadata directive must contain KEY=VALUE")
+        return key, value
+    if package_links is None or not line.startswith("cargo:") or line.startswith("cargo::"):
+        return None
+    directive, separator, value = line[len("cargo:") :].partition("=")
+    if not separator or directive in _CARGO_METADATA_DIRECTIVES or directive.startswith("rustc-link-arg-"):
+        return None
+    return directive, value
+
+
+def _dep_env_component(value: str, field: str) -> str:
+    if not value or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None:
+        raise ValueError(f"Cargo build-script {field} is not a supported environment component: {value!r}")
+    return value.upper().replace("-", "_").replace(".", "_")
+
+
+def _metadata_value_for_consumer(value: str, producer_out_dir: str, consumer_out_dir: str) -> str:
+    source = os.path.normpath(producer_out_dir)
+    target = os.path.abspath(consumer_out_dir)
+    if value == source:
+        return target
+    for separator in (os.sep, "/", "\\"):
+        prefix = source.rstrip("/\\") + separator
+        if value.startswith(prefix):
+            return target.rstrip("/\\") + separator + value[len(prefix) :]
+    return value
+
+
+def _dependency_environment(dep_info: list[list[str]]) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for links, metadata_path, out_dir_path in dep_info:
+        if not links:
+            raise ValueError("buildscript DEP input has an empty Cargo links identity")
+        with Path(metadata_path).open(encoding="utf-8") as f:
+            record = json.load(f)
+        if not isinstance(record, dict) or record.get("schema_version") != 1:
+            raise ValueError(f"unsupported buildscript metadata artifact schema: {metadata_path}")
+        producer_out_dir = record.get("out_dir")
+        values = record.get("values")
+        if not isinstance(producer_out_dir, str) or not os.path.isabs(producer_out_dir):
+            raise ValueError(f"buildscript metadata artifact lacks its absolute producer OUT_DIR: {metadata_path}")
+        if not isinstance(values, dict):
+            raise ValueError(f"buildscript metadata artifact lacks a key/value map: {metadata_path}")
+        consumer_out_dir = os.path.abspath(out_dir_path)
+        prefix = "DEP_" + _dep_env_component(links, "links") + "_"
+        for key, value in values.items():
+            if not isinstance(key, str) or re.fullmatch(r"[A-Za-z0-9_]+", key) is None:
+                raise ValueError(f"unsupported Cargo build-script metadata key: {key!r}")
+            if not isinstance(value, str):
+                raise ValueError(f"Cargo build-script metadata value for {key!r} is not a string")
+            name = prefix + key.upper()
+            if name in env:
+                raise ValueError(f"multiple Cargo links dependencies provide {name}")
+            env[name] = _metadata_value_for_consumer(value, producer_out_dir, consumer_out_dir)
+    return env
 
 
 def main() -> None:  # noqa: C901
@@ -219,9 +316,20 @@ def main() -> None:  # noqa: C901
     env["OUT_DIR"] = os.path.abspath(out_dir)
 
     cwd = create_cwd(args.create_cwd, args.manifest_dir)
+    if args.manifest_subdir is not None:
+        subdir = Path(args.manifest_subdir)
+        if (subdir.is_absolute() or str(subdir) != args.manifest_subdir
+                or "\\" in args.manifest_subdir
+                or any(part in ("", ".", "..") for part in args.manifest_subdir.split("/"))):
+            raise ValueError("build-script manifest subdirectory must be a normalized relative path")
+        cwd = cwd.joinpath(subdir)
+        if not cwd.is_dir():
+            raise ValueError(f"build-script manifest subdirectory does not exist in staged inputs: {args.manifest_subdir!r}")
     env["CARGO_MANIFEST_DIR"] = os.path.abspath(cwd)
+    env["CARGO_MANIFEST_PATH"] = os.path.join(env["CARGO_MANIFEST_DIR"], "Cargo.toml")
 
     env = dict(os.environ, **env)
+    env.update(_dependency_environment(args.dep_info))
 
     target = env.get("TARGET")
     if target is None:
@@ -248,6 +356,7 @@ def main() -> None:  # noqa: C901
     script_output = run_buildscript(args.buildscript, env=env, cwd=cwd)
 
     cargo_rustc_cfg_pattern = re.compile("^cargo::?rustc-cfg=(.*)")
+    cargo_rustc_check_cfg_pattern = re.compile("^cargo::?rustc-check-cfg=(.*)")
     cargo_rustc_env_pattern = re.compile("^cargo::?rustc-env=(.+?)=(.*)")
     cargo_rustc_link_lib_pattern = re.compile("^cargo::?rustc-link-lib=(.*)")
     cargo_rustc_link_search_pattern = re.compile(
@@ -264,11 +373,20 @@ def main() -> None:  # noqa: C901
         return None
 
     flags = ""
+    metadata = {}
     for line in script_output.split("\n"):
+        pair = _metadata_pair(line, args.package_links)
+        if pair is not None:
+            metadata[pair[0]] = pair[1]
         cargo_rustc_cfg_match = cargo_rustc_cfg_pattern.match(line)
         if cargo_rustc_cfg_match:
             value = cargo_rustc_cfg_match.group(1)
             flags += f"--cfg={value}\n"
+            continue
+        cargo_rustc_check_cfg_match = cargo_rustc_check_cfg_pattern.match(line)
+        if cargo_rustc_check_cfg_match:
+            value = cargo_rustc_check_cfg_match.group(1)
+            flags += f"--check-cfg={value}\n"
             continue
         cargo_rustc_env_match = cargo_rustc_env_pattern.match(line)
         if cargo_rustc_env_match:
@@ -304,6 +422,13 @@ def main() -> None:  # noqa: C901
             continue
         print(line, end="\n")
     args.outfile.write(flags)
+    json.dump(
+        {"schema_version": 1, "out_dir": os.path.abspath(env["OUT_DIR"]), "values": metadata},
+        args.metadata_out,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    args.metadata_out.write("\n")
 
 
 if __name__ == "__main__":

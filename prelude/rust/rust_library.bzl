@@ -215,7 +215,8 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 )
                 metadata_link = rlib_for_staticlib
 
-            if toolchain_info.nightly_features:
+            # Opted-in crates expand proc macros once for full metadata and link.
+            if toolchain_info.nightly_features and not ctx.attrs.full_metadata_from_link:
                 # Pipelined build: dependents that need full metadata compile
                 # against the `-Zno-codegen` "hollow rlib" instead of waiting
                 # for this crate's codegen.

@@ -36,9 +36,9 @@ git_fetch = prelude_rule(
                 attrs.string(),
                 default = None,
                 doc = """
-                Path to the git binary to use. If not specified, the system
-                git from PATH is used, with fallback to common system
-                locations (/usr/bin/git, /usr/local/bin/git).
+                Optional assertion of the declared pinned Git path.
+                A different executable is refused; fetches never discover
+                Git from the client or worker environment.
             """,
             ),
             "object_format": attrs.option(

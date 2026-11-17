@@ -33,6 +33,11 @@ def _rust_common_attributes(is_binary: bool):
             "default_platform": attrs.option(attrs.string(), default = None),
             "flagged_deps": attrs.list(attrs.tuple(rust_target_dep(is_binary), attrs.list(attrs.string())), default = []),
             "incremental_enabled": attrs.bool(default = False),
+            "local_only_compile": attrs.bool(default = False, doc = """
+                Compile on this host, never upload, and mark the action so no
+                cached result of an unmarked compile can serve it. For a crate
+                whose output bakes a checkout path.
+            """),
             "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source()), sorted = True, default = []),
             "rustdoc_flags": attrs.list(attrs.arg(), default = []),
             "separate_debug_info": attrs.bool(default = False),
@@ -244,6 +249,11 @@ rust_library = prelude_rule(
             "doctests": attrs.option(attrs.bool(), default = None),
             "include_in_android_merge_map_output": attrs.bool(default = True),
             "proc_macro": attrs.bool(default = False),
+            "full_metadata_from_link": attrs.bool(default = False, doc = """
+                Use the link output as full metadata. Nondeterministic proc-macro
+                expansion can otherwise produce different SVHs across pipelined
+                metadata-full and link invocations, causing E0460 in dependents.
+            """),
             "supports_python_dlopen": attrs.option(attrs.bool(), default = None),
         }
         | _rust_binary_attrs_group(prefix = "doc_")
@@ -330,6 +340,11 @@ rust_test = prelude_rule(
         | _rust_analyzer_target_kind("test")
         | _RUST_EXECUTABLE_ATTRIBUTES
         | {
+            "supports_test_execution_caching": attrs.bool(default = False),
+            "args": attrs.list(attrs.string(), default = [], doc = """
+                Arguments appended to the test command after the binary, and
+                after any test process runner's own arguments.
+            """),
             "framework": attrs.bool(
                 default = True,
                 doc = """
