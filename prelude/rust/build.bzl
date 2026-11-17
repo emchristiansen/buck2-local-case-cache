@@ -690,6 +690,9 @@ def miri_command(
     miri_cmd = cmd_args(
         [cmd_args("--env=", k, "=", v, delimiter = "") for (k, v) in plain_env.items()],
         [cmd_args("--path-env=", k, "=", v, delimiter = "") for (k, v) in path_env.items()],
+        # Like every other Nix-bound rustc_action command, the driver inherits
+        # no ambient Nix wrapper inputs; the declared overlays above still apply.
+        "--closed-nix-env" if toolchain_info.trial_nix_manifest != None else [],
         # Rendered diagnostics stream straight to stderr, unparsed.
         "--passthrough-stderr",
         # Driver plus its flags, kept raw: expansion applies only after
