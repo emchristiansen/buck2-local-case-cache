@@ -444,14 +444,20 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
         buildscript_variants = require_rust_arch_variants(ctx.attrs.buildscript_arch[RustArchRunInfo].arch_variants, ctx.label)
         arch_programs = {}
         for arch, variant in arch_toolchain_info.arch_variants.items():
+            arch_tools = {
+                "HOST": variant.arch_triple,
+                "RUSTC": _make_rustc_shim(ctx, buildscript_cwd, arch = arch),
+            }
+
+            # As on the scalar path: this architecture's declared rustdoc,
+            # relative to where the script runs, unless the target sets its own.
+            if "RUSTDOC" not in ctx.attrs.env:
+                arch_tools["RUSTDOC"] = cmd_args(variant.rustdoc, relative_to = buildscript_cwd)
             env = (
                 rule_env
                 | variant.plain_env
                 | variant.path_env
-                | {
-                    "HOST": variant.arch_triple,
-                    "RUSTC": _make_rustc_shim(ctx, buildscript_cwd, arch = arch),
-                }
+                | arch_tools
             )
             cmd = cmd_args(
                 "/usr/bin/env",
