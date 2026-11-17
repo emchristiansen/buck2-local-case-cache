@@ -182,13 +182,13 @@ def _make_cc_shim(ctx: AnalysisContext, name: str, cmd: cmd_args) -> cmd_args:
         wrapper, _ = ctx.actions.write(
             script,
             [
-                "#!@buck2_bash@",
+                "#!/usr/bin/env bash",
                 # Capture buildscript-selected working directory.
                 "cc_original_dir=$(pwd)",
-                # Preserve the logical output path: realpath would traverse a
-                # relocated buck-out symlink before the project-root climb.
-                'cd -L -- "$(dirname -- "${BASH_SOURCE[0]}")"',
-                cmd_args(ctx.label.project_root, relative_to = (script, 1), format = "cd -L -- {}"),
+                # Change directory to the script's location in buck-out, then up
+                # to the repo root.
+                'cd -- "$(dirname -- "$(realpath "${BASH_SOURCE[0]}")")"',
+                cmd_args(ctx.label.project_root, relative_to = (script, 1), format = "cd {}"),
                 # Run from_any_dir.py.
                 cmd_args(
                     cmd_args(
@@ -253,36 +253,18 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
     cwd = ctx.actions.declare_output("cwd", dir = True, has_content_based_path = True)
     out_dir = ctx.actions.declare_output("OUT_DIR", dir = True, has_content_based_path = True)
     rustc_flags = ctx.actions.declare_output("rustc_flags", has_content_based_path = True)
-    metadata = ctx.actions.declare_output("metadata.json", has_content_based_path = True)
 
     if ctx.attrs.manifest_dir != None:
         manifest_dir = ctx.attrs.manifest_dir[DefaultInfo].default_outputs[0]
     else:
-        manifest_dir_action = ctx.actions.copied_dir if rust_toolchain_info.trial_nix_manifest != None else ctx.actions.symlinked_dir
-        manifest_dir = manifest_dir_action("manifest_dir", ctx.attrs.filegroup_for_manifest_dir, has_content_based_path = True)
-
-    # create_cwd links each top-level manifest entry. A nested working directory
-    # is physically inside manifest_dir, so tool paths must be relative to it.
-    buildscript_cwd = cwd
-    if ctx.attrs.manifest_subdir != None:
-        buildscript_cwd = manifest_dir.project(ctx.attrs.manifest_subdir)
+        manifest_dir = ctx.actions.symlinked_dir("manifest_dir", ctx.attrs.filegroup_for_manifest_dir, has_content_based_path = True)
 
     base_cmd = [
         cmd_args("--rustc-cfg=", ctx.attrs.rustc_cfg[DefaultInfo].default_outputs[0], delimiter = ""),
         cmd_args("--manifest-dir=", manifest_dir, delimiter = ""),
         cmd_args("--create-cwd=", cwd.as_output(), delimiter = ""),
         cmd_args("--outfile=", rustc_flags.as_output(), delimiter = ""),
-        cmd_args("--metadata-out=", metadata.as_output(), delimiter = ""),
     ]
-
-    if ctx.attrs.manifest_subdir != None:
-        base_cmd.append(cmd_args("--manifest-subdir=", ctx.attrs.manifest_subdir, delimiter = ""))
-    if ctx.attrs.links != None:
-        base_cmd.append(cmd_args("--package-links=", ctx.attrs.links, delimiter = ""))
-    for links, metadata_dep, out_dir_dep in ctx.attrs.dep_info:
-        metadata_input = metadata_dep[DefaultInfo].default_outputs[0]
-        out_dir_input = out_dir_dep[DefaultInfo].default_outputs[0]
-        base_cmd.append(cmd_args("--dep-info", links, metadata_input, out_dir_input))
 
     if ctx.attrs.rustc_link_lib:
         base_cmd.append("--rustc-link-lib")
@@ -292,20 +274,12 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
     # See https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts
 
     rule_env = {}
-    # CC shims need declared bootstrap utilities before they reach the compiler.
-    # Explicit target env below continues to take priority over this default.
-    if rust_toolchain_info.trial_nix_manifest != None:
-        pinned_path = rust_toolchain_info.rustc_env.get("PATH")
-        if not pinned_path:
-            fail("Nix-bound build scripts require the declared toolchain PATH")
-        rule_env["PATH"] = pinned_path
     rule_env["CARGO"] = "/bin/false"
     rule_env["CARGO_PKG_NAME"] = ctx.attrs.package_name
     rule_env["CARGO_PKG_VERSION"] = ctx.attrs.version
     rule_env["OUT_DIR"] = out_dir.as_output()
     if arch_toolchain_info == None:
-        rule_env["RUSTC"] = _make_rustc_shim(ctx, buildscript_cwd)
-        rule_env["RUSTDOC"] = cmd_args(rust_toolchain_info.rustdoc, relative_to = buildscript_cwd)
+        rule_env["RUSTC"] = _make_rustc_shim(ctx, cwd)
     rule_env["RUSTC_LINKER"] = "/bin/false"
     rule_env["RUST_BACKTRACE"] = "1"
 
@@ -406,7 +380,7 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
     # Environment variables specified in the target's attributes get priority
     # over all the above.
     for k, v in ctx.attrs.env.items():
-        rule_env[k] = cmd_args(v, relative_to = buildscript_cwd)
+        rule_env[k] = cmd_args(v, relative_to = cwd)
 
     # A target that blanks CC leaves cc-rs with a `<target>-gcc` PATH lookup
     # when cross-compiling, which exists nowhere. Re-export the shim as
@@ -444,20 +418,14 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
         buildscript_variants = require_rust_arch_variants(ctx.attrs.buildscript_arch[RustArchRunInfo].arch_variants, ctx.label)
         arch_programs = {}
         for arch, variant in arch_toolchain_info.arch_variants.items():
-            arch_tools = {
-                "HOST": variant.arch_triple,
-                "RUSTC": _make_rustc_shim(ctx, buildscript_cwd, arch = arch),
-            }
-
-            # As on the scalar path: this architecture's declared rustdoc,
-            # relative to where the script runs, unless the target sets its own.
-            if "RUSTDOC" not in ctx.attrs.env:
-                arch_tools["RUSTDOC"] = cmd_args(variant.rustdoc, relative_to = buildscript_cwd)
             env = (
                 rule_env
                 | variant.plain_env
                 | variant.path_env
-                | arch_tools
+                | {
+                    "HOST": variant.arch_triple,
+                    "RUSTC": _make_rustc_shim(ctx, cwd, arch = arch),
+                }
             )
             cmd = cmd_args(
                 "/usr/bin/env",
@@ -483,7 +451,6 @@ def _cargo_buildscript_impl(ctx: AnalysisContext) -> list[Provider]:
             sub_targets = {
                 "out_dir": [DefaultInfo(default_output = out_dir)],
                 "rustc_flags": [DefaultInfo(default_output = rustc_flags)],
-                "metadata": [DefaultInfo(default_output = metadata)],
             },
         )
     ]
@@ -495,13 +462,10 @@ _cargo_buildscript_rule = rule(
         "buildscript_arch": attrs.option(attrs.dep(providers = [RustArchRunInfo]), default = None),
         "cxx_deps": attrs.list(attrs.dep(), default = []),
         "cxx_flags": attrs.list(attrs.arg(), default = []),
-        "dep_info": attrs.list(attrs.tuple(attrs.string(), attrs.dep(), attrs.dep()), default = []),
         "env": attrs.dict(key = attrs.string(), value = attrs.arg(), default = {}),
         "features": attrs.list(attrs.string(), default = []),
         "filegroup_for_manifest_dir": attrs.option(attrs.dict(key = attrs.string(), value = attrs.source()), default = None),
         "manifest_dir": attrs.option(attrs.dep(), default = None),
-        "links": attrs.option(attrs.string(), default = None),
-        "manifest_subdir": attrs.option(attrs.string(), default = None),
         "package_name": attrs.string(),
         "runner": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//rust/tools:buildscript_run")),
         # *IMPORTANT* rustc_cfg must be a `dep` and not an `exec_dep` because
@@ -534,8 +498,6 @@ def buildscript_run(
     manifest_dir = None,
     buildscript_compatible_with = None,
     arch_buildscript_rule = None,
-    links = None,
-    manifest_subdir = None,
     **kwargs,
 ):
     kwargs = apply_platform_attrs(platform, kwargs)
@@ -588,7 +550,5 @@ def buildscript_run(
         version = version,
         filegroup_for_manifest_dir = filegroup_for_manifest_dir,
         manifest_dir = manifest_dir,
-        links = links,
-        manifest_subdir = manifest_subdir,
         **kwargs,
     )
