@@ -139,7 +139,10 @@ def _cargo_rust_binary(name, crate = None, platform = {}, **kwargs):
     Build a third-party rust binary for reindeer, suppressing lints.
     """
 
-    if crate == "build_script_build":
+    # Any build-script crate, not only Cargo's default name: a custom `build` path
+    # (`build_script_main`) and per-variant scripts (`build_script_test_build`,
+    # `build_script_host_build`, ...) also run for the platform they are built for.
+    if crate != None and crate.startswith("build_script_"):
         kwargs = apply_platform_attrs_for_buildscript_build(platform, kwargs)
     else:
         kwargs = apply_platform_attrs(platform, kwargs)
