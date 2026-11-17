@@ -175,7 +175,7 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
             fail("{}: cargo_bin_exes[{}] must have exactly one default output".format(ctx.label, repr(name)))
         env[CARGO_BIN_EXE_PREFIX + name] = cmd_args(outputs[0], ignore_artifacts = True)
     if _runner_applies(ctx):
-        env[CARGO_TARGET_TMPDIR] = CARGO_TARGET_TMPDIR_PATH
+        env[CARGO_TARGET_TMPDIR] = cmd_args(CARGO_TARGET_TMPDIR_PATH)
     return env
 
 def _runner_applies(ctx: AnalysisContext) -> bool:
