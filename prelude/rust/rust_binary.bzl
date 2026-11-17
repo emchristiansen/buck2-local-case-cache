@@ -837,6 +837,8 @@ def _rust_test_remote_profile(ctx):
         profiles = remote_toolchain[RemoteTestExecutionToolchainInfo].profiles
         if remote_execution not in profiles:
             fail("{}: remote_execution names unknown remote-test profile {}".format(ctx.label, repr(remote_execution)))
+        if profiles[remote_execution] == None:
+            fail("{}: remote_execution names remote-test profile {}, which has no properties".format(ctx.label, repr(remote_execution)))
         return profiles[remote_execution]
     if remote_toolchain == None:
         return None
@@ -884,9 +886,25 @@ def _rust_test_re_executors(ctx, toolchain_info, profile, environment, runner_ar
     if profile == None:
         return get_re_executors_from_props(ctx)
 
+    if type(profile) != "dict":
+        fail("{}: a remote rust_test profile must be a property dict, not {}".format(ctx.label, repr(profile)))
+
     # No local fallback: a remote test's profile may not also enable this host.
-    if profile.get("local_enabled", False) != False or profile.get("local_listing_enabled", None) not in (None, False):
+    local_enabled = profile.get("local_enabled", False)
+    local_listing_enabled = profile.get("local_listing_enabled", False)
+    if type(local_enabled) != "bool" or local_enabled or type(local_listing_enabled) != "bool" or local_listing_enabled:
         fail("{}: a remote rust_test profile must not enable local execution or listing".format(ctx.label))
+
+    # A remote profile names where it runs.
+    capabilities = profile.get("capabilities")
+    if type(capabilities) != "dict" or not capabilities:
+        fail("{}: a remote rust_test profile requires nonempty remote capabilities".format(ctx.label))
+    for key, value in capabilities.items():
+        if type(key) != "string" or not key or type(value) != "string" or not value:
+            fail("{}: a remote rust_test profile requires nonempty string capabilities".format(ctx.label))
+    use_case = profile.get("use_case")
+    if type(use_case) != "string" or not use_case:
+        fail("{}: a remote rust_test profile requires an explicit remote use_case".format(ctx.label))
 
     # Host secret routes and live effects belong to this host and are never sent
     # to a worker.
@@ -899,8 +917,8 @@ def _rust_test_re_executors(ctx, toolchain_info, profile, environment, runner_ar
     # Hermeticity: the worker runs the declared runtime under the per-test runner,
     # which resolves worker-local HOME and TMPDIR for both external listing and
     # the runner's internal listing.
-    if ctx.attrs.framework and toolchain_info.test_process_runner == None:
-        fail("{}: a remote libtest rust_test requires the libtest process runner".format(ctx.label))
+    if not ctx.attrs.framework or toolchain_info.test_process_runner == None:
+        fail("{}: a remote rust_test requires the libtest process runner; a custom harness sets remote_execution = \"disabled\"".format(ctx.label))
     if toolchain_info.trial_nix_manifest == None:
         fail("{}: a remote rust_test requires the declared runtime manifest".format(ctx.label))
     if ctx.attrs.framework:
