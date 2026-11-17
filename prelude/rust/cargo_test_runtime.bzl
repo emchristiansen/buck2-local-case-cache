@@ -96,6 +96,8 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
                 toolchain's declared runtime manifest. The test's PATH is then
                 exactly that directory; the directory and the manifest are
                 inputs of the test action. Without it, the prelude sets no PATH.
+                It requires the libtest process runner; a test without the
+                runner that names it fails analysis.
             """,
         ),
         "extra_resources": attrs.list(
@@ -211,6 +213,10 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
             fail("{}: args must not name {} in {}; the prelude writes it".format(label, named, PROJECT_RELATIVE_ENV))
 
     if not runner_applies:
+        # Only the runner puts the tools directory on PATH; without it the
+        # declared tools would silently give way to the host's.
+        if ctx.attrs.runtime_tools != None:
+            fail("{}: runtime_tools needs the libtest process runner (framework = True and a toolchain test_process_runner); without it PATH would not be the declared tools".format(label))
         return {}, [_source_inputs(ctx)]
 
     manifest_dir = ctx.attrs.cargo_manifest_dir
