@@ -104,6 +104,14 @@ def repository_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
         if path in srcs:
             fail("{}: mapped_srcs path {} names the same path as another source".format(ctx.label, repr(path)))
         srcs[path] = artifact
+    # A source file cannot also be a directory holding another source. (A built
+    # directory, such as an http_archive crate, may be overlaid; see symlinked_srcs.)
+    for path in srcs.keys():
+        components = path.split("/")
+        for i in range(1, len(components)):
+            parent = "/".join(components[:i])
+            if parent in srcs and srcs[parent].is_source:
+                fail("{}: source path {} lies under {}, which is a source file".format(ctx.label, repr(path), repr(parent)))
     return srcs
 
 def symlinked_srcs(ctx: AnalysisContext) -> Artifact:
