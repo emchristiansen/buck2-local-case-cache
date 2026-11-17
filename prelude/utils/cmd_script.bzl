@@ -60,3 +60,18 @@ def cmd_script(
         fail(language)
 
     return cmd_args(wrapper, hidden = cmd)
+
+# Muninn: an executable at `path` that runs `cmd` with its own arguments
+# appended, under the declared Bash; e.g. a program name on a test's PATH that
+# runs a declared tool.
+def exec_script(actions: AnalysisActions, path: str, cmd: cmd_args) -> Artifact:
+    wrapper, _ = actions.write(
+        actions.declare_output(path),
+        [
+            "#!@buck2_bash@",
+            cmd_args(cmd_args(cmd, quote = "shell"), format = 'exec {} "$@"\n'),
+        ],
+        is_executable = True,
+        allow_args = True,
+    )
+    return wrapper
