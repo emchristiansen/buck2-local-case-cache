@@ -100,6 +100,7 @@ load(
     "crate_type_linked",
     "dep_metadata_of_emit",
 )
+load(":cargo_test_runtime.bzl", "cargo_bin_exe_compile_env")
 load(":clippy_configuration.bzl", "ClippyConfiguration")
 load(
     ":context.bzl",
@@ -671,7 +672,7 @@ def miri_command(
 
     # Compile-time env processed like normal rustc actions, so `env!` matches.
     # The wrapper sets it on the driver process, absolutizing paths.
-    plain_env, path_env = process_env(compile_ctx, toolchain_info.rustc_env | ctx.attrs.env)
+    plain_env, path_env = process_env(compile_ctx, toolchain_info.rustc_env | ctx.attrs.env | cargo_bin_exe_compile_env(ctx))
     if toolchain_info.nightly_features and "RUSTC_BOOTSTRAP" not in plain_env:
         plain_env["RUSTC_BOOTSTRAP"] = cmd_args("1")
     if toolchain_info.rust_target_path != None:
@@ -2387,7 +2388,7 @@ def _env_value_needs_escape(value: str) -> bool:
     return False
 
 def process_env(
-    compile_ctx: CompileContext, env: dict[str, str | ResolvedStringWithMacros | Artifact], escape_for_rustc_action: bool = True
+    compile_ctx: CompileContext, env: dict[str, str | ResolvedStringWithMacros | Artifact | cmd_args], escape_for_rustc_action: bool = True
 ) -> (dict[str, cmd_args | str | ResolvedStringWithMacros], dict[str, cmd_args]):
     # Values with inputs (ie artifact references).
     path_env = {}
@@ -2466,7 +2467,7 @@ def _dist_thinlto_enabled(ctx: AnalysisContext, compile_ctx: CompileContext) -> 
 def _base_rustc_env(ctx: AnalysisContext, compile_ctx: CompileContext) -> (dict[str, cmd_args | str], dict[str, cmd_args]):
     cached = compile_ctx.processed_env.get("rustc")
     if cached == None:
-        cached = process_env(compile_ctx, compile_ctx.toolchain_info.rustc_env | ctx.attrs.env)
+        cached = process_env(compile_ctx, compile_ctx.toolchain_info.rustc_env | ctx.attrs.env | cargo_bin_exe_compile_env(ctx))
         compile_ctx.processed_env["rustc"] = cached
 
     # Fresh dicts for the caller to extend with emit-specific values.

@@ -128,6 +128,7 @@ load(
 load(":named_deps.bzl", "write_named_deps_names")
 load(":outputs.bzl", "RustcExtraOutputsInfo", "output_as_diag_subtargets")
 load(":profile.bzl", "make_profile_providers")
+load(":cargo_test_runtime.bzl", "cargo_test_runtime", "cargo_test_runtime_attrs")
 load(":resources.bzl", "rust_attr_resources")
 load(":rust_toolchain.bzl", "PanicRuntime", "RustToolchainInfo", "toolchain_supports_miri")
 
@@ -210,6 +211,7 @@ def _native_test_info(
     ctx: AnalysisContext,
     args: cmd_args,
     re_executors,
+    runtime_env: dict[str, typing.Any] = {},
 ) -> list[Provider]:
     """Default (native) test execution for a test rule."""
     return inject_test_run_info(
@@ -217,7 +219,7 @@ def _native_test_info(
         ExternalRunnerTestInfo(
             type = "rust",
             command = [args],
-            env = ctx.attrs.env | ctx.attrs.run_env,
+            env = ctx.attrs.env | ctx.attrs.run_env | runtime_env,
             labels = ctx.attrs.labels,
             contacts = ctx.attrs.contacts,
             default_executor = re_executors.default_executor,
@@ -1047,8 +1049,14 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
 
     # Run each libtest test in its own process. A custom harness
     # (`framework = False`) need not speak libtest's listing protocol.
-    if toolchain_info.test_process_runner != None and ctx.attrs.framework:
+    runner_applies = toolchain_info.test_process_runner != None and ctx.attrs.framework
+    if runner_applies:
         test_command = cmd_args(toolchain_info.test_process_runner, test_command)
+
+    # The prelude alone writes the Cargo-style runtime path entries; the runner
+    # makes each absolute before any test or listing sees it.
+    runtime_env, runtime_runner_args = cargo_test_runtime(ctx, runner_applies)
+    test_command = cmd_args(test_command, runtime_runner_args)
 
     # Set the host's secret read route for the test, outside the per-test runner so
     # that every test process it starts inherits the route. The prefix reads a host
@@ -1061,7 +1069,7 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     # to libtest unchanged.
     test_command = cmd_args(test_command, ctx.attrs.args)
 
-    return _native_test_info(ctx, test_command, re_executors) + native.providers + [native.default_info]
+    return _native_test_info(ctx, test_command, re_executors, runtime_env) + native.providers + [native.default_info]
 
 rust_binary = prelude_rule(
     name = "rust_binary",
@@ -1225,6 +1233,7 @@ rust_test = prelude_rule(
                 after any test process runner's own arguments.
             """),
         }
+        | cargo_test_runtime_attrs()
         | miri_interpreted_attr()
         | re_test_common.test_args()
         | rust_common.cxx_toolchain_arg()
