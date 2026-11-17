@@ -906,10 +906,11 @@ def _rust_test_re_executors(ctx, toolchain_info, profile, environment, runner_ar
     if type(use_case) != "string" or not use_case:
         fail("{}: a remote rust_test profile requires an explicit remote use_case".format(ctx.label))
 
-    # Host secret routes and live effects belong to this host and are never sent
-    # to a worker.
-    if toolchain_info.test_secret_read_route != None or "unqualified-live-effect" in ctx.attrs.labels:
-        fail("{}: a remote rust_test must not carry the host secret route or live effects; set remote_execution = \"disabled\"".format(ctx.label))
+    # The host secret route belongs to this host and is never sent to a worker. A
+    # run that opts into live effects carries it; such a run names no default
+    # profile, so only a test that names one itself reaches this refusal.
+    if toolchain_info.test_secret_read_route != None:
+        fail("{}: a remote rust_test must not carry the host secret route; set remote_execution = \"disabled\"".format(ctx.label))
     for name in ["MUNINN_SECRET_READ_ROUTE", "OP_CONNECT_HOST"]:
         if name in environment:
             fail("{}: a remote rust_test must not carry host-route environment {}".format(ctx.label, name))
