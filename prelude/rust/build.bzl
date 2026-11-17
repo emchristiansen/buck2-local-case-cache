@@ -158,6 +158,8 @@ load(
     ":sources.bzl",
     "RustSources",
     "RustSourcesTSet",
+    "repository_sources",
+    "source_package_prefix",
 )
 
 def generate_rustdoc(
@@ -514,13 +516,14 @@ def generate_rustdoc_test(
         cmd_args("--test-runtool-arg=--resources=", resources, delimiter = ""),
         "--color=always",
         "--test-args=--color=always",
+        # The sources are repository-shaped (sources.bzl), so mapping their
+        # directory to nothing makes `file!()` the checkout path, as Cargo's is
+        # for a workspace member.
         cmd_args(
             "--remap-path-prefix=",
             compile_ctx.symlinked_srcs,
             compile_ctx.path_sep,
             "=",
-            compile_ctx.symlinked_srcs.owner.path,
-            compile_ctx.path_sep,
             delimiter = "",
         ),
         hidden = [
@@ -712,13 +715,14 @@ def miri_command(
         common_args.args,
         "-o",
         miri_out,
+        # The sources are repository-shaped (sources.bzl), so mapping their
+        # directory to nothing makes `file!()` the checkout path, as Cargo's is
+        # for a workspace member.
         cmd_args(
             "--remap-path-prefix=",
             compile_ctx.symlinked_srcs,
             compile_ctx.path_sep,
             "=",
-            compile_ctx.symlinked_srcs.owner.path,
-            compile_ctx.path_sep,
             delimiter = "",
         ),
         ["-Zremap-cwd-prefix=."] if toolchain_info.nightly_features else [],
@@ -828,13 +832,14 @@ def rust_compile(
         # Report unused --extern crates in the notification stream.
         ["--json=unused-externs-silent", "-Wunused-crate-dependencies"] if toolchain_info.report_unused_deps else [],
         common_args.args,
+        # The sources are repository-shaped (sources.bzl), so mapping their
+        # directory to nothing makes `file!()` the checkout path, as Cargo's is
+        # for a workspace member.
         cmd_args(
             "--remap-path-prefix=",
             compile_ctx.symlinked_srcs,
             compile_ctx.path_sep,
             "=",
-            compile_ctx.symlinked_srcs.owner.path,
-            compile_ctx.path_sep,
             delimiter = "",
         ),
         ["-Zremap-cwd-prefix=."] if toolchain_info.nightly_features else [],
@@ -1547,7 +1552,7 @@ def _compute_common_args(
     # Included in tempfiles
     tempfile = "{}-{}".format(attr_simple_crate_for_filenames(ctx), emit.value)
 
-    root = crate_root(ctx, default_roots)
+    root = source_tree_crate_root(ctx, default_roots)
     if compile_ctx.exec_is_windows:
         root = root.replace("/", "\\")
 
@@ -1824,12 +1829,23 @@ def _metadata(
 
     return (metadata, hex_hash)
 
+def source_tree_crate_root(ctx: AnalysisContext, default_roots: list[str]) -> str:
+    """The crate root's path inside the repository-shaped source tree."""
+    if getattr(ctx.attrs, "srcs_filegroup", None):
+        # A path inside the filegroup's own (repository-shaped) tree.
+        return ctx.attrs.crate_root
+    if ctx.attrs.crate_root:
+        return source_package_prefix(ctx) + ctx.attrs.crate_root
+    return _infer_crate_root(ctx, default_roots, repository_sources(ctx).keys())
+
 def crate_root(ctx: AnalysisContext, default_roots: list[str]) -> str:
+    """The crate root as the target names it (relative to its package), for IDE tooling."""
     if ctx.attrs.crate_root:
         return ctx.attrs.crate_root
 
-    srcs = [s.short_path for s in ctx.attrs.srcs] + ctx.attrs.mapped_srcs.values()
+    return _infer_crate_root(ctx, default_roots, [s.short_path for s in ctx.attrs.srcs] + ctx.attrs.mapped_srcs.values())
 
+def _infer_crate_root(ctx: AnalysisContext, default_roots: list[str], srcs: list[str]) -> str:
     candidates = set()
     if getattr(ctx.attrs, "crate_dynamic", None):
         crate_with_suffix = None
@@ -2452,9 +2468,12 @@ def process_env(
     for key in _DIRECTORY_ENV:
         value = plain_env.pop(key, None)
         if value != None:
+            # Relative to the package, which lies at its project path in the sources.
+            package = compile_ctx.symlinked_srcs.owner.package
             path_env[key] = cmd_args(
                 compile_ctx.symlinked_srcs,
                 compile_ctx.path_sep,
+                cmd_args(package, compile_ctx.path_sep, delimiter = "") if package else "",
                 value,
                 delimiter = "",
             )
