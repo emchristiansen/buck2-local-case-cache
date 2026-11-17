@@ -11,23 +11,23 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::buck_out_path::BuckOutPathKind;
-use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_data::clean_stale_result::Origin;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::ordered_entry_walk;
 use buck2_error::ErrorTag;
-use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use derive_more::Display;
 use dice::UserComputationData;
+use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::stream::BoxStream;
 use futures::stream::TryStreamExt;
@@ -195,23 +195,12 @@ impl MaterializeResponse {
         Ok(self.into_leases()?.0)
     }
 
-    /// Both leases once every artifact materialized, else the first error, with the outputs
-    /// lease abandoned: the caller produces nothing without its inputs.
+    /// Both leases once every artifact materialized, else the first error.
     pub fn into_leases(self) -> Result<(ReadLease, Option<WriteLease>), MaterializationError> {
-        let Self {
-            results,
-            lease,
-            outputs,
-        } = self;
-        for result in results {
-            if let Err(e) = result {
-                if let Some(outputs) = outputs {
-                    outputs.abandon();
-                }
-                return Err(e);
-            }
+        for result in self.results {
+            result?;
         }
-        Ok((lease, outputs))
+        Ok((self.lease, self.outputs))
     }
 }
 
@@ -220,8 +209,8 @@ struct Lease {
     guard: Option<Box<dyn Any + Send + Sync>>,
 }
 
-/// Held by the caller of `materialize` for as long as it reads the paths that request put on
-/// disk. Holding it tells the materializer those paths are in use, and an
+/// Held by the caller of [`Materializer::materialize`] for as long as it reads the paths that
+/// request put on disk. Holding it tells the materializer those paths are in use, and an
 /// implementation may hold off conflicting writes until it is dropped. The deferred
 /// materializer does not, so today the guard only fixes the scope callers hold it over.
 #[must_use = "hold the lease while reading the materialized paths"]
@@ -258,27 +247,17 @@ impl fmt::Debug for ReadLease {
     }
 }
 
-/// Held by a caller that produces content at paths it asked for through `prepare_outputs` or
-/// the outputs of a `materialize` request, up to and including the report or publish that makes
+/// Held by a caller that produces content at paths it asked for through
+/// [`Materializer::prepare_outputs`], [`Materializer::hold_or_take`] or the outputs of a
+/// [`Materializer::materialize`] request, up to and including the report or publish that makes
 /// that content tracked; both take the lease, so that content can only ever be reported by
 /// whoever holds its paths. Holding it tells the materializer nothing else may touch those
 /// paths; the deferred materializer does not enforce that, so there the guard only fixes the
-/// scope.
-///
-/// Every root the lease holds is settled before the lease is released: reported through
-/// `declare_existing`, moved out through `publish`, or left untracked through
-/// [`WriteLease::leave_untracked`] where the holder produced no artifact. A holder that gives up
-/// before its report leaves every root with [`WriteLease::abandon`].
+/// scope. Dropping it releases the paths, whatever was reported under them: content the holder
+/// put there and did not report is untracked, and whoever next takes the paths clears it.
 #[must_use = "hold the lease while producing the outputs"]
 pub struct WriteLease {
     lease: Lease,
-    roots: Mutex<Vec<WriteRoot>>,
-}
-
-/// A path a write lease holds, and whether the holder has settled it.
-struct WriteRoot {
-    path: ProjectRelativePathBuf,
-    settled: bool,
 }
 
 impl WriteLease {
@@ -286,7 +265,6 @@ impl WriteLease {
     pub fn noop() -> Self {
         Self {
             lease: Lease { guard: None },
-            roots: Mutex::new(Vec::new()),
         }
     }
 
@@ -297,7 +275,6 @@ impl WriteLease {
             lease: Lease {
                 guard: Some(Box::new(guard)),
             },
-            roots: Mutex::new(Vec::new()),
         }
     }
 
@@ -306,82 +283,10 @@ impl WriteLease {
         self.lease.guard.as_deref()
     }
 
-    /// The paths the lease holds, as the caller asked for them.
-    fn with_roots(self, paths: Vec<ProjectRelativePathBuf>) -> Self {
-        *self.roots.lock().unwrap() = paths
-            .into_iter()
-            .map(|path| WriteRoot {
-                path,
-                settled: false,
-            })
-            .collect();
-        self
-    }
-
-    /// Errors unless `path` is at or under a root of the lease.
-    fn check(&self, path: &ProjectRelativePath) -> buck2_error::Result<()> {
-        let roots = self.roots.lock().unwrap();
-        if roots.iter().any(|root| path.starts_with(&root.path)) {
-            Ok(())
-        } else {
-            Err(internal_error!(
-                "`{path}` was reported outside the write roots of its lease"
-            ))
-        }
-    }
-
-    /// Settles the root at or above `path`, which `check` found.
-    fn settle(&self, path: &ProjectRelativePath) {
-        let mut roots = self.roots.lock().unwrap();
-        if let Some(root) = roots.iter_mut().find(|root| path.starts_with(&root.path)) {
-            root.settled = true;
-        }
-    }
-
-    /// Leaves whatever is at `path` untracked, for a root the holder produces no artifact at: a
-    /// scratch path, or an output its command did not write.
-    pub fn leave_untracked(&self, path: &ProjectRelativePath) -> buck2_error::Result<()> {
-        self.check(path)?;
-        self.settle(path);
-        Ok(())
-    }
-
-    /// Releases the lease with every root left untracked, for a holder that gives up before its
-    /// report: whatever its work left on disk is cleared by whoever next takes the paths.
-    pub fn abandon(self) {
-        for root in self.roots.lock().unwrap().iter_mut() {
-            root.settled = true;
-        }
-    }
-
-    /// `result`, with the lease released: settled by the report an `Ok` stands for, abandoned
-    /// on an `Err`.
-    pub fn abandon_on_err<T, E>(self, result: Result<T, E>) -> Result<T, E> {
-        if result.is_err() {
-            self.abandon();
-        }
-        result
-    }
-
     /// The lease as the holder's readers hold it once everything under it is reported: the roots
     /// stay held, for reading, until the returned lease is dropped.
-    pub fn into_read_lease(mut self) -> ReadLease {
-        ReadLease {
-            _lease: Lease {
-                guard: self.lease.guard.take(),
-            },
-        }
-    }
-
-    /// The roots nothing has settled yet.
-    fn pending(&self) -> Vec<ProjectRelativePathBuf> {
-        self.roots
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|root| !root.settled)
-            .map(|root| root.path.clone())
-            .collect()
+    pub fn into_read_lease(self) -> ReadLease {
+        ReadLease { _lease: self.lease }
     }
 }
 
@@ -391,35 +296,27 @@ impl fmt::Debug for WriteLease {
     }
 }
 
-impl Drop for WriteLease {
-    fn drop(&mut self) {
-        let pending = self.pending();
-        if pending.is_empty() || std::thread::panicking() {
-            return;
-        }
-        let pending = pending
-            .iter()
-            .map(|path| format!("`{path}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // A bug in the holder: whatever it left there may be named by a value and is tracked by
-        // nothing.
-        buck2_core::soft_error_or_panic!(
-            "write_lease_released_unsettled",
-            internal_error!("A write lease was released with nothing reported at [{pending}]")
-        );
-    }
-}
-
 /// What `Materializer::hold_or_take` answers.
 #[must_use = "hold the lease while reading the path, or make the content and report it"]
 pub enum HeldContent {
     /// The path holds the content; the lease holds it for reading.
     Found(ReadLease),
     /// The path does not hold the content, and the lease holds it for writing: the caller puts
-    /// the content there, the whole of the path, and reports it with `declare_existing`, or
-    /// abandons the lease.
+    /// the content there, the whole of the path, and reports it with `declare_existing`.
     Missing(WriteLease),
+}
+
+/// The paths a materializer tracks, as the BlobStore takes content out of them
+/// (`BlobStore::find`).
+#[async_trait]
+pub trait TrackedPaths: Send + Sync {
+    /// A tracked path holding a file of `digest`, held for reading until the lease drops;
+    /// `None` when no such path can be held without waiting, or the materializer does not know
+    /// its paths by digest (the deferred core).
+    async fn hold_file(
+        &self,
+        digest: &FileDigest,
+    ) -> buck2_error::Result<Option<(AbsNormPathBuf, ReadLease)>>;
 }
 
 /// A trait providing methods to asynchronously materialize artifacts.
@@ -448,15 +345,19 @@ pub enum HeldContent {
 /// 4. Declare may delete any existing paths that conflict with the path that was
 ///    declared.
 #[async_trait]
-pub trait Materializer: Allocative + Send + Sync + 'static {
+pub trait Materializer: TrackedPaths + Allocative + Send + Sync + 'static {
     /// Whether this materializer tracks disk state only, so that a producer that can make its
     /// content puts it on disk itself, under `hold_or_take`, and reports it, as a local run does
     /// (`materialize::produce`). The deferred core is declared to instead (`declare_write`,
     /// `declare_copy`).
     fn is_disk_state(&self) -> bool;
 
-    /// Behind `hold_or_take`, which gives the write lease returned here its root.
-    async fn hold_or_take_impl(
+    /// Holds `path` for reading when it holds `value`'s content already, else for writing, for
+    /// the caller to put the content there and report it with `declare_existing`: how a producer
+    /// that can make its content asks a disk-state materializer (`is_disk_state`), so that
+    /// content a previous build left on disk is found rather than made again. Found content is
+    /// backed by the materializer's own means before it is handed out.
+    async fn hold_or_take(
         &self,
         path: ProjectRelativePathBuf,
         value: ArtifactValue,
@@ -467,15 +368,18 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
         MaterializerBackgroundCleanupGuard::new(())
     }
 
-    /// Behind `declare_existing`, which has checked that every path is under a root of `lease`.
-    async fn declare_existing_impl(
+    /// Reports content the caller put on disk at the paths of `artifacts`, which it holds
+    /// `lease` for. From then on the content is the artifact at each path.
+    async fn declare_existing(
         &self,
         lease: &WriteLease,
         artifacts: Vec<DeclareArtifactPayload>,
     ) -> buck2_error::Result<()>;
 
-    /// Behind `materialize`, which gives the write lease returned here its roots.
-    async fn materialize_impl(
+    /// Puts the requested artifacts on disk at their paths and reports one result per artifact.
+    /// This is how consumers (local actions reading their inputs, final materialization) ask for
+    /// content; the `declare_*` methods remain for producers.
+    async fn materialize(
         &self,
         request: MaterializeRequest,
     ) -> buck2_error::Result<MaterializeResponse>;
@@ -501,8 +405,13 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
         generate: Box<dyn FnOnce() -> buck2_error::Result<Vec<WriteRequest>> + Send + 'a>,
     ) -> buck2_error::Result<Vec<ArtifactValue>>;
 
-    /// Behind `prepare_outputs`, which gives the write lease returned here its roots.
-    async fn prepare_outputs_impl(
+    /// Stops tracking `paths` and returns the write lease the caller holds while it produces
+    /// content there, up to and including the report or publish that makes that content
+    /// tracked. Nothing on disk is touched: deleting what is there is the caller's job, done
+    /// under the lease, since only the caller knows whether it wants a clean slate or a
+    /// workspace kept across runs. A caller that also reads inputs asks for both in one
+    /// [`Materializer::materialize`] request instead.
+    async fn prepare_outputs(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<WriteLease>;
@@ -517,8 +426,31 @@ pub trait Materializer: Allocative + Send + Sync + 'static {
         paths: Vec<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<()>;
 
-    /// Behind `publish`, which has checked that `src` is under a root of `lease`.
-    async fn publish_impl(
+    /// Puts `value`'s content at `path`, which the caller holds `lease` for in write mode, unless
+    /// the path held exactly that content when the lease took it: an incremental action's
+    /// previous output, which its run writes in place. Whatever else is at the path goes first.
+    /// The content is not tracked: it is the caller's, as its own writes are, until the caller
+    /// reports the path. `from` names a path that held the content when the caller last saw it;
+    /// a materializer that copies by declaration (the deferred core) copies from there, one that
+    /// finds content by digest (the disk-state core) needs no hint. Once it writes, the fill runs
+    /// to its end whatever `cancellations` asks, so that the path is never left half-written.
+    async fn fill(
+        &self,
+        lease: &WriteLease,
+        path: ProjectRelativePathBuf,
+        value: ArtifactValue,
+        from: Option<ProjectRelativePathBuf>,
+        re_use_case: RemoteExecutorUseCase,
+        cancellations: &CancellationContext,
+    ) -> buck2_error::Result<()>;
+
+    /// Makes the untracked content an action produced at `src`, which it holds `lease` for, the
+    /// artifact at `dest`, described by `value`. The content moves: `src` is the caller's to
+    /// produce and not to keep. Returns once `dest` is on disk, with a lease over it for the
+    /// readers that follow. The deferred core's: a disk-state materializer refuses it, since its
+    /// consumers find content by digest and a local output stays where its run wrote it,
+    /// reported through [`Materializer::declare_existing`].
+    async fn publish(
         &self,
         lease: &WriteLease,
         src: ProjectRelativePathBuf,
@@ -672,87 +604,6 @@ impl DeclareMatchOutcome {
 }
 
 impl dyn Materializer {
-    /// Puts the requested artifacts on disk at their paths and reports one result per artifact.
-    /// This is how consumers (local actions reading their inputs, final materialization) ask for
-    /// content; the `declare_*` methods remain for producers.
-    pub async fn materialize(
-        &self,
-        request: MaterializeRequest,
-    ) -> buck2_error::Result<MaterializeResponse> {
-        let outputs = request.outputs.clone();
-        let mut response = self.materialize_impl(request).await?;
-        response.outputs = response.outputs.map(|lease| lease.with_roots(outputs));
-        Ok(response)
-    }
-
-    /// Stops tracking `paths` and returns the write lease the caller holds while it produces
-    /// content there, up to and including the report or publish that makes that content
-    /// tracked. Nothing on disk is touched: deleting what is there is the caller's job, done
-    /// under the lease, since only the caller knows whether it wants a clean slate or a
-    /// workspace kept across runs. A caller that also reads inputs asks for both in one
-    /// `materialize` request instead.
-    pub async fn prepare_outputs(
-        &self,
-        paths: Vec<ProjectRelativePathBuf>,
-    ) -> buck2_error::Result<WriteLease> {
-        let lease = self.prepare_outputs_impl(paths.clone()).await?;
-        Ok(lease.with_roots(paths))
-    }
-
-    /// Holds `path` for reading when it holds `value`'s content already, else for writing, for
-    /// the caller to put the content there and report it with `declare_existing`: how a producer
-    /// that can make its content asks a disk-state materializer (`is_disk_state`), so that
-    /// content a previous build left on disk is found rather than made again. Found content is
-    /// backed by the materializer's own means before it is handed out.
-    pub async fn hold_or_take(
-        &self,
-        path: ProjectRelativePathBuf,
-        value: ArtifactValue,
-    ) -> buck2_error::Result<HeldContent> {
-        Ok(match self.hold_or_take_impl(path.clone(), value).await? {
-            HeldContent::Found(lease) => HeldContent::Found(lease),
-            HeldContent::Missing(lease) => HeldContent::Missing(lease.with_roots(vec![path])),
-        })
-    }
-
-    /// Reports content the caller put on disk at the paths of `artifacts`, which it holds
-    /// `lease` for. From then on the content is the artifact at each path.
-    pub async fn declare_existing(
-        &self,
-        lease: &WriteLease,
-        artifacts: Vec<DeclareArtifactPayload>,
-    ) -> buck2_error::Result<()> {
-        let paths: Vec<ProjectRelativePathBuf> = artifacts
-            .iter()
-            .map(|payload| payload.path.clone())
-            .collect();
-        for path in &paths {
-            lease.check(path)?;
-        }
-        self.declare_existing_impl(lease, artifacts).await?;
-        for path in &paths {
-            lease.settle(path);
-        }
-        Ok(())
-    }
-
-    /// Makes the untracked content an action produced at `src`, which it holds `lease` for, the
-    /// artifact at `dest`, described by `value`. The content moves: `src` is the caller's to
-    /// produce and not to keep. Returns once `dest` is on disk, with a lease over it for the
-    /// readers that follow.
-    pub async fn publish(
-        &self,
-        lease: &WriteLease,
-        src: ProjectRelativePathBuf,
-        dest: ProjectRelativePathBuf,
-        value: ArtifactValue,
-    ) -> buck2_error::Result<ReadLease> {
-        lease.check(&src)?;
-        let published = self.publish_impl(lease, src.clone(), dest, value).await?;
-        lease.settle(&src);
-        Ok(published)
-    }
-
     /// Declare an artifact at `path` whose files can be materialized by doing
     /// a local copy. Implicitly cleans up `path`.
     ///
@@ -1166,6 +1017,7 @@ pub struct CleanStaleArtifactsArgs {
     pub policy: CleanStaleArtifactsPolicy,
     pub dry_run: bool,
     pub tracked_only: bool,
+    pub origin: Origin,
 }
 
 #[derive(Debug, Clone)]
@@ -1177,28 +1029,4 @@ pub enum CleanStaleArtifactsPolicy {
         adaptive_min_ttl: Option<std::time::Duration>,
         adaptive_unmaterialize_active: bool,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn path(s: &str) -> ProjectRelativePathBuf {
-        ProjectRelativePathBuf::unchecked_new(s.to_owned())
-    }
-
-    #[test]
-    fn test_write_lease_roots_are_settled_at_or_under_them() -> buck2_error::Result<()> {
-        let lease = WriteLease::noop().with_roots(vec![path("a"), path("b/c"), path("s")]);
-        lease.check(&path("a"))?;
-        lease.settle(&path("a"));
-        lease.check(&path("b/c/d"))?;
-        lease.settle(&path("b/c/d"));
-        assert!(lease.check(&path("b")).is_err());
-        assert!(lease.check(&path("x")).is_err());
-        assert_eq!(lease.pending(), vec![path("s")]);
-        lease.leave_untracked(&path("s"))?;
-        assert!(lease.pending().is_empty());
-        Ok(())
-    }
 }

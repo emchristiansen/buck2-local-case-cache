@@ -50,14 +50,13 @@ SwiftToolchainInfo = provider(
         # "unknown argument", so this defaults off.
         "supports_modularization_dependency_graph": provider_field(bool, default = False),
         "supports_modulemaps_with_hmaps": provider_field(bool, default = False),
+        "supports_pch_base_dir_is_cwd": provider_field(bool, default = False),
         "supports_relative_resource_dir": provider_field(bool),
         "swift_experimental_features": provider_field(dict[str, list[str]]),  # { "5": [], "6", [] }
         "swift_ide_test_tool": provider_field([RunInfo, None], default = None),
         "swift_stdlib_tool": provider_field(RunInfo),
         "swift_stdlib_tool_flags": provider_field(list[ArgLike]),
         "swift_upcoming_features": provider_field(dict[str, list[str]]),  # { "5": [], "6", [] }
-        # Runs swift-symbolgraph-extract, if the toolchain provides it.
-        "symbolgraph_extractor": provider_field(cmd_args | None, default = None),
         "uncompiled_clang_sdk_modules_deps": provider_field(dict[str, Dependency]),
         "uncompiled_swift_sdk_modules_deps": provider_field(dict[str, Dependency]),
         "use_depsfiles": provider_field(bool, default = False),

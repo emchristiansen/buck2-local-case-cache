@@ -25,6 +25,8 @@ RustExplicitSysrootDeps = record(
     std = Dependency | None,
     panic_unwind = Dependency | None,
     panic_abort = Dependency | None,
+    alloc = field(Dependency | None, None),
+    compiler_builtins = field(Dependency | None, None),
     others = list[Dependency],
 )
 
@@ -33,6 +35,49 @@ RustSysrootInfo = provider(fields = {"sysroot_deps": RustExplicitSysrootDeps | N
 PanicRuntime = enum("unwind", "abort", "none")
 
 RustSanitizer = enum("address", "cfi", "hwaddress", "kcfi", "leak", "memory", "memtag", "safestack", "shadow-call-stack", "thread")
+
+RUST_ARCH_VARIANTS = ("x86_64", "arm64")
+
+# Tools and inputs selected for the architecture running a Rust action. This is
+# independent of the fixed target architecture of the action's outputs.
+RustArchToolchainVariant = record(
+    compiler = field(RunInfo),
+    rustdoc = field(RunInfo),
+    clippy_driver = field(RunInfo | None),
+    arch_triple = field(str),
+    implicit_bootstrap_sysroot = field(Artifact | None),
+    runtime_and_plugin_inputs = field(list[Artifact | cmd_args]),
+    archiver = field(cmd_args | None),
+    archiver_deterministic = field(bool),
+    plain_env = field(dict[str, typing.Any]),
+    path_env = field(dict[str, typing.Any]),
+)
+
+RustArchToolchainInfo = provider(
+    fields = {
+        "arch_variants": dict[str, RustArchToolchainVariant],
+    },
+)
+
+# A runnable tool with one complete executable closure per arch architecture.
+RustArchRunInfo = provider(
+    fields = {
+        "arch_variants": dict[str, RunInfo],
+    },
+)
+
+def require_rust_arch_variants(arch_variants: dict[str, typing.Any], owner: typing.Any):
+    missing = [variant for variant in RUST_ARCH_VARIANTS if variant not in arch_variants]
+    extra = [variant for variant in arch_variants if variant not in RUST_ARCH_VARIANTS]
+    if missing or extra:
+        fail("{} must provide exactly Rust arch variants {}; missing {}, extra {}".format(owner, RUST_ARCH_VARIANTS, missing, extra))
+    return arch_variants
+
+def get_rust_arch_toolchain_info(toolchain: Dependency, owner: typing.Any) -> RustArchToolchainInfo | None:
+    arch_info = toolchain.get(RustArchToolchainInfo)
+    if arch_info != None:
+        require_rust_arch_variants(arch_info.arch_variants, owner)
+    return arch_info
 
 # FIXME(JakobDegen): These all have default values for historical reasons. Some of them certainly
 # should, but some of them probably shouldn't?
@@ -45,6 +90,12 @@ rust_toolchain_attrs = {
     "rustc_target_triple": provider_field(str | None, default = None),
     # Extra env variables that should be made available to the rustc executable.
     "rustc_env": provider_field(dict[str, typing.Any], default = {}),
+    # Hidden source required by the maintained workstation NativeLink worker.
+    "trial_nix_manifest": provider_field(Artifact | None, default = None),
+    # Prefix for libtest test commands that runs each test in its own process.
+    "test_process_runner": provider_field(RunInfo | None, default = None),
+    # Prefix for a Rust test command that sets the host's secret read route.
+    "test_secret_read_route": provider_field(RunInfo | None, default = None),
     # Baseline compiler config
     "rustc_flags": provider_field(list[typing.Any], default = []),
     # Extra rustc flags applied only while compiling a proc-macro crate.
@@ -68,6 +119,8 @@ rust_toolchain_attrs = {
     "rustdoc_env": provider_field(dict[str, typing.Any], default = {}),
     # Extra flags for rustdoc invocations
     "rustdoc_flags": provider_field(list[typing.Any], default = []),
+    # A Rust-specific driver; when present C/C++ linker pre-args do not apply.
+    "linker": provider_field(RunInfo | None, default = None),
     # Extra flags to pass to the linker
     "linker_flags": provider_field(list[typing.Any], default = []),
     # Native dependencies added to every crate, and therefore to every link
@@ -116,6 +169,11 @@ rust_toolchain_attrs = {
     # to deny from our codebase without slowing down your inner dev loop, or encouraging you to
     # --cap-warns=lint for your projects.
     "deny_on_check_lints": provider_field(list[typing.Any], default = []),
+    # Lint and check-cfg flags for each package, keyed by "cell//package" and applied
+    # unchanged to every compile of that package's targets. When this is set, a target
+    # in a package that is neither keyed nor under an exempt prefix fails analysis.
+    "package_lint_flags": provider_field(dict[str, list[str]] | None, default = None),
+    "package_lint_flags_exempt_prefixes": provider_field(list[str], default = []),
     # Clippy configuration file clippy.toml
     "clippy_toml": provider_field(Artifact | None, default = None),
     # Setting this enables additional behaviors that improves linking at the

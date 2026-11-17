@@ -64,6 +64,9 @@ class ResourceSourceMapExecutableMainTest {
     ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output)
 
     val expectedLines = listOf(
+        fileSourceMapRow(0, "res/layout/screen.xml", "first/BUCK", "first/BUCK"),
+        fileSourceMapRow(0, "res/values/strings.xml", "first/BUCK", "first/BUCK"),
+        fileSourceMapRow(1, "res/values-fr/strings.xml", "second/BUCK", "second/BUCK"),
         "R\t0\tid\ttitle_view\t\tfirst/BUCK\tfirst/BUCK",
         "R\t0\tlayout\tscreen\t\tfirst/BUCK\tfirst/BUCK",
         "R\t0\tstring\ttitle\t\tfirst/BUCK\tfirst/BUCK",
@@ -72,6 +75,279 @@ class ResourceSourceMapExecutableMainTest {
     assertEquals(
         expectedLines.joinToString(separator = "\n", postfix = "\n"),
         Files.readString(output, StandardCharsets.UTF_8),
+    )
+  }
+
+  @Test
+  fun `generated resource entries preserve their original source`() {
+    val root = temporaryFolder.newFolder("repo").toPath()
+    val generatedResources = root.resolve("buck-out/generated/res")
+    val sourceResources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(generatedResources.resolve("values"))
+    Files.createDirectories(sourceResources.resolve("values"))
+    val contents = "<resources><string name=\"title\">Title</string></resources>"
+    Files.writeString(
+        generatedResources.resolve("values/strings.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("values/strings.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("generated-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$generatedResources\t$sourceResources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("generated-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("generated-source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+
+    assertEquals(
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/values/strings.xml",
+                "fbandroid/example/res/values/strings.xml",
+                "fbandroid/example/BUCK",
+            ),
+            "R\t0\tstring\ttitle\t\tfbandroid/example/res/values/strings.xml\tfbandroid/example/BUCK",
+        )
+            .sorted(),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
+    )
+  }
+
+  @Test
+  fun `generated extension changes preserve their original source`() {
+    val root = temporaryFolder.newFolder("extension-change-repo").toPath()
+    val generatedResources = root.resolve("buck-out/generated/res")
+    val sourceResources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(generatedResources.resolve("drawable"))
+    Files.createDirectories(sourceResources.resolve("drawable"))
+    Files.writeString(
+        generatedResources.resolve("drawable/icon.webp"),
+        "generated webp",
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("drawable/icon.png"),
+        "source png",
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("extension-change-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$generatedResources\t$sourceResources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("extension-change-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("extension-change-source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+
+    assertEquals(
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/drawable/icon.webp",
+                "fbandroid/example/res/drawable/icon.png",
+                "fbandroid/example/BUCK",
+            ),
+            "R\t0\tdrawable\ticon\t\tfbandroid/example/res/drawable/icon.png\tfbandroid/example/BUCK",
+        )
+            .sorted(),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
+    )
+  }
+
+  @Test
+  fun `generated qualifier variants preserve their most specific original source`() {
+    val root = temporaryFolder.newFolder("qualifier-change-repo").toPath()
+    val generatedResources = root.resolve("buck-out/generated/res")
+    val sourceResources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(generatedResources.resolve("drawable-night-v21"))
+    Files.createDirectories(sourceResources.resolve("drawable"))
+    Files.createDirectories(sourceResources.resolve("drawable-night"))
+    val contents = "<shape xmlns:android=\"http://schemas.android.com/apk/res/android\" />"
+    Files.writeString(
+        generatedResources.resolve("drawable-night-v21/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("drawable/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("drawable-night/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("qualifier-change-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$generatedResources\t$sourceResources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("qualifier-change-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("qualifier-change-source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+
+    assertEquals(
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/drawable-night-v21/icon.xml",
+                "fbandroid/example/res/drawable-night/icon.xml",
+                "fbandroid/example/BUCK",
+            ),
+            "R\t0\tdrawable\ticon\tnight-v21\tfbandroid/example/res/drawable-night/icon.xml\tfbandroid/example/BUCK",
+        )
+            .sorted(),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
+    )
+  }
+
+  @Test
+  fun `generated qualifier variants preserve equally specific original sources`() {
+    val root = temporaryFolder.newFolder("ambiguous-qualifier-repo").toPath()
+    val generatedResources = root.resolve("buck-out/generated/res")
+    val sourceResources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(generatedResources.resolve("drawable-land-night-v21"))
+    Files.createDirectories(sourceResources.resolve("drawable-land"))
+    Files.createDirectories(sourceResources.resolve("drawable-night"))
+    val contents = "<shape xmlns:android=\"http://schemas.android.com/apk/res/android\" />"
+    Files.writeString(
+        generatedResources.resolve("drawable-land-night-v21/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("drawable-land/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        sourceResources.resolve("drawable-night/icon.xml"),
+        contents,
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("ambiguous-qualifier-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$generatedResources\t$sourceResources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("ambiguous-qualifier-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("ambiguous-qualifier-source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+
+    assertEquals(
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/drawable-land-night-v21/icon.xml",
+                "fbandroid/example/res/drawable-land/icon.xml",
+                "fbandroid/example/BUCK",
+            ),
+            fileSourceMapRow(
+                0,
+                "res/drawable-land-night-v21/icon.xml",
+                "fbandroid/example/res/drawable-night/icon.xml",
+                "fbandroid/example/BUCK",
+            ),
+            "R\t0\tdrawable\ticon\tland-night-v21\tfbandroid/example/res/drawable-land/icon.xml\tfbandroid/example/BUCK",
+            "R\t0\tdrawable\ticon\tland-night-v21\tfbandroid/example/res/drawable-night/icon.xml\tfbandroid/example/BUCK",
+        )
+            .sorted(),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
+    )
+  }
+
+  @Test
+  fun `source indexing failures do not fall back to owning build files`() {
+    val root = temporaryFolder.newFolder("source-index-failure-repo").toPath()
+    val generatedResources = root.resolve("buck-out/generated/res")
+    val missingSourceResources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(generatedResources.resolve("drawable"))
+    Files.writeString(
+        generatedResources.resolve("drawable/icon.webp"),
+        "generated webp",
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("source-index-failure-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$generatedResources\t$missingSourceResources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("source-index-failure-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("source-index-failure-source-map").toPath()
+
+    org.junit.Assert.assertThrows(java.io.IOException::class.java) {
+      ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+    }
+  }
+
+  @Test
+  fun `excluded values entries remain available for coverage attribution`() {
+    val root = temporaryFolder.newFolder("repo").toPath()
+    val resources = root.resolve("fbandroid/example/res")
+    Files.createDirectories(resources.resolve("values"))
+    Files.createDirectories(resources.resolve("values-it"))
+    Files.writeString(
+        resources.resolve("values/strings.xml"),
+        "<resources><string name=\"title\">Title</string></resources>",
+        StandardCharsets.UTF_8,
+    )
+    Files.writeString(
+        resources.resolve("values-it/strings.xml"),
+        """
+        <resources exclude-from-buck-resource-map="true">
+          <string name="title">Titolo</string>
+        </resources>
+        """
+            .trimIndent(),
+        StandardCharsets.UTF_8,
+    )
+    val resourceDirs = temporaryFolder.newFile("excluded-resource-dirs").toPath()
+    Files.writeString(
+        resourceDirs,
+        "$resources\tfbandroid/example/BUCK",
+        StandardCharsets.UTF_8,
+    )
+    val assetDirs = temporaryFolder.newFile("excluded-asset-dirs").toPath()
+    val output = temporaryFolder.newFile("excluded-source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, root)
+
+    assertEquals(
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/values/strings.xml",
+                "fbandroid/example/res/values/strings.xml",
+                "fbandroid/example/BUCK",
+            ),
+            fileSourceMapRow(
+                0,
+                "res/values-it/strings.xml",
+                "fbandroid/example/res/values-it/strings.xml",
+                "fbandroid/example/BUCK",
+            ),
+            "R\t0\tstring\ttitle\t\tfbandroid/example/res/values/strings.xml\tfbandroid/example/BUCK",
+            "R\t0\tstring\ttitle\tit\tfbandroid/example/res/values-it/strings.xml\tfbandroid/example/BUCK",
+        )
+            .sorted(),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
     )
   }
 
@@ -104,6 +380,7 @@ class ResourceSourceMapExecutableMainTest {
     val resources = temporaryFolder.newFolder("resources").toPath()
     Files.createDirectories(resources.resolve("values"))
     Files.createDirectories(resources.resolve("layout"))
+    Files.createDirectories(resources.resolve("raw"))
     Files.writeString(
         resources.resolve("values/strings.xml"),
         "<resources><string name=\"title\">Title</string></resources>",
@@ -119,6 +396,10 @@ class ResourceSourceMapExecutableMainTest {
         "<LinearLayout>",
         StandardCharsets.UTF_8,
     )
+    Files.write(
+        resources.resolve("raw/payload.xml"),
+        byteArrayOf(0x00, 0x01, 0x02, 0x03),
+    )
 
     val resourceDirs = temporaryFolder.newFile("resource-dirs").toPath()
     Files.writeString(resourceDirs, "$resources\tresources/BUCK", StandardCharsets.UTF_8)
@@ -133,7 +414,33 @@ class ResourceSourceMapExecutableMainTest {
     ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output)
 
     assertEquals(
-        listOf("R\t0\tstring\ttitle\t\tresources/BUCK\tresources/BUCK"),
+        listOf(
+            fileSourceMapRow(
+                0,
+                "res/layout/broken.xml",
+                "resources/BUCK",
+                "resources/BUCK",
+            ),
+            fileSourceMapRow(
+                0,
+                "res/raw/payload.xml",
+                "resources/BUCK",
+                "resources/BUCK",
+            ),
+            fileSourceMapRow(
+                0,
+                "res/values/broken.xml",
+                "resources/BUCK",
+                "resources/BUCK",
+            ),
+            fileSourceMapRow(
+                0,
+                "res/values/strings.xml",
+                "resources/BUCK",
+                "resources/BUCK",
+            ),
+            "R\t0\tstring\ttitle\t\tresources/BUCK\tresources/BUCK",
+        ),
         Files.readAllLines(output, StandardCharsets.UTF_8),
     )
   }
@@ -184,6 +491,33 @@ class ResourceSourceMapExecutableMainTest {
     assertEquals(assetRow, ResourceSourceMapFormat.parse(assetRow.serialize()))
   }
 
+  @Test
+  fun `resource ids preserve type and name`() {
+    val resourceDirs = temporaryFolder.newFile("resource-dirs").toPath()
+    val assetDirs = temporaryFolder.newFile("asset-dirs").toPath()
+    val rDotTxt = temporaryFolder.newFile("R.txt").toPath()
+    Files.write(
+        rDotTxt,
+        listOf(
+            "int string title 0x7f120001",
+            "int color accent 0x7f060002",
+            "int[] styleable Example { 0x7f010001 }",
+        ),
+        StandardCharsets.UTF_8,
+    )
+    val output = temporaryFolder.newFile("source-map").toPath()
+
+    ResourceSourceMapExecutableMain.generate(resourceDirs, assetDirs, output, rDotTxt = rDotTxt)
+
+    assertEquals(
+        listOf(
+            "I\t0x7f060002\tcolor\taccent",
+            "I\t0x7f120001\tstring\ttitle",
+        ),
+        Files.readAllLines(output, StandardCharsets.UTF_8),
+    )
+  }
+
   private fun assetSourceMapRow(
       priority: Int,
       path: String,
@@ -191,6 +525,20 @@ class ResourceSourceMapExecutableMainTest {
       ownerBuildFile: String,
   ): String = listOf(
       "A",
+      priority.toString(),
+      encodeField(path),
+      encodeField(source),
+      encodeField(ownerBuildFile),
+  )
+      .joinToString("\t")
+
+  private fun fileSourceMapRow(
+      priority: Int,
+      path: String,
+      source: String,
+      ownerBuildFile: String,
+  ): String = listOf(
+      "F",
       priority.toString(),
       encodeField(path),
       encodeField(source),

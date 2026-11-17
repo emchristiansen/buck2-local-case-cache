@@ -24,6 +24,7 @@ use crate::ids::Key;
 use crate::ids::Revision;
 use crate::ids::Seq;
 use crate::ids::Version;
+use crate::key_vec::KeyVec;
 use crate::resolve::Resolved;
 use crate::slot::Claim;
 use crate::slot::Slot;
@@ -47,47 +48,30 @@ pub struct CoreState<E: Env> {
     /// A key's slots, one per branch it has a claim or an untracked-input history on. A key stays
     /// in the map once certified, even with no slots left after [`Self::delete_branch`]: that
     /// memory is what lets [`Self::commit`] refuse to assert a key that has been certified.
-    pub(crate) slots: KeyMap<KeySlots<E>>,
+    pub(crate) slots: KeyVec<KeySlots<E>>,
     pub(crate) assertions: KeyMap<KeyAssertions<E>>,
     /// The number of distinct keys across `slots` and `assertions`. Neither map ever drops a key.
     pub(crate) key_count: usize,
 }
 
-/// One assertion as a lookup reports it: the version it was made at and its data.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Assertion<T> {
-    pub version: Version,
-    pub data: T,
-}
-
-/// Where a `Valid` lookup's revision comes from.
-pub enum ValidSource<'a, E: Env> {
-    /// A claim.
-    Claim {
-        cert: &'a Arc<Cert<E::Premises>>,
-        data: &'a E::ClaimData,
-    },
-    /// The assertion of an injected key in force at the looked-up version.
-    Asserted {
-        assertion: Assertion<E::AssertionData>,
-    },
-}
-
 /// The answer to a lookup (§2.2, §5.1).
 pub enum Lookup<'a, E: Env> {
-    /// `revision` is justified for the key at the version.
+    /// `revision` is justified for the key at the version; `attribute` is that of the derivation
+    /// (§4.7).
     Valid {
         revision: Revision,
-        source: ValidSource<'a, E>,
+        attribute: E::Attribute,
     },
     /// Nothing is known. `candidate` is a certificate the caller may try to re-establish: the
     /// nearest one on the resolution chain, else any claim's, provided it was stamped with the
     /// version's ε, since one that was not can never cover the version. `epsilon` is the revision
     /// of the key's untracked input at the version, for stamping the certificate the caller is
-    /// about to produce.
+    /// about to produce, and `untracked` the attribute of its assertion, which is part of the
+    /// derivation of whatever the caller produces.
     Unknown {
         candidate: Option<&'a Arc<Cert<E::Premises>>>,
         epsilon: EpsilonToken,
+        untracked: E::Attribute,
     },
 }
 
@@ -116,7 +100,7 @@ impl<E: Env> CoreState<E> {
     pub fn new() -> Self {
         CoreState {
             branches: Vec::new(),
-            slots: KeyMap::default(),
+            slots: KeyVec::default(),
             assertions: KeyMap::default(),
             key_count: 0,
         }
@@ -163,27 +147,32 @@ impl<E: Env> CoreState<E> {
         match self.resolve(key, v) {
             Resolved::Claim { claim, .. } => Lookup::Valid {
                 revision: claim.revision(),
-                source: ValidSource::Claim {
-                    cert: &claim.cert,
-                    data: &claim.data,
-                },
+                attribute: claim.attribute,
             },
             Resolved::Asserted { owner, entry } => Lookup::Valid {
                 revision: entry.revision,
-                source: ValidSource::Asserted {
-                    assertion: Assertion {
-                        version: Version::new(owner, entry.seq),
-                        data: entry.data,
-                    },
-                },
+                attribute: E::assertion(Version::new(owner, entry.seq), entry.data),
             },
             Resolved::Unknown { candidate } => {
-                let epsilon = self.epsilon(key, v);
+                let (epsilon, untracked) = self.untracked(key, v);
                 Lookup::Unknown {
                     candidate: candidate.filter(|cert| cert.epsilon == epsilon),
                     epsilon,
+                    untracked,
                 }
             }
+        }
+    }
+
+    /// The revision of `key`'s untracked input at `v` and the attribute of its assertion:
+    /// [`Env::EMPTY`] before the key is first dirtied.
+    pub fn untracked(&self, key: Key, v: Version) -> (EpsilonToken, E::Attribute) {
+        match self.resolve_untracked(key, v) {
+            Some((owner, entry)) => (
+                entry.revision,
+                E::assertion(Version::new(owner, entry.seq), entry.data),
+            ),
+            None => (EpsilonToken::INITIAL, E::EMPTY),
         }
     }
 
@@ -195,15 +184,6 @@ impl<E: Env> CoreState<E> {
             Resolved::Unknown { candidate } => candidate,
             Resolved::Claim { .. } | Resolved::Asserted { .. } => None,
         }
-    }
-
-    /// The dirty of `key` in force at `v`, `None` if it was never dirtied before `v`.
-    pub fn dirtied_at(&self, key: Key, v: Version) -> Option<Assertion<E::AssertionData>> {
-        self.resolve_untracked(key, v)
-            .map(|(owner, entry)| Assertion {
-                version: Version::new(owner, entry.seq),
-                data: entry.data,
-            })
     }
 
     /// Whether `key` has ever been asserted, i.e. is an injected key.
@@ -261,7 +241,7 @@ impl<E: Env> CoreState<E> {
         for (key, slots) in self.slots.iter_mut() {
             if let Some(index) = slots.iter().position(|slot| slot.branch == b) {
                 if slots[index].claim.is_some() {
-                    affected.push(*key);
+                    affected.push(key);
                 }
                 slots.remove(index);
             }
@@ -287,7 +267,7 @@ impl<E: Env> CoreState<E> {
             .slots
             .iter()
             .filter(|(_, slots)| slots.iter().any(|slot| slot.branch == b))
-            .map(|(key, _)| *key)
+            .map(|(key, _)| key)
             .collect();
         for key in keys {
             let slot = self.slot(key, b).expect("filtered above");
@@ -298,7 +278,7 @@ impl<E: Env> CoreState<E> {
                 } else {
                     Window::empty(first)
                 },
-                data: claim.data.clone(),
+                attribute: claim.attribute,
             });
             let dirty = slot.untracked.at(fork_seq).map(|entry| Entry {
                 seq: first,
@@ -369,7 +349,7 @@ impl<E: Env> CoreState<E> {
     }
 
     pub(crate) fn slot_or_insert(&mut self, key: Key, b: BranchId) -> &mut Slot<E> {
-        let slots = self.slots.entry(key).or_insert_with(|| {
+        let slots = self.slots.get_or_insert_with(key, || {
             if !self.assertions.contains_key(&key) {
                 self.key_count += 1;
             }

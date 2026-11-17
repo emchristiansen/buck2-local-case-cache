@@ -130,6 +130,17 @@ def unarchive(
     has_content_based_path: bool = False,
 ):
     exec_is_windows = exec_deps.exec_os_type[OsLookup].os == Os("windows")
+    archive_env = {}
+    archive_hidden = []
+    if not exec_is_windows:
+        archive_env = {
+            "PATH": exec_deps.archive_shell_info.path_env,
+            "TRIAL_NIX_MANIFEST": cmd_args(
+                exec_deps.archive_shell_info.nix_manifest,
+                replace_regex = ("^\\./", ""),
+            ),
+        }
+        archive_hidden = [exec_deps.archive_shell_info.nix_manifest]
 
     # The excludes listing runs `tar --list` and redirects it to a file; keep it
     # in the shell whose redirect writes raw bytes (cmd on Windows, sh else).
@@ -139,7 +150,7 @@ def unarchive(
         first_param = "%1"
     else:
         listing_ext = "sh"
-        listing_interpreter = ["/bin/sh"]
+        listing_interpreter = [exec_deps.archive_shell.args]
         first_param = '"$1"'
 
     # Unpack archive to output directory.
@@ -167,8 +178,9 @@ def unarchive(
             has_content_based_path = False,
         )
         ctx.actions.run(
-            cmd_args(listing_interpreter + [tar_script, contents.as_output()], hidden = [archive]),
+            cmd_args(listing_interpreter + [tar_script, contents.as_output()], hidden = [archive] + archive_hidden),
             category = "process_exclusions",
+            env = archive_env,
         )
 
         def create_exclusion_list(ctx: AnalysisContext, artifacts, outputs):
@@ -200,7 +212,7 @@ def unarchive(
     else:
         unarchive_cmd, needs_strip_prefix = _unarchive_cmd(ext_type, archive, strip_prefix)
         unpack_ext = "sh"
-        unpack_interpreter = ["/bin/sh"]
+        unpack_interpreter = [exec_deps.archive_shell.args]
 
     output = ctx.actions.declare_output(output_name, dir = True, has_content_based_path = has_content_based_path)
     script_output = ctx.actions.declare_output(output_name + "_tmp", dir = True, has_content_based_path = False) if needs_strip_prefix else output
@@ -225,11 +237,12 @@ def unarchive(
     ctx.actions.run(
         cmd_args(
             unpack_interpreter + [script],
-            hidden = exclude_hidden + [archive, script_output.as_output()],
+            hidden = exclude_hidden + [archive, script_output.as_output()] + archive_hidden,
         ),
         category = "http_archive",
         identifier = output_name,
         prefer_local = prefer_local,
+        env = archive_env,
     )
 
     if needs_strip_prefix:

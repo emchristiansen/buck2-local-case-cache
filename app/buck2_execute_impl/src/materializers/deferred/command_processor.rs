@@ -20,6 +20,7 @@ use buck2_core::buck2_env;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_core::soft_error_or_panic;
+use buck2_data::clean_stale_result::Origin;
 use buck2_data::clean_stale_result::Trigger;
 use buck2_data::error::ErrorTag;
 use buck2_error::BuckErrorContext;
@@ -49,8 +50,8 @@ use futures::future;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
+use futures::stream;
 use futures::stream::BoxStream;
-use futures::stream::FuturesOrdered;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use jiff::SignedDuration;
@@ -91,6 +92,7 @@ use crate::materializers::deferred::clean_stale::CleanFailure;
 use crate::materializers::deferred::clean_stale::CleanResult;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsCommand;
 use crate::materializers::deferred::clean_stale::CleanStaleConfig;
+use crate::materializers::deferred::clean_stale::FinishUnmaterializationUpload;
 use crate::materializers::deferred::clean_stale::disk_space_probe_path;
 use crate::materializers::deferred::extension::ExtensionCommand;
 use crate::materializers::deferred::io_handler::IoHandler;
@@ -131,6 +133,10 @@ pub(super) struct DeferredMaterializerCommandProcessor<T: 'static> {
     pub(super) rematerialization_ttl: Option<SignedDuration>,
     background_cleanup_gate: Arc<BackgroundCleanupGate>,
 }
+
+/// What was materialized at exactly each of the paths an invalidation was asked for, for the
+/// holder that is about to write there to tell what it may keep (`fill`).
+pub(crate) type Displaced = Vec<(ProjectRelativePathBuf, ArtifactMetadata)>;
 
 /// Message taken by the `DeferredMaterializer`'s command loop.
 pub(super) enum MaterializerCommand<T: 'static> {
@@ -174,7 +180,7 @@ pub(super) enum MaterializerCommand<T: 'static> {
     /// the file was created, or because it was removed..
     InvalidateFilePaths(
         Vec<ProjectRelativePathBuf>,
-        oneshot::Sender<CleaningFuture>,
+        oneshot::Sender<(Displaced, CleaningFuture)>,
         EventDispatcher,
         Option<SpanId>,
     ),
@@ -300,13 +306,19 @@ pub(super) enum LowPriorityMaterializerCommand {
         result: Result<(), SharedMaterializingError>,
         dispatcher: Option<EventDispatcher>,
     },
+
+    FinishUnmaterializationUpload {
+        command: FinishUnmaterializationUpload,
+        dispatcher: Option<EventDispatcher>,
+    },
 }
 
 impl LowPriorityMaterializerCommand {
     fn dispatcher(&self) -> Option<EventDispatcher> {
         match self {
             Self::MaterializationFinished { dispatcher, .. }
-            | Self::CleanupFinished { dispatcher, .. } => dispatcher.clone(),
+            | Self::CleanupFinished { dispatcher, .. }
+            | Self::FinishUnmaterializationUpload { dispatcher, .. } => dispatcher.clone(),
         }
     }
 }
@@ -494,6 +506,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         dry_run: bool,
         tracked_only: bool,
         trigger: Trigger,
+        origin: Origin,
     ) -> CleanStaleArtifactsCommand {
         CleanStaleArtifactsCommand::configured(
             &self.clean_stale_config,
@@ -502,6 +515,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             dry_run,
             tracked_only,
             trigger,
+            origin,
         )
     }
 
@@ -628,6 +642,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                         false,
                         false,
                         Trigger::Scheduled,
+                        Origin::DaemonSchedule,
                     );
                     let clean = cmd.create_clean_fut(&mut self, None, daemon_id);
                     stream.clean_stale_fut = Some(
@@ -707,6 +722,21 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                     )
                 });
 
+                let displaced: Displaced = paths
+                    .iter()
+                    .filter_map(|path| {
+                        let (root, data) =
+                            Self::find_artifact_containing_path(&mut self.tree, path)?;
+                        match &data.stage {
+                            ArtifactMaterializationStage::Materialized { metadata, .. }
+                                if root == path =>
+                            {
+                                Some((path.clone(), metadata.dupe()))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
                 let existing_futs = self.tree.invalidate_paths_and_collect_futures(
                     paths,
                     self.sqlite_db.as_mut(),
@@ -715,11 +745,12 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
 
                 // TODO: This probably shouldn't return a CleanFuture
                 sender
-                    .send(
+                    .send((
+                        displaced,
                         async move { join_all_existing_futs(existing_futs?).await }
                             .boxed()
                             .shared(),
-                    )
+                    ))
                     .ok();
             }),
             // Entry point for `ensure_materialized` calls
@@ -784,6 +815,10 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             } => {
                 self.tree.cleanup_finished(path, version, result);
             }
+            LowPriorityMaterializerCommand::FinishUnmaterializationUpload {
+                command,
+                dispatcher: _,
+            } => command.execute(self),
         })
     }
 
@@ -852,21 +887,25 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         paths: Vec<ProjectRelativePathBuf>,
         event_dispatcher: EventDispatcher,
     ) -> BoxStream<'static, Result<(), MaterializationError>> {
-        let tasks = paths.into_iter().map(|path| {
-            match self.materialize_artifact(path.as_ref(), event_dispatcher.dupe()) {
-                Some(fut) => future::Either::Left(fut.map_err(move |e| match e {
-                    SharedMaterializingError::Error(source) => {
-                        MaterializationError::Error { path, source }
-                    }
-                    SharedMaterializingError::NotFound(source) => {
-                        MaterializationError::NotFound { source }
-                    }
-                })),
-                None => future::Either::Right(future::ready(Ok(()))),
-            }
-        });
+        // Jobs start eagerly and are only awaited in order, keeping order and per-path errors.
+        let tasks: Vec<_> = paths
+            .into_iter()
+            .map(
+                |path| match self.materialize_artifact(path.as_ref(), event_dispatcher.dupe()) {
+                    Some(fut) => future::Either::Left(fut.map_err(move |e| match e {
+                        SharedMaterializingError::Error(source) => {
+                            MaterializationError::Error { path, source }
+                        }
+                        SharedMaterializingError::NotFound(source) => {
+                            MaterializationError::NotFound { source }
+                        }
+                    })),
+                    None => future::Either::Right(future::ready(Ok(()))),
+                },
+            )
+            .collect();
 
-        tasks.collect::<FuturesOrdered<_>>().boxed()
+        stream::iter(tasks).then(|task| task).boxed()
     }
 
     fn promote_final_output_closure(&mut self, paths: &[ProjectRelativePathBuf]) {

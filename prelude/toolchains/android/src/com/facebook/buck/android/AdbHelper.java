@@ -216,7 +216,6 @@ public class AdbHelper implements AndroidDevicesHelper {
    * is enabled (-x). This flag is used as a marker that user understands that multiple devices will
    * be used to install the apk if needed.
    */
-  @SuppressWarnings("PMD.EmptyCatchBlock")
   @Override
   public synchronized void adbCall(String description, AdbDeviceCallable func, boolean quiet)
       throws InterruptedException {
@@ -237,7 +236,7 @@ public class AdbHelper implements AndroidDevicesHelper {
                   + " devices/emulators.\n");
           return;
         }
-        throw new RuntimeException("Didn't find any attached Android devices/emulators.");
+        throw new RuntimeException(noDevicesMessage(result.listedDevices));
       }
       devices = result.devices;
     } catch (Exception e) {
@@ -690,14 +689,7 @@ public class AdbHelper implements AndroidDevicesHelper {
     }
 
     List<AndroidDevice> devices = new ArrayList<>();
-    Optional<Boolean> emulatorsOnly = Optional.empty();
-    if (deviceOptions.isEmulatorsOnlyModeEnabled() && options.isMultiInstallModeEnabled()) {
-      emulatorsOnly = Optional.empty();
-    } else if (deviceOptions.isEmulatorsOnlyModeEnabled()) {
-      emulatorsOnly = Optional.of(true);
-    } else if (deviceOptions.isRealDevicesOnlyModeEnabled()) {
-      emulatorsOnly = Optional.of(false);
-    }
+    Optional<Boolean> emulatorsOnly = emulatorsOnly();
 
     int onlineDevices = 0;
     for (AndroidDevice device : allDevices) {
@@ -775,45 +767,109 @@ public class AdbHelper implements AndroidDevicesHelper {
 
     private final ImmutableList<AndroidDevice> devices;
     private final Optional<String> errorMessage;
+    // Everything adb listed, before filtering, so an empty result can say whether adb or the
+    // filter left nothing.
+    private final ImmutableList<AndroidDevice> listedDevices;
 
-    private GetDevicesResult(ImmutableList<AndroidDevice> devices, Optional<String> errorMessage) {
+    private GetDevicesResult(
+        ImmutableList<AndroidDevice> devices,
+        Optional<String> errorMessage,
+        ImmutableList<AndroidDevice> listedDevices) {
       this.devices = devices;
       this.errorMessage = errorMessage;
+      this.listedDevices = listedDevices;
     }
 
-    static GetDevicesResult createSuccess(ImmutableList<AndroidDevice> devices) {
-      return new GetDevicesResult(devices, Optional.empty());
+    static GetDevicesResult createSuccess(
+        ImmutableList<AndroidDevice> devices, List<AndroidDevice> listedDevices) {
+      return new GetDevicesResult(devices, Optional.empty(), ImmutableList.copyOf(listedDevices));
     }
 
     static GetDevicesResult createFailure(String message) {
-      return new GetDevicesResult(ImmutableList.of(), Optional.of(message));
+      return new GetDevicesResult(ImmutableList.of(), Optional.of(message), ImmutableList.of());
     }
   }
 
   private GetDevicesResult getDevicesImpl() {
     if (devicesSupplierForTests.isPresent()) {
-      return GetDevicesResult.createSuccess(devicesSupplierForTests.get().get());
+      ImmutableList<AndroidDevice> devices = devicesSupplierForTests.get().get();
+      return GetDevicesResult.createSuccess(devices, devices);
     }
 
     // Build list of matching devices.
-    List<AndroidDevice> devices = filterDevices(adbUtils.getDevices());
+    List<AndroidDevice> allDevices = adbUtils.getDevices();
+    List<AndroidDevice> devices = filterDevices(allDevices);
     // Found multiple devices but multi-install mode is not enabled.
     if (devices.size() > 1 && !options.isMultiInstallModeEnabled()) {
       return GetDevicesResult.createFailure(
           String.format(
               "%d devices match specified device filter (1 expected).\n"
-                  + "Either disconnect other devices or enable multi-install mode (%s).",
-              devices.size(), AdbOptions.MULTI_INSTALL_MODE_SHORT_ARG));
+                  + "Matching devices: %s.\n"
+                  + "Either pass one of them with -s, disconnect other devices or enable"
+                  + " multi-install mode (%s).",
+              devices.size(), serials(devices), AdbOptions.MULTI_INSTALL_MODE_SHORT_ARG));
     }
 
-    if (devices.isEmpty() && restartAdbOnFailure) {
+    // Only when adb lists no online device: a restart cannot make a listed device match the
+    // filter, and it drops every device attached with `adb connect`.
+    if (devices.isEmpty()
+        && restartAdbOnFailure
+        && allDevices.stream().noneMatch(AndroidDevice::isOnline)) {
       androidPrinter.printError("No devices found with adb, restarting adb-server.");
       adbUtils.restart();
-      devices = filterDevices(adbUtils.getDevices());
+      allDevices = adbUtils.getDevices();
+      devices = filterDevices(allDevices);
     }
 
     return GetDevicesResult.createSuccess(
-        devices.stream().collect(ImmutableList.toImmutableList()));
+        devices.stream().collect(ImmutableList.toImmutableList()), allDevices);
+  }
+
+  private static String serials(List<AndroidDevice> devices) {
+    return devices.stream().map(AndroidDevice::getSerialNumber).collect(Collectors.joining(", "));
+  }
+
+  /**
+   * Why no device was found: adb lists none, none online, or the filter rejected every online one.
+   * The first sentence stays fixed: error classification and scripts match on it.
+   */
+  private String noDevicesMessage(ImmutableList<AndroidDevice> listedDevices) {
+    String message = "Didn't find any attached Android devices/emulators.";
+    if (listedDevices.isEmpty()) {
+      return message + " adb lists no device.";
+    }
+    // Asks adb again, once per device: affordable only because the install is failing anyway.
+    List<AndroidDevice> online =
+        listedDevices.stream().filter(AndroidDevice::isOnline).collect(Collectors.toList());
+    if (online.isEmpty()) {
+      return String.format(
+          "%s None of the devices adb lists is online: %s.", message, serials(listedDevices));
+    }
+    List<String> filter = new ArrayList<>();
+    if (deviceOptions.getSerialNumber().isPresent()) {
+      filter.add("serial " + deviceOptions.getSerialNumber().get());
+    } else if (getEnvironment().containsKey(SERIAL_NUMBER_ENV)) {
+      // Read from this process's environment, which need not be the shell the user typed in.
+      filter.add(
+          String.format(
+              "serial %s from $%s", getEnvironment().get(SERIAL_NUMBER_ENV), SERIAL_NUMBER_ENV));
+    }
+    emulatorsOnly().ifPresent(emulators -> filter.add(emulators ? "emulators" : "real devices"));
+    return String.format(
+        "%s None of the online devices (%s) matches the device filter%s.",
+        message, serials(online), filter.isEmpty() ? "" : ": " + String.join(", ", filter));
+  }
+
+  /** Empty when both device types pass the filter. */
+  private Optional<Boolean> emulatorsOnly() {
+    if (deviceOptions.isEmulatorsOnlyModeEnabled() && options.isMultiInstallModeEnabled()) {
+      return Optional.empty();
+    } else if (deviceOptions.isEmulatorsOnlyModeEnabled()) {
+      return Optional.of(true);
+    } else if (deviceOptions.isRealDevicesOnlyModeEnabled()) {
+      return Optional.of(false);
+    }
+    return Optional.empty();
   }
 
   @Override
@@ -913,7 +969,7 @@ public class AdbHelper implements AndroidDevicesHelper {
                   device,
                   buck2BuildUuid,
                   timings)
-              .doInstall(isolatedApkInfo, setDebugAppMode, restartApp);
+              .doInstall(isolatedApkInfo, setDebugAppMode, restartApp, options.isForceQueryable());
           return true;
         },
         quiet);
@@ -948,14 +1004,23 @@ public class AdbHelper implements AndroidDevicesHelper {
             }
             return device.installApexOnDevice(apk, quiet, restart, options.getWaitForDeviceReady());
           } else if (!options.isStagedInstallModeEnabled()
-              && !shouldAppBeInstalled(device, packageName, apk, androidPrinter)) {
+              && !shouldAppBeInstalled(
+                  device, packageName, apk, androidPrinter, options.isForceQueryable())) {
             if (restartApp) {
               device.stopPackage(packageName);
             }
             return true;
           } else {
             return device.installApkOnDevice(
-                apk, installViaSd, quiet, options.isStagedInstallModeEnabled(), packageName);
+                apk,
+                installViaSd,
+                quiet,
+                /* verifyTempWritable= */ true,
+                options.isStagedInstallModeEnabled(),
+                /* userId= */ null,
+                /* allowFastDeploy= */ true,
+                packageName,
+                options.isForceQueryable());
           }
         },
         quiet);
@@ -970,13 +1035,21 @@ public class AdbHelper implements AndroidDevicesHelper {
     }
   }
 
-  /** Whether {@code device} lacks {@code apk} as the installed apk of {@code packageName}. */
+  /**
+   * Whether {@code device} lacks {@code apk} as the installed apk of {@code packageName}. With
+   * {@code forceQueryable}, also true when the installed package is not queryable or its
+   * queryability cannot be read.
+   */
   public static boolean shouldAppBeInstalled(
-      AndroidDevice device, String packageName, File apk, AndroidInstallPrinter androidPrinter)
+      AndroidDevice device,
+      String packageName,
+      File apk,
+      AndroidInstallPrinter androidPrinter,
+      boolean forceQueryable)
       throws Exception {
     AndroidDevice.InstalledApk installed;
     try {
-      installed = device.compareInstalledApk(packageName, apk, /* exact= */ false);
+      installed = device.compareInstalledApk(packageName, apk);
     } catch (AdbCommandFailedException e) {
       LOG.info("Could not read the installed APK.  Must re-install: %s", e.getMessage());
       return true;
@@ -989,6 +1062,17 @@ public class AdbHelper implements AndroidDevicesHelper {
         LOG.info("Installed APK differs.  Must re-install.");
         return true;
       default:
+        if (forceQueryable) {
+          try {
+            if (!device.isPackageQueryable(packageName)) {
+              LOG.info("Installed APK is not queryable.  Must re-install.");
+              return true;
+            }
+          } catch (AdbCommandFailedException e) {
+            LOG.info("Could not read package queryability.  Must re-install: %s", e.getMessage());
+            return true;
+          }
+        }
         LOG.info("Installed APK matches.  No need to install.");
         return false;
     }

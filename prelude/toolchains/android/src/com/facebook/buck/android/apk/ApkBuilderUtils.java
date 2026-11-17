@@ -13,6 +13,7 @@ package com.facebook.buck.android.apk;
 import com.facebook.buck.android.apk.sdk.ApkBuilder;
 import com.facebook.buck.android.apk.sdk.ApkCreationException;
 import com.facebook.buck.android.apk.sdk.DuplicateFileException;
+import com.facebook.buck.android.apk.sdk.FastPackaging;
 import com.facebook.buck.android.apk.sdk.SealedApkException;
 import com.facebook.infer.annotation.Nullsafe;
 import com.google.common.collect.ImmutableSet;
@@ -23,6 +24,7 @@ import java.nio.file.Path;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.UnrecoverableKeyException;
+import java.util.function.Predicate;
 import org.jetbrains.annotations.Nullable;
 
 /** A class that provides methods useful for building an APK. */
@@ -45,7 +47,53 @@ public class ApkBuilderUtils {
       KeystoreProperties keystoreProperties,
       boolean packageMetaInfVersionFiles,
       @Nullable PrintStream output,
-      ImmutableSet<String> excludedResources)
+      ImmutableSet<String> excludedResources,
+      Predicate<String> storedPaths)
+      throws IOException,
+          ApkCreationException,
+          KeyStoreException,
+          NoSuchAlgorithmException,
+          SealedApkException,
+          UnrecoverableKeyException,
+          DuplicateFileException {
+    buildApk(
+        resourceApk,
+        pathToOutputApkFile,
+        dexFile,
+        assetDirectories,
+        nativeLibraryDirectories,
+        zipFiles,
+        jarFilesThatMayContainResources,
+        pathToKeystore,
+        keystoreProperties,
+        packageMetaInfVersionFiles,
+        output,
+        excludedResources,
+        storedPaths,
+        null);
+  }
+
+  /**
+   * Builds the APK like {@link #buildApk(Path, Path, Path, ImmutableSet, ImmutableSet,
+   * ImmutableSet, ImmutableSet, Path, KeystoreProperties, boolean, PrintStream, ImmutableSet,
+   * Predicate)}, with {@link com.facebook.buck.android.apk.sdk.FastApkJarBuilder} when {@code
+   * fastPackaging} is set.
+   */
+  public static void buildApk(
+      Path resourceApk,
+      Path pathToOutputApkFile,
+      Path dexFile,
+      ImmutableSet<Path> assetDirectories,
+      ImmutableSet<Path> nativeLibraryDirectories,
+      ImmutableSet<Path> zipFiles,
+      ImmutableSet<Path> jarFilesThatMayContainResources,
+      Path pathToKeystore,
+      KeystoreProperties keystoreProperties,
+      boolean packageMetaInfVersionFiles,
+      @Nullable PrintStream output,
+      ImmutableSet<String> excludedResources,
+      Predicate<String> storedPaths,
+      @Nullable FastPackaging fastPackaging)
       throws IOException,
           ApkCreationException,
           KeyStoreException,
@@ -60,7 +108,9 @@ public class ApkBuilderUtils {
             dexFile.toFile(),
             packageMetaInfVersionFiles,
             output,
-            excludedResources);
+            excludedResources,
+            storedPaths,
+            fastPackaging);
     for (Path nativeLibraryDirectory : nativeLibraryDirectories.stream().sorted().toList()) {
       builder.addNativeLibraries(nativeLibraryDirectory.toFile());
     }

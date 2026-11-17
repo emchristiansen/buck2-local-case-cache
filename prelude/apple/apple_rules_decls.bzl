@@ -15,6 +15,7 @@ load("@prelude//:attrs_validators.bzl", "validation_common")
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//:validation_deps.bzl", "VALIDATION_DEPS_ATTR_NAME", "VALIDATION_DEPS_ATTR_TYPE")
 load("@prelude//apple:apple_common.bzl", "apple_common")
+load("@prelude//apple:apple_execution_groups.bzl", "AppleResources")
 load("@prelude//apple:apple_info_plist.bzl", "MergeOperations", "RestrictedMergeOperations", "UpdateOperations", "apple_info_plist_impl")
 load("@prelude//apple:apple_metal_library.bzl", "apple_metal_library_impl")
 load("@prelude//apple:apple_provisioning_profile_sources.bzl", "apple_provisioning_profile_sources_impl")
@@ -22,10 +23,8 @@ load("@prelude//apple:apple_resource_dedupe_alias.bzl", "apple_resource_dedupe_a
 load("@prelude//apple:apple_resource_types.bzl", "AppleResourceDestination")
 load(
     "@prelude//apple:apple_rules_impl_utility.bzl",
-    "AppleFrameworkBundleModuleMapType",
     "apple_bundle_extra_attrs",
     "apple_test_extra_attrs",
-    "get_apple_info_plist_build_system_identification_attrs",
 )
 load("@prelude//apple:apple_simulators.bzl", "apple_simulators_impl")
 load("@prelude//apple:apple_static_archive.bzl", "apple_static_archive_impl")
@@ -42,7 +41,6 @@ load("@prelude//apple/swift:swift_toolchain_types.bzl", "SwiftObjectFormat")
 load("@prelude//apple/swift:swift_types.bzl", "SwiftMacroPlugin", "SwiftVersion")
 load("@prelude//apple/user:apple_ipa_package.bzl", "apple_ipa_package_attribs", "apple_ipa_package_impl")
 load("@prelude//apple/user:apple_macos_bundle.bzl", "apple_macos_bundle_impl")
-load("@prelude//apple/user:apple_resource_bundle.bzl", "apple_resource_bundle_impl")
 load("@prelude//apple/user:apple_resource_transition.bzl", "apple_resource_transition")
 load(
     "@prelude//apple/user:apple_selective_debugging.bzl",
@@ -90,15 +88,14 @@ load(
     "get_apple_resources_toolchain_attr",
     "get_apple_xctoolchain_attr",
     "get_apple_xctoolchain_bundle_id_attr",
+    "get_apple_xctoolchain_full_attr",
     "get_enable_library_evolution",
     "get_incremental_split_actions_attrs",
     "get_incremental_swiftmodule_action_attrs",
     "get_skip_swift_incremental_outputs_attrs",
-    "get_swift_dynamic_replacement_enabled",
     "get_swift_incremental_file_hashing_attrs",
     "get_swift_incremental_logging_attrs",
     "get_swift_incremental_remote_outputs_attrs",
-    "get_versioned_macos_bundle_attr",
 )
 load(":apple_test.bzl", "apple_test_impl")
 load(":apple_toolchain.bzl", "apple_toolchain_impl")
@@ -396,6 +393,7 @@ apple_binary = prelude_rule(
             "swift_version": attrs.enum(SwiftVersion, default = SwiftVersion[0]),
             "_apple_xctoolchain": get_apple_xctoolchain_attr(),
             "_apple_xctoolchain_bundle_id": get_apple_xctoolchain_bundle_id_attr(),
+            "_apple_xctoolchain_full": get_apple_xctoolchain_full_attr(),
             "_enable_library_evolution": get_enable_library_evolution(),
             "_swift_enable_testing": attrs.default_only(attrs.bool(default = False)),
             VALIDATION_DEPS_ATTR_NAME: VALIDATION_DEPS_ATTR_TYPE,
@@ -565,6 +563,7 @@ apple_bundle = prelude_rule(
     ),
     impl = apple_bundle_impl,
     cfg = target_sdk_version_transition,
+    exec_groups = [DefaultExecGroup, AppleResources],
 )
 
 apple_library = prelude_rule(
@@ -677,7 +676,6 @@ apple_library = prelude_rule(
         | apple_common.uses_cxx_explicit_modules_arg()
         | apple_common.uses_modules_arg()
         | {
-            "bridging_header": attrs.option(attrs.source(), default = None),
             "can_be_asset": attrs.option(attrs.bool(), default = None),
             "cxx_runtime_type": attrs.option(attrs.enum(CxxRuntimeType), default = None),
             "dist_thin_lto_codegen_flags": attrs.list(attrs.arg(), default = []),
@@ -731,16 +729,8 @@ apple_library = prelude_rule(
             "use_archive": attrs.option(attrs.bool(), default = None),
             "_apple_xctoolchain": get_apple_xctoolchain_attr(),
             "_apple_xctoolchain_bundle_id": get_apple_xctoolchain_bundle_id_attr(),
+            "_apple_xctoolchain_full": get_apple_xctoolchain_full_attr(),
             "_enable_library_evolution": get_enable_library_evolution(),
-            # Compiles the module so that every function, initializer, computed
-            # property and subscript can be replaced at run time with
-            # `@_dynamicReplacement`, and lets the library produce such
-            # replacements. Every call pays an indirection, so this is for
-            # development builds only and no target can set it: it follows the
-            # `swift_dynamic_replacement` constraint, and when that is
-            # unspecified the `apple.swift_dynamic_replacement_override_enabled`
-            # buckconfig.
-            "_swift_dynamic_replacement_enabled": get_swift_dynamic_replacement_enabled(),
             "_swift_enable_testing": attrs.bool(
                 default = select({
                     "DEFAULT": False,
@@ -758,6 +748,7 @@ apple_library = prelude_rule(
         | xplugins_common.debug_artifacts_arg
         | get_incremental_split_actions_attrs()
         | get_incremental_swiftmodule_action_attrs()
+        | apple_common.swift_dynamic_replacement_enabled_arg()
     ),
     uses_plugins = [SwiftMacroPlugin],
     impl = apple_library_impl,
@@ -1119,7 +1110,7 @@ apple_test = prelude_rule(
             "cxx_runtime_type": attrs.option(attrs.enum(CxxRuntimeType), default = None),
             "destination_specifier": attrs.dict(key = attrs.string(), value = attrs.string(), sorted = False, default = {}),
             "entitlements_file": attrs.option(attrs.source(), default = None),
-            "env": attrs.option(attrs.dict(key = attrs.string(), value = attrs.arg(), sorted = False), default = None),
+            "env": attrs.option(attrs.dict(key = attrs.string(), value = attrs.arg(exec_group = DefaultExecGroup), sorted = False), default = None),
             # Need to keep both `exported_headers` and `headers` for Swift mixed modules
             # to hide C++ code importing.
             "exported_headers": attrs.named_set(attrs.source(), sorted = True, default = []),
@@ -1131,6 +1122,11 @@ apple_test = prelude_rule(
             "force_static": attrs.option(attrs.bool(), default = None),
             "headers_as_raw_headers_mode": attrs.option(attrs.enum(HeadersAsRawHeadersMode), default = None),
             "incremental_bundling_enabled": attrs.option(attrs.bool(), default = None),
+            "internal_bridging_header": attrs.option(
+                attrs.source(),
+                default = None,
+                doc = "A bridging header whose declarations are imported with internal visibility during Swift compilation.",
+            ),
             "is_ui_test": attrs.bool(default = False),
             "lang_compiler_flags": attrs.dict(key = attrs.enum(CxxSourceType), value = attrs.list(attrs.arg()), sorted = False, default = {}),
             "lang_preprocessor_flags": attrs.dict(key = attrs.enum(CxxSourceType), value = attrs.list(attrs.arg()), sorted = False, default = {}),
@@ -1149,7 +1145,7 @@ apple_test = prelude_rule(
             "runner": attrs.option(attrs.dep(), default = None),
             "skip_copying_swift_stdlib": attrs.option(attrs.bool(), default = None),
             "snapshot_reference_images_path": attrs.option(attrs.one_of(attrs.source(), attrs.string()), default = None),
-            "specs": attrs.option(attrs.arg(json = True), default = None),
+            "specs": attrs.option(attrs.arg(json = True, exec_group = DefaultExecGroup), default = None),
             "supports_merged_linking": attrs.option(attrs.bool(), default = None),
             "swift_compiler_flags": attrs.list(attrs.arg(), default = []),
             "swift_interface_compilation_enabled": attrs.bool(default = False),
@@ -1166,6 +1162,7 @@ apple_test = prelude_rule(
         | constraint_overrides.attributes
     ),
     uses_plugins = [SwiftMacroPlugin],
+    exec_groups = [DefaultExecGroup, AppleResources],
     impl = apple_test_impl,
     cfg = apple_test_target_sdk_version_transition,
 )
@@ -1443,6 +1440,7 @@ swift_toolchain = prelude_rule(
             # -emit-modularization-dependency-dot-graph.
             "supports_modularization_dependency_graph": attrs.bool(default = False),
             "supports_modulemaps_with_hmaps": attrs.bool(default = False),
+            "supports_pch_base_dir_is_cwd": attrs.bool(default = False),
             "supports_relative_resource_dir": attrs.bool(default = False),
             "swift_experimental_features": attrs.dict(
                 key = attrs.enum(SwiftVersion), value = attrs.list(attrs.string()), sorted = False, default = SWIFT_VERSION_FEATURE_MAP
@@ -1450,7 +1448,6 @@ swift_toolchain = prelude_rule(
             "swift_ide_test_tool": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "swift_stdlib_tool": attrs.exec_dep(providers = [RunInfo]),
             "swift_stdlib_tool_flags": attrs.list(attrs.arg(), default = []),
-            "swift_symbolgraph_extract": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "swift_upcoming_features": attrs.dict(
                 key = attrs.enum(SwiftVersion), value = attrs.list(attrs.string()), sorted = False, default = SWIFT_VERSION_FEATURE_MAP
             ),
@@ -1774,6 +1771,7 @@ apple_macos_bundle = prelude_rule(
     """,
     impl = apple_macos_bundle_impl,
     attrs = apple_macos_bundle_attrs(),
+    exec_groups = [DefaultExecGroup, AppleResources],
     cfg = macos_transition,
 )
 
@@ -1786,48 +1784,8 @@ apple_watchos_bundle = prelude_rule(
     """,
     impl = apple_watchos_bundle_impl,
     attrs = apple_watchos_bundle_attrs(),
+    exec_groups = [DefaultExecGroup, AppleResources],
     cfg = watch_transition,
-)
-
-apple_resource_bundle = prelude_rule(
-    name = "apple_resource_bundle",
-    docs = """
-        An `apple_resource_bundle()` is a rule that exists for internal implementation reasons to compile resources for the Apple platform. It's used by the Apple rules and not for public consumption.
-    """,
-    impl = apple_resource_bundle_impl,
-    attrs = (
-        buck.labels_arg()
-        | buck.contacts_arg()
-        | apple_common.deps_arg()
-        | apple_common.ibtool_flags_arg()
-        | apple_common.product_name_arg()
-        | apple_common.resource_group_arg()
-        | {
-            "binary": attrs.option(attrs.split_transition_dep(cfg = cpu_split_transition), default = None),
-            "copy_public_framework_headers": attrs.option(attrs.bool(), default = None),
-            "extension": attrs.one_of(attrs.enum(AppleBundleExtension), attrs.string()),
-            "info_plist": attrs.source(),
-            "module_map": attrs.option(attrs.one_of(attrs.enum(AppleFrameworkBundleModuleMapType), attrs.source()), default = None),
-            "privacy_manifest": attrs.option(attrs.source(), default = None),
-            "product_name_from_module_name": attrs.bool(default = False),
-            "resource_group_map": RESOURCE_GROUP_MAP_ATTR,
-            "universal": attrs.option(attrs.bool(), default = None),
-            "versioned_macos_bundle": get_versioned_macos_bundle_attr(),
-            "xcassets_usage_targets": attrs.list(attrs.split_transition_dep(cfg = cpu_split_transition), default = []),
-            # Only include macOS hosted toolchains, so we compile resources directly on Mac RE
-            "_apple_toolchain": get_apple_resources_toolchain_attr(),
-            # Because `apple_resource_bundle` is a proxy for `apple_bundle`, we need to get `name`
-            # field of the `apple_bundle`, as it's used as a fallback value in Info.plist.
-            "_bundle_target_name": attrs.string(),
-            "_compile_resources_locally_override": attrs.option(attrs.bool(), default = None),
-        }
-        | get_apple_info_plist_build_system_identification_attrs()
-        | apple_common.apple_tools_arg()
-        | apple_common.asset_catalogs_compilation_options_arg()
-        | apple_common.info_plist_substitutions_arg()
-        | apple_common.enforce_minimum_os_plist_key()
-        | apple_common.skip_private_swiftinterface_arg()
-    ),
 )
 
 apple_resource_dedupe_alias = prelude_rule(
@@ -1937,7 +1895,6 @@ apple_rules = struct(
     apple_test = apple_test,
     apple_toolchain = apple_toolchain,
     apple_tools = apple_tools,
-    apple_resource_bundle = apple_resource_bundle,
     apple_resource_dedupe_alias = apple_resource_dedupe_alias,
     apple_selective_debugging = apple_selective_debugging,
     apple_simulators = apple_simulators,

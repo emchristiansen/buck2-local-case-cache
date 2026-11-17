@@ -1,3 +1,4 @@
+load("@prelude//git:git_fetch.bzl", "git_fetch_tool")
 load("@prelude//utils:source_listing.bzl", "source_listing")
 
 oncall("build_infra")
@@ -6,9 +7,23 @@ source_listing()
 
 prelude = native
 
-prelude.python_bootstrap_binary(
+# The fetch tool is eligible only on the platform advertising its immutable runtime.
+prelude.constraint_setting(
+    name = "fetch_runtime",
+    visibility = ["PUBLIC"],
+)
+
+prelude.constraint_value(
+    name = "fetch_runtime_available",
+    constraint_setting = ":fetch_runtime",
+    visibility = ["PUBLIC"],
+)
+
+git_fetch_tool(
     name = "git_fetch",
     main = "git_fetch.py",
+    runtime_manifest = "git-fetch-runtime.json",
+    target_compatible_with = [":fetch_runtime_available"],
     visibility = ["PUBLIC"],
 )
 

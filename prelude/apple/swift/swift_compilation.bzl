@@ -171,6 +171,10 @@ SwiftCompilationOutput = record(
     exported_pre = field(CPreprocessor),
     # Exported -Swift.h header
     exported_swift_header = field(Artifact),
+    # The umbrella header generated for a mixed module (`__<M>_umbrella__/<M>.h`, when
+    # `disable_generated_umbrella_header` is off): the exported header map names it under
+    # `<M>/<M>.h`, and `[umbrella-header]` is the one way to build it by label.
+    generated_umbrella_header = field(Artifact | None, None),
     # Argsfiles used to compile object files.
     argsfiles = field(CompileArgsfiles),
     # A tset of (SDK/first-party) swiftmodule artifacts required to be linked into binary.
@@ -188,7 +192,7 @@ SwiftCompilationOutput = record(
     swift_module_map_artifact = field(Artifact | None, None),
     # The `@_dynamicReplacement` thunks for every function in the module,
     # compiled as a separate module that imports this one. Populated when
-    # `_swift_dynamic_replacement_enabled` is set and the toolchain carries the
+    # `swift_dynamic_replacement_enabled` is set and the toolchain carries the
     # thunk tool; `apple_library` links the object and records the commands in
     # `[swift-dynamic-dylib-thunk-command-database]`.
     dynamic_thunk = field(SwiftDynamicThunkOutput | None, None),
@@ -427,7 +431,14 @@ def _get_internal_bridging_header_flags(
         swift_cxx_flags,
         additional_args,
     )
-    return cmd_args("-disable-bridging-pch", "-internal-import-bridging-header", pch)
+    # Clang reads the PCH's input headers when loading it, even with PCH
+    # validation disabled, so they must be materialized for Swift compilation.
+    return cmd_args(
+        "-disable-bridging-pch",
+        "-internal-import-bridging-header",
+        pch,
+        hidden = [header, private_header_args, public_header_args],
+    )
 
 def _generate_umbrella_header(ctx: AnalysisContext, module_name: str, exported_headers: list[CHeader], uses_content_based_paths: bool) -> [CHeader, None]:
     """Auto-generate an umbrella header for mixed ObjC/Swift modules.
@@ -668,7 +679,7 @@ def compile_swift(
         ctx,
         name = "swift-extended",
         module_name = module_name,
-        headers = exported_headers,
+        headers = exported_headers + ([generated_umbrella_header] if generated_umbrella_header else []),
         swift_header = output_header,
     )
     exported_swift_header = CHeader(
@@ -721,6 +732,7 @@ def compile_swift(
             pre = pre,
             exported_pre = exported_pp_info,
             exported_swift_header = exported_swift_header.artifact,
+            generated_umbrella_header = generated_umbrella_header.artifact if generated_umbrella_header else None,
             argsfiles = object_output.argsfiles,
             swift_debug_info = extract_and_merge_swift_debug_infos(ctx, deps_providers, [output_swiftmodule]),
             clang_debug_info = extract_and_merge_clang_debug_infos(

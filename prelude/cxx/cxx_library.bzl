@@ -49,6 +49,7 @@ load(
 load(
     "@prelude//ide_integrations/xcode:argsfiles.bzl",
     "XCODE_ARGSFILES_SUB_TARGET",
+    "XCODE_COMPILER_FLAGS_SUB_TARGET",
 )
 load(
     "@prelude//ide_integrations/xcode:data.bzl",
@@ -143,6 +144,7 @@ load(
     ":argsfiles.bzl",
     "ARGSFILES_SUBTARGET",
     "get_argsfiles_output",
+    "get_xcode_compiler_flags_output",
 )
 load(":bitcode.bzl", "BitcodeBundle", "BitcodeBundleInfo", "BitcodeTSet", "make_bitcode_bundle")
 load(
@@ -526,7 +528,7 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
 
     preferred_linkage = cxx_attr_preferred_linkage(ctx)
 
-    exported_needs_coverage = build_exported_needs_coverage(ctx, deps_all_exported_first)
+    compilation_needs_coverage = build_exported_needs_coverage(ctx, deps_all_exported_first)
     compiled_srcs = cxx_compile_srcs(
         actions = ctx.actions,
         target_label = ctx.label,
@@ -538,7 +540,7 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
         inherited_exported_preprocessor_infos = inherited_exported_preprocessor_infos,
         preferred_linkage = preferred_linkage,
         compile_pch = compile_pch,
-        add_coverage_instrumentation_compiler_flags = needs_coverage(exported_needs_coverage),
+        add_coverage_instrumentation_compiler_flags = needs_coverage(compilation_needs_coverage),
     )
 
     sub_targets = {}
@@ -596,6 +598,11 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
 
         providers.append(pch_provider)
 
+    # Callers see exported headers; PCHs and reexport_all_header_dependencies can also expose private headers.
+    if impl_params.coverage_profile_list_srcs and not compile_pch and not impl_params.precompiled_header and not _attr_reexport_all_header_dependencies(ctx):
+        exported_needs_coverage = build_exported_needs_coverage(ctx, exported_deps)
+    else:
+        exported_needs_coverage = compilation_needs_coverage
     providers.append(exported_needs_coverage)
 
     if len(ctx.attrs.tests) > 0 and impl_params.generate_providers.preprocessor_for_tests:
@@ -610,6 +617,9 @@ def cxx_library_parameterized(ctx: AnalysisContext, impl_params: CxxRuleConstruc
         sub_targets[ARGSFILES_SUBTARGET] = [get_argsfiles_output(ctx, compiled_srcs.compile_cmds.argsfiles.relative, ARGSFILES_SUBTARGET)]
     if impl_params.generate_sub_targets.xcode_data:
         sub_targets[XCODE_ARGSFILES_SUB_TARGET] = [get_argsfiles_output(ctx, compiled_srcs.compile_cmds.argsfiles.xcode, XCODE_ARGSFILES_SUB_TARGET)]
+        sub_targets[XCODE_COMPILER_FLAGS_SUB_TARGET] = [
+            get_xcode_compiler_flags_output(ctx, compiled_srcs.compile_cmds.argsfiles.xcode, XCODE_COMPILER_FLAGS_SUB_TARGET)
+        ]
 
     if impl_params.generate_sub_targets.clang_remarks:
         if compiled_srcs.non_pic and compiled_srcs.non_pic.clang_remarks:

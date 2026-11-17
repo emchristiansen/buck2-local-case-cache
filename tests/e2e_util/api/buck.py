@@ -10,6 +10,7 @@
 # pyre-strict
 
 import os
+import subprocess as sync_subprocess
 import uuid
 from asyncio import subprocess
 from pathlib import Path
@@ -774,6 +775,21 @@ class Buck(Executable):
         client = await SubscribeClient.create(process)
         return client
 
+    def run_sync(
+        self, cmd: str, *argv: str, timeout: float
+    ) -> "sync_subprocess.CompletedProcess[bytes]":
+        """
+        Runs a buck command to completion without the event loop, for code that cannot await,
+        such as a signal handler.
+        """
+        return sync_subprocess.run(
+            self.construct_buck_command(cmd, *argv),
+            cwd=self.cwd,
+            env=self._get_command_env(None),
+            capture_output=True,
+            timeout=timeout,
+        )
+
     def construct_buck_command(
         self,
         cmd: str,
@@ -968,7 +984,16 @@ class Buck(Executable):
         )
 
     async def get_daemon_dir(self) -> Path:
-        return Path((await self.debug("daemon-dir")).stdout.strip())
+        # `debug daemon-dir` doesn't accept `--unstable-write-invocation-record`.
+        daemon_dir = await self._run_buck_command(
+            "debug",
+            "daemon-dir",
+            input=None,
+            rel_cwd=None,
+            env=None,
+            can_write_invocation_record=False,
+        )
+        return Path(daemon_dir.stdout.strip())
 
     async def daemon_stderr(self) -> str:
         daemon_dir = await self.get_daemon_dir()

@@ -249,6 +249,9 @@ def compile_internal_bridging_header_pch(
     swift_cxx_args: list[str],
     additional_args: cmd_args,
 ) -> Artifact:
+    # Embed inputs so toolchains without cwd-relative PCH paths can still
+    # load a PCH built on another machine.
+    additional_args = cmd_args(additional_args, "-Xcc", "-Xclang", "-Xcc", "-fmodules-embed-all-files")
     return _compile_clang_headers(
         ctx,
         "swift_internal_bridging_header_pch_compile",
@@ -330,6 +333,8 @@ def _get_base_pcm_flags(
         # The driver has no standalone PCH mode. Use its Clang-input mode and
         # override the frontend action to emit a PCH instead of a PCM.
         cmd.add("-Xfrontend", "-emit-pch", "-Xcc", "-Xclang", "-Xcc", "-fno-pch-timestamp")
+        if swift_toolchain_info.supports_pch_base_dir_is_cwd:
+            cmd.add("-Xcc", "-fpch-base-dir-is-cwd")
 
     additional_cmd = cmd_args("-o", pcm_output.as_output())
 

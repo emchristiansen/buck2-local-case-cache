@@ -13,6 +13,7 @@
 use crate::Change;
 use crate::EpsilonToken;
 use crate::Seq;
+use crate::tests::Stamp;
 use crate::tests::State;
 use crate::tests::StateExt;
 use crate::tests::cert;
@@ -44,12 +45,12 @@ fn a_commit_with_no_effective_change_returns_the_head() {
             Change::Assert {
                 key: k(0),
                 revision: r(1),
-                data: (),
+                data: Stamp::mint(),
             },
             Change::Assert {
                 key: k(1),
                 revision: r(1),
-                data: (),
+                data: Stamp::mint(),
             },
         ],
     );
@@ -129,24 +130,24 @@ fn batched_changes_close_overlapping_dependents_only() {
                 Change::Assert {
                     key: k(0),
                     revision: r(1),
-                    data: (),
+                    data: Stamp::mint(),
                 },
                 Change::Dirty {
                     key: k(2),
-                    data: (),
+                    data: Stamp::mint(),
                 },
                 Change::Assert {
                     key: k(1),
                     revision: r(2),
-                    data: (),
+                    data: Stamp::mint(),
                 },
                 Change::Dirty {
                     key: k(3),
-                    data: (),
+                    data: Stamp::mint(),
                 },
                 Change::Dirty {
                     key: k(4),
-                    data: (),
+                    data: Stamp::mint(),
                 },
             ];
             if reverse {
@@ -192,12 +193,12 @@ fn a_dirty_closes_the_key_and_its_dependents() {
     assert!(s.is_unknown_at(k(1), v2));
     assert_eq!(s.valid_at(k(0), v(root, 1)), Some(r(1)));
     assert_eq!(s.valid_at(k(1), v(root, 1)), Some(r(1)));
-    assert_eq!(
-        s.dirtied_at(k(0), v2).map(|a| a.version),
-        Some(v2),
-        "the dirty in force at the new version is the one just committed"
+    assert_ne!(
+        s.epsilon(k(0), v2),
+        EpsilonToken::INITIAL,
+        "the dirty just committed is in force at the new version"
     );
-    assert_eq!(s.dirtied_at(k(0), v(root, 1)), None);
+    assert_eq!(s.epsilon(k(0), v(root, 1)), EpsilonToken::INITIAL);
 }
 
 /// Closing an inherited claim gives the branch its own closed copy and leaves the parent alone.
@@ -230,11 +231,9 @@ fn seqs_are_per_branch() {
     assert_eq!(s.head(root), v(root, 3));
 }
 
+// With panic=abort the panic kills the in-process Miri harness.
+#[cfg(not(all(miri, panic = "abort")))]
 #[test]
-#[cfg_attr(
-    all(miri, panic = "abort"),
-    ignore = "with panic=abort the panic kills the in-process Miri harness"
-)]
 #[should_panic(expected = "never both")]
 fn asserting_a_certified_key_panics() {
     let mut s = State::new();
@@ -243,11 +242,9 @@ fn asserting_a_certified_key_panics() {
     s.assert_at(root, k(0), r(1));
 }
 
+// With panic=abort the panic kills the in-process Miri harness.
+#[cfg(not(all(miri, panic = "abort")))]
 #[test]
-#[cfg_attr(
-    all(miri, panic = "abort"),
-    ignore = "with panic=abort the panic kills the in-process Miri harness"
-)]
 #[should_panic(expected = "never both")]
 fn certifying_an_asserted_key_panics() {
     let mut s = State::new();
@@ -256,11 +253,9 @@ fn certifying_an_asserted_key_panics() {
     s.write_checked(&cert(k(0), r(1), &[], EpsilonToken::INITIAL));
 }
 
+// With panic=abort the panic kills the in-process Miri harness.
+#[cfg(not(all(miri, panic = "abort")))]
 #[test]
-#[cfg_attr(
-    all(miri, panic = "abort"),
-    ignore = "with panic=abort the panic kills the in-process Miri harness"
-)]
 #[should_panic(expected = "never both")]
 fn dirtying_an_asserted_key_panics() {
     let mut s = State::new();
@@ -334,11 +329,9 @@ fn reasserting_the_parents_revision_after_an_own_change_is_a_change() {
     assert_eq!(s.valid_at(k(0), v(root, 2)), Some(r(1)));
 }
 
+// With panic=abort the panic kills the in-process Miri harness.
+#[cfg(not(all(miri, panic = "abort")))]
 #[test]
-#[cfg_attr(
-    all(miri, panic = "abort"),
-    ignore = "with panic=abort the panic kills the in-process Miri harness"
-)]
 #[should_panic(expected = "appears twice in one commit")]
 fn a_key_appearing_twice_in_one_commit_panics() {
     let mut s = State::new();
@@ -348,11 +341,11 @@ fn a_key_appearing_twice_in_one_commit_panics() {
         vec![
             Change::Dirty {
                 key: k(1),
-                data: (),
+                data: Stamp::mint(),
             },
             Change::Dirty {
                 key: k(1),
-                data: (),
+                data: Stamp::mint(),
             },
         ],
     );
@@ -360,11 +353,9 @@ fn a_key_appearing_twice_in_one_commit_panics() {
 
 /// Deleting the only branch with a claim on a key forgets the claim, not that the key has been
 /// certified: asserting it afterwards is still the mistake it was before.
+// With panic=abort the panic kills the in-process Miri harness.
+#[cfg(not(all(miri, panic = "abort")))]
 #[test]
-#[cfg_attr(
-    all(miri, panic = "abort"),
-    ignore = "with panic=abort the panic kills the in-process Miri harness"
-)]
 #[should_panic(expected = "asserted after being certified")]
 fn a_key_certified_on_a_deleted_branch_still_cannot_be_asserted() {
     let (mut s, root, _) = leaf_and_dependent();

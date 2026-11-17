@@ -26,14 +26,18 @@ DexLibraryInfo = provider(
         "weight_estimate": provider_field(typing.Any, default = None),  # ["artifact", None]
         # a file containing the exact method_ids_size, field_ids_size, and type_ids_size
         # from the DEX header. Format: "<method_ref_count> <field_ref_count> <type_ref_count>"
-        # (single line). These are the actual counts that the 64K DEX limits apply to,
-        # unlike weight_estimate which is a byte-size proxy.
+        # (first line, summed over the .dex.jar's dex files). These are the actual counts that
+        # the 64K DEX limits apply to, unlike weight_estimate which is a byte-size proxy. When the
+        # dex toolchain sets class_ref_counts, a library over a 64K limit without synthetic
+        # classes also gets one "<method_ref_count> <field_ref_count> <type_ref_count> <class>"
+        # line per class, counted with D8 dexing that class alone.
         "ref_count": provider_field(typing.Any, default = None),  # ["artifact", None]
         # a file mapping each synthetic class D8 created to the class it was synthesized from,
         # one "<synthetic> <context>" pair per line. A synthetic must be placed in the same dex
         # as its context class, and D8 reports the pairing because the synthetic's name is
         # mangled in a format it does not treat as stable.
         "synthetic_contexts": provider_field(typing.Any, default = None),  # ["artifact", None]
+        "dex_units": provider_field(typing.Any, default = None),  # ["artifact", None]
     },
 )
 
@@ -55,7 +59,7 @@ def get_dex_produced_from_java_library(
     d8_cmd.add(["--file-to-dex", jar_to_dex])
     d8_cmd.add(["--android-jar", dex_toolchain.android_jar])
 
-    d8_cmd.add(["--intermediate", "--no-optimize", "--force-jumbo"])
+    d8_cmd.add(["--intermediate", "--file-per-class-file", "--no-optimize", "--force-jumbo"])
     if not needs_desugar:
         d8_cmd.add("--no-desugar")
     else:
@@ -76,11 +80,16 @@ def get_dex_produced_from_java_library(
 
     ref_count_file = ctx.actions.declare_output(prefix + "_ref_count.txt", has_content_based_path = True)
     d8_cmd.add(["--ref-count-path", ref_count_file.as_output()])
+    if dex_toolchain.class_ref_counts:
+        d8_cmd.add("--class-ref-counts")
 
     synthetic_contexts_file = ctx.actions.declare_output(prefix + "_synthetic_contexts.txt", has_content_based_path = True)
     d8_cmd.add(["--synthetic-contexts-path", synthetic_contexts_file.as_output()])
 
-    min_sdk_version = getattr(ctx.attrs, "_dex_min_sdk_version", None) or getattr(ctx.attrs, "min_sdk_version", None)
+    dex_units_file = ctx.actions.declare_output(prefix + "_dex_units.txt", has_content_based_path = True)
+    d8_cmd.add(["--dex-units-path", dex_units_file.as_output()])
+
+    min_sdk_version = ctx.attrs.min_sdk_version
     if min_sdk_version:
         d8_cmd.add(["--min-sdk-version", str(min_sdk_version)])
 
@@ -100,4 +109,5 @@ def get_dex_produced_from_java_library(
         weight_estimate = weight_estimate_file,
         ref_count = ref_count_file,
         synthetic_contexts = synthetic_contexts_file,
+        dex_units = dex_units_file,
     )

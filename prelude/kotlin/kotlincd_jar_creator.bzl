@@ -30,6 +30,7 @@ load(
 load(
     "@prelude//java/utils:java_utils.bzl",
     "CustomJdkInfo",  # @unused Used as type
+    "declare_prefixed_name",
 )
 load(
     "@prelude//jvm:cd_jar_creator_util.bzl",
@@ -42,12 +43,14 @@ load(
     "encode_command",
     "generate_abi_jars",
     "get_source_only_abi_compiling_deps",
+    "get_source_only_abi_jars",
     "prepare_cd_exe",
     "prepare_final_jar",
     "setup_dep_files",
 )
 load("@prelude//kotlin:kotlin_toolchain.bzl", "KotlinToolchainInfo")
 load("@prelude//kotlin:kotlin_utils.bzl", "get_kotlinc_compatible_target")
+load("@prelude//utils:argfile.bzl", "at_argfile")
 load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "map_idx")
 
@@ -103,11 +106,6 @@ def create_jar_artifact_kotlincd(
             )
         )
     actual_abi_generation_mode = abi_generation_mode or AbiGenerationMode("class") if srcs else AbiGenerationMode("none")
-
-    # A toolchain without Kosabi (kotlin.enable_source_only_abi=false) can't produce a source-only
-    # ABI, so targets that hard-code source_only fall back to the class ABI instead of failing.
-    if actual_abi_generation_mode == AbiGenerationMode("source_only") and kotlin_toolchain.kosabi_stubs_gen_k2_plugin == None:
-        actual_abi_generation_mode = AbiGenerationMode("class")
     kosabi_applicability_cell_root = (
         label.cell_root
         if not is_creating_subtarget and actual_abi_generation_mode == AbiGenerationMode("source_only") and kotlin_toolchain.kosabi_applicability_plugin != None
@@ -161,7 +159,17 @@ def create_jar_artifact_kotlincd(
     so_abi_deps = None
     if actual_abi_generation_mode == AbiGenerationMode("source_only"):
         so_abi_deps = get_source_only_abi_compiling_deps(actions, compiling_deps_tset, source_only_abi_deps)
-        source_only_abi_applicability_classpath = cmd_args(so_abi_deps.project_as_args("source_only_abi_jars"))
+        if kotlin_toolchain.kosabi_availability_jars != None:
+            # The jars themselves are inputs that no dep file covers, so any change to them would rerun
+            # this compile; the availability jars change only when what the checks read changes.
+            source_only_abi_applicability_classpath = _availability_jars(
+                actions,
+                actions_identifier,
+                kotlin_toolchain.kosabi_availability_jars,
+                get_source_only_abi_jars(so_abi_deps, compiling_deps_tset, source_only_abi_deps),
+            )
+        else:
+            source_only_abi_applicability_classpath = cmd_args(so_abi_deps.project_as_args("source_only_abi_jars"))
 
     track_class_usage = enable_depfiles and kotlin_toolchain.track_class_usage_plugin != None
 
@@ -292,6 +300,7 @@ def create_jar_artifact_kotlincd(
             incremental_state_dir = None,
             language_version = language_version,
             source_only_abi_applicability_classpath = cmd_args(),
+            kosabi_jvm_abi_gen_options = kotlin_toolchain.kosabi_jvm_abi_gen_options,
         )
 
         # kotlincd does not support source abi
@@ -365,6 +374,36 @@ def create_jar_artifact_kotlincd(
             {},
         )
 
+def _availability_jars(actions: AnalysisActions, actions_identifier: [str, None], tool: Dependency, jars: list[Artifact]) -> cmd_args:
+    """The availability jars of `jars`, in the same order: see AvailabilityJars."""
+    # The i-th availability jar is `<output>/<i>/<cell>.<package>.<target>/<jar name>`, so the compile
+    # command still shows which dependency each one stands for.
+    names = [_availability_jar_name(jar) for jar in jars]
+    args = []
+    for name, jar in zip(names, jars):
+        args.extend([name, jar])
+    output = declare_prefixed_output(actions, actions_identifier, "source_only_abi_availability_jars", has_content_based_path = True, dir = True)
+    actions.run(
+        cmd_args(
+            tool[RunInfo],
+            output.as_output(),
+            at_argfile(
+                actions = actions,
+                name = declare_prefixed_name("source_only_abi_availability_jars.args", actions_identifier),
+                args = args,
+                has_content_based_path = True,
+            ),
+        ),
+        category = "kosabi_availability_jars",
+        identifier = actions_identifier,
+    )
+    return cmd_args([cmd_args(output, format = "{}/" + str(index) + "/" + name) for index, name in enumerate(names)])
+
+def _availability_jar_name(jar: Artifact) -> str:
+    # Classpath jars are build outputs, so they have an owner.
+    owner = jar.owner
+    return "{}.{}.{}/{}".format(owner.cell, owner.package.replace("/", "."), owner.name, jar.basename)
+
 def get_source_only_friend_path_abis(friend_paths: list[Dependency], source_only_abi_deps: list[Dependency]) -> list[Artifact]:
     """Returns friend ABI jars restricted to the source-only ABI classpath."""
     if not friend_paths:
@@ -404,6 +443,7 @@ def _encode_kotlin_extra_params(
     incremental_state_dir: Artifact | None,
     language_version: str,
     source_only_abi_applicability_classpath: cmd_args = cmd_args(),
+    kosabi_jvm_abi_gen_options: list[str] = [],
 ):
     kosabiPluginOptionsMap = {}
 
@@ -418,6 +458,12 @@ def _encode_kotlin_extra_params(
 
     if kotlin_toolchain.kosabi_jvm_abi_gen_k2_plugin != None:
         kosabiPluginOptionsMap["kosabi_jvm_abi_gen_k2_plugin"] = kotlin_toolchain.kosabi_jvm_abi_gen_k2_plugin
+
+    # Rokoko stubgen .so (prototype engine). Present only when
+    # kotlin.stubgen_engine=rokoko; the Java side branches on its presence.
+    # Excluded from main-compile -Xplugin args in KosabiPluginOptions.
+    if kotlin_toolchain.rokoko_stubgen_so != None:
+        kosabiPluginOptionsMap["rokoko_stubgen_so"] = kotlin_toolchain.rokoko_stubgen_so[DefaultInfo].default_outputs[0]
 
     return struct(
         extraClassPaths = bootclasspath_entries,
@@ -437,6 +483,8 @@ def _encode_kotlin_extra_params(
         shouldKotlincRunIncrementally = should_kotlinc_run_incrementally,
         shouldKosabiUseShallowClassUsage = kotlin_toolchain.kosabi_shallow_class_usage,
         kosabiAbiValidationMode = kotlin_toolchain.kosabi_abi_validation_mode,
+        kosabiJvmAbiGenOptions = kosabi_jvm_abi_gen_options,
+        disableKosabiKeptBodyStubCheck = not kotlin_toolchain.kosabi_kept_body_stub_check,
         incrementalStateDir = incremental_state_dir.as_output() if incremental_state_dir else None,
         languageVersion = language_version,
         javaBinary = cmd_args(kotlin_toolchain.java_binary_for_kotlincd[RunInfo], delimiter = " ") if kotlin_toolchain.java_binary_for_kotlincd else "",
@@ -521,6 +569,15 @@ def _encode_kotlin_command(
         incremental_metadata_ignored_inputs_tag = incremental_metadata_ignored_inputs_tag,
     )
 
+def _is_small_compile(srcs: list[Artifact], max_srcs: int) -> bool:
+    if len(srcs) > max_srcs:
+        return False
+    for src in srcs:
+        # A source archive can hold any number of files.
+        if src.extension in (".srcjar", ".zip", ".jar"):
+            return False
+    return True
+
 # buildifier: disable=uninitialized
 # buildifier: disable=unused-variable
 def _define_kotlincd_action(
@@ -569,6 +626,7 @@ def _define_kotlincd_action(
         extra_jvm_args = kotlin_toolchain.kotlincd_jvm_args,
         extra_jvm_args_target = kotlin_toolchain.kotlincd_jvm_args_target,
         java_runtime_version = java_toolchain.java_runtime_version,
+        non_worker_jvm_args = kotlin_toolchain.kotlincd_small_action_jvm_args if _is_small_compile(srcs, kotlin_toolchain.kotlincd_small_action_max_srcs) else [],
     )
 
     args = cmd_args()

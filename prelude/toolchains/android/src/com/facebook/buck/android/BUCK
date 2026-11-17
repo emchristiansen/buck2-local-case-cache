@@ -32,6 +32,7 @@ buck_kotlin_library(
     srcs = HELPERS_SRCS,
     tests = [
         "prelude//toolchains/android/test/com/facebook/buck/android:unit",
+        "prelude//toolchains/android/test/com/facebook/buck/android/exopackage:unit",
     ],
     visibility = [
         "PUBLIC",
@@ -48,6 +49,7 @@ buck_kotlin_library(
         "prelude//toolchains/android/src/com/facebook/buck/util/environment:environment",
         "prelude//toolchains/android/third-party:guava",
         "prelude//toolchains/android/third-party:infer-annotations",
+        "prelude//toolchains/android/third-party:jspecify",
         "prelude//toolchains/android/third-party:kotlin-annotations",
         "prelude//toolchains/android/third-party:kotlinx-coroutines-core-jvm",
         "prelude//toolchains/android/third-party:zstd-jni",
@@ -99,7 +101,6 @@ UTILS_API_SRCS = [
     "exopackage/AndroidIntent.java",
     "exopackage/InstallTimings.java",
     "IsolatedApkInfo.java",
-    "exopackage/PackageInfo.java",
 ]
 
 buck_kotlin_library(

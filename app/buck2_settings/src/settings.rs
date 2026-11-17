@@ -15,22 +15,33 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::agent_build::AgentBuild;
 use crate::agent_config_change::AgentConfigChange;
 use crate::agent_interactive::AgentInteractive;
 use crate::agent_materialization::AgentMaterialization;
 use crate::analysis::Analysis;
+use crate::buckconfig::BuckconfigSource;
+use crate::daemon::Daemon;
+use crate::digest::Digest;
+use crate::event_log::EventLog;
+use crate::execution_platforms::ExecutionPlatforms;
+use crate::health_check::HealthCheck;
+use crate::http::Http;
 use crate::hydration::Hydration;
 use crate::log_download::LogDownload;
+use crate::materializer::Materializer;
 use crate::metadata::SectionMetadata;
 use crate::metadata::SectionReport;
 use crate::metadata::SectionScope;
 use crate::metadata::SettingsSection;
 use crate::package_visibility::PackageVisibility;
+use crate::resource_control::ResourceControl;
 use crate::section::Section;
+use crate::starlark::Starlark;
 
 /// Assembles `BuckSettings` from the sections, each listed under its scope.
 ///
-/// Generates the flat on-disk form (`BuckSettingsData`), the two scope
+/// Generates the flat on-disk form (`BuckSettingsData`), the three scope
 /// structs, the conversion between them, and the registry the parser and the
 /// rollout selector consult. A section listed under the wrong scope fails to
 /// compile.
@@ -38,10 +49,12 @@ macro_rules! buck_settings {
     (
         daemon { $($daemon:ident: $daemon_ty:ty,)* }
         invocation { $($invocation:ident: $invocation_ty:ty,)* }
+        dice { $($dice:ident: $dice_ty:ty,)* }
     ) => {
         pub(crate) static ALL_SECTION_METADATA: &[SectionMetadata] = &[
             $(<$daemon_ty as SettingsSection>::METADATA,)*
             $(<$invocation_ty as SettingsSection>::METADATA,)*
+            $(<$dice_ty as SettingsSection>::METADATA,)*
         ];
 
         const _: () = {
@@ -53,6 +66,10 @@ macro_rules! buck_settings {
                 matches!(<$invocation_ty as SettingsSection>::METADATA.scope, SectionScope::Invocation),
                 concat!("`", stringify!($invocation_ty), "` is listed as an invocation section but declares another scope"),
             );)*
+            $(assert!(
+                matches!(<$dice_ty as SettingsSection>::METADATA.scope, SectionScope::Dice),
+                concat!("`", stringify!($dice_ty), "` is listed as a dice section but declares another scope"),
+            );)*
         };
 
         // The file format: every section at the top level, unknown ones rejected
@@ -62,6 +79,7 @@ macro_rules! buck_settings {
         pub(crate) struct BuckSettingsData {
             $(#[serde(default)] $daemon: $daemon_ty,)*
             $(#[serde(default)] $invocation: $invocation_ty,)*
+            $(#[serde(default)] $dice: $dice_ty,)*
         }
 
         /// Sections whose values are fixed for the daemon's lifetime. Every
@@ -107,6 +125,31 @@ macro_rules! buck_settings {
             $(pub $invocation: Section<$invocation_ty>,)*
         }
 
+        /// Sections whose values belong to one invocation and are read only
+        /// through DICE, which tracks the dependency: see `dice::HasDiceBuckSettings`.
+        /// A request carries them next to the invocation sections.
+        #[derive(
+            Clone,
+            Dupe,
+            Debug,
+            Default,
+            Serialize,
+            Deserialize,
+            PartialEq,
+            Eq,
+            Allocative
+        )]
+        #[serde(default, deny_unknown_fields)]
+        pub struct DiceBuckSettings {
+            $(pub $dice: Section<$dice_ty>,)*
+        }
+
+        $(impl crate::dice::HasDiceSection<$dice_ty> for DiceBuckSettings {
+            fn section(&self) -> &Section<$dice_ty> {
+                &self.$dice
+            }
+        })*
+
         impl From<BuckSettingsData> for BuckSettings {
             fn from(data: BuckSettingsData) -> Self {
                 Self {
@@ -116,24 +159,35 @@ macro_rules! buck_settings {
                     invocation: InvocationBuckSettings {
                         $($invocation: Section::new(data.$invocation),)*
                     },
+                    dice: DiceBuckSettings {
+                        $($dice: Section::new(data.$dice),)*
+                    },
                 }
             }
         }
 
         impl BuckSettings {
             /// Every section with its metadata and this value's keys, daemon
-            /// sections first. For reporting.
-            pub fn sections(&self) -> Vec<SectionReport> {
-                vec![
+            /// sections first. For reporting. `buckconfig` is what keys with
+            /// a declared fallback read when unset.
+            pub fn sections(
+                &self,
+                buckconfig: &mut dyn BuckconfigSource,
+            ) -> buck2_error::Result<Vec<SectionReport>> {
+                Ok(vec![
                     $(SectionReport {
                         metadata: <$daemon_ty as SettingsSection>::METADATA,
-                        values: self.daemon.$daemon.values(),
+                        values: self.daemon.$daemon.values(buckconfig)?,
                     },)*
                     $(SectionReport {
                         metadata: <$invocation_ty as SettingsSection>::METADATA,
-                        values: self.invocation.$invocation.values(),
+                        values: self.invocation.$invocation.values(buckconfig)?,
                     },)*
-                ]
+                    $(SectionReport {
+                        metadata: <$dice_ty as SettingsSection>::METADATA,
+                        values: self.dice.$dice.values(buckconfig)?,
+                    },)*
+                ])
             }
         }
     };
@@ -142,14 +196,26 @@ macro_rules! buck_settings {
 buck_settings! {
     daemon {
         analysis: Analysis,
+        daemon: Daemon,
+        digest: Digest,
+        http: Http,
         hydration: Hydration,
         log_download: LogDownload,
+        materializer: Materializer,
         package_visibility: PackageVisibility,
+        resource_control: ResourceControl,
     }
     invocation {
+        agent_build: AgentBuild,
         agent_config_change: AgentConfigChange,
         agent_interactive: AgentInteractive,
         agent_materialization: AgentMaterialization,
+        event_log: EventLog,
+        health_check: HealthCheck,
+    }
+    dice {
+        execution_platforms: ExecutionPlatforms,
+        starlark: Starlark,
     }
 }
 
@@ -172,6 +238,31 @@ pub struct BuckSettings {
     pub daemon: DaemonBuckSettings,
     #[serde(flatten)]
     pub invocation: InvocationBuckSettings,
+    // Not public: on the daemon these are read through DICE, and the only
+    // other uses are sending them there and reporting them.
+    #[serde(flatten)]
+    dice: DiceBuckSettings,
+}
+
+impl BuckSettings {
+    pub fn new(
+        daemon: DaemonBuckSettings,
+        invocation: InvocationBuckSettings,
+        dice: DiceBuckSettings,
+    ) -> Self {
+        Self {
+            daemon,
+            invocation,
+            dice,
+        }
+    }
+
+    /// The `dice` sections, for the client to send with a request and the
+    /// daemon to inject into its transaction. Computations read them through
+    /// `dice::HasDiceBuckSettings` instead, so the dependency is recorded.
+    pub fn dice_sections(&self) -> &DiceBuckSettings {
+        &self.dice
+    }
 }
 
 impl InvocationBuckSettings {
@@ -179,6 +270,17 @@ impl InvocationBuckSettings {
         match request {
             Some(request) => {
                 serde_json::from_str(request).buck_error_context("Invalid invocation Buck Settings")
+            }
+            None => Ok(Self::default()),
+        }
+    }
+}
+
+impl DiceBuckSettings {
+    pub fn from_request(request: Option<&str>) -> buck2_error::Result<Self> {
+        match request {
+            Some(request) => {
+                serde_json::from_str(request).buck_error_context("Invalid DICE Buck Settings")
             }
             None => Ok(Self::default()),
         }
@@ -307,6 +409,7 @@ mod tests {
         let previous = BuckSettings::default();
         for (section, name) in [
             ("agent_interactive", "enabled"),
+            ("agent_build", "enabled"),
             ("agent_interactive", "killall_enabled"),
             ("agent_interactive", "clean_enabled"),
             ("agent_interactive", "new_isolation_dir_enabled"),
@@ -357,11 +460,18 @@ mod tests {
         assert!(settings.invocation.agent_materialization.enabled());
         assert!(!settings.daemon.analysis.record_requested_anon_targets());
         assert_eq!(
-            settings.daemon.log_download.log_url().as_deref(),
+            settings
+                .daemon
+                .log_download
+                .log_url(&mut crate::buckconfig::NoBuckconfig)?
+                .as_deref(),
             Some("https://example.com/")
         );
         let serialized = serde_json::to_value(&settings)?;
-        assert!(serialized.get("daemon").is_none());
+        // The flat form has no scope groups: `daemon` here is the section of
+        // that name.
+        assert!(serialized["daemon"].get("analysis").is_none());
+        assert_eq!(serialized["daemon"]["buster"], Value::Null);
         assert!(serialized.get("invocation").is_none());
         assert_eq!(serialized["agent_materialization"]["enabled"], true);
         assert_eq!(
@@ -378,20 +488,21 @@ mod tests {
             r#"{"agent_materialization":{"enabled":false},"agent_interactive":{"enabled":true,"killall_enabled":true},"analysis":{"record_requested_anon_targets":false}}"#,
         )?;
         let request = serde_json::to_string(&client.invocation)?;
-        let values: Value = serde_json::from_str(&request)?;
-        assert_eq!(
-            values,
-            serde_json::json!({
-                "agent_config_change": {"enabled": null},
-                "agent_materialization": {"enabled": false},
-                "agent_interactive": {
-                    "enabled": true,
-                    "killall_enabled": true,
-                    "clean_enabled": null,
-                    "new_isolation_dir_enabled": null,
-                },
-            })
-        );
+        let values: serde_json::Map<String, Value> = serde_json::from_str(&request)?;
+        // Every invocation section travels, set or not, and nothing else.
+        let mut sections: Vec<&str> = values.keys().map(String::as_str).collect();
+        sections.sort_unstable();
+        let mut invocation_sections: Vec<&str> = ALL_SECTION_METADATA
+            .iter()
+            .filter(|section| matches!(section.scope, SectionScope::Invocation))
+            .map(|section| section.section_name)
+            .collect();
+        invocation_sections.sort_unstable();
+        assert_eq!(sections, invocation_sections);
+        assert_eq!(values["agent_build"]["enabled"], Value::Null);
+        assert_eq!(values["agent_materialization"]["enabled"], false);
+        assert_eq!(values["agent_interactive"]["killall_enabled"], true);
+        assert_eq!(values["agent_interactive"]["clean_enabled"], Value::Null);
         let invocation = InvocationBuckSettings::from_request(Some(&request))?;
         assert_eq!(invocation, client.invocation);
         assert!(invocation.agent_interactive.killall_enabled());
@@ -443,13 +554,20 @@ mod tests {
         let settings = BuckSettings::default();
         let daemon = serde_json::to_value(&settings.daemon)?;
         let invocation = serde_json::to_value(&settings.invocation)?;
+        let dice = serde_json::to_value(settings.dice_sections())?;
         let daemon = daemon.as_object().unwrap();
         let invocation = invocation.as_object().unwrap();
+        let dice = dice.as_object().unwrap();
         assert!(daemon.keys().all(|name| !invocation.contains_key(name)));
+        assert!(
+            dice.keys()
+                .all(|name| !invocation.contains_key(name) && !daemon.contains_key(name))
+        );
         let combined: serde_json::Map<_, _> = daemon
             .clone()
             .into_iter()
             .chain(invocation.clone())
+            .chain(dice.clone())
             .collect();
         assert_eq!(
             Value::Object(combined),

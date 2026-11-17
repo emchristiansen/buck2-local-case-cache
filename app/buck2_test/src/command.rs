@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -30,6 +31,9 @@ use buck2_build_api::build::build_report::build_report_opts;
 use buck2_build_api::build::build_report::maybe_stream_build_reports;
 use buck2_build_api::build::build_report::streaming_build_result_channel;
 use buck2_build_api::build::build_report::write_build_report;
+use buck2_build_api::build::build_report_metrics::BuildReportMetricsConfig;
+use buck2_build_api::build::build_report_metrics::compute_build_report_supplemental_data;
+use buck2_build_api::build::graph_properties::GraphPropertiesOptions;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::InternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::internal_runner_test_info::OwnedInternalRunnerTestInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::RunInfo;
@@ -494,6 +498,10 @@ async fn test(
         .build_opts
         .as_ref()
         .internal_error("should have build options")?;
+    let build_report_metrics_config =
+        BuildReportMetricsConfig::from_buckconfig(&mut ctx.ctx(), cell_resolver.root_cell())
+            .await?;
+    let graph_properties = build_report_metrics_config.graph_properties;
 
     let timeout = request
         .timeout
@@ -517,6 +525,7 @@ async fn test(
     let (streaming_build_result_tx, streaming_build_result_rx) =
         streaming_build_result_channel(build_opts);
 
+    let build_start = Instant::now();
     let test_future = test_targets(
         ctx.dupe(),
         resolved_pattern,
@@ -540,6 +549,8 @@ async fn test(
         build_run_info,
         tpx_experiments,
         streaming_build_result_tx,
+        build_start,
+        graph_properties,
     );
 
     let test_outcome = maybe_stream_build_reports(
@@ -549,7 +560,7 @@ async fn test(
         server_ctx.project_root(),
         server_ctx.working_dir(),
         server_ctx.events().trace_id().dupe(),
-        Default::default(),
+        graph_properties,
         streaming_build_result_rx,
     )
     .await?;
@@ -629,15 +640,17 @@ async fn test(
         ),
     };
 
+    let supplemental_data = compute_build_report_supplemental_data(
+        &mut ctx.ctx(),
+        &test_outcome.build_target_result,
+        build_report_metrics_config,
+    )
+    .await?;
+
     let serialized_build_report = if build_opts.unstable_print_build_report {
         let artifact_fs = ctx.ctx().get_artifact_fs().await?;
-        let build_report_opts = build_report_opts(
-            &mut ctx.ctx(),
-            &cell_resolver,
-            build_opts,
-            Default::default(),
-        )
-        .await?;
+        let build_report_opts =
+            build_report_opts(&mut ctx.ctx(), &cell_resolver, build_opts, graph_properties).await?;
 
         write_build_report(
             build_report_opts,
@@ -651,9 +664,9 @@ async fn test(
                 .build_target_result
                 .configured_to_pattern_modifiers,
             &test_outcome.build_target_result.other_errors,
-            None,
-            None,
-            None,
+            supplemental_data.detailed_metrics,
+            supplemental_data.action_graph_sketch_result,
+            supplemental_data.artifact_path_sketch_result,
         )?
     } else {
         None
@@ -693,6 +706,8 @@ async fn test_targets(
     build_run_info: bool,
     tpx_experiments: BuckMutSet<String>,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 ) -> buck2_error::Result<TestOutcome> {
     let session = Arc::new(session);
 
@@ -823,6 +838,8 @@ async fn test_targets(
                         ignore_tests_attribute,
                         build_default_info,
                         build_run_info,
+                        build_start,
+                        graph_properties,
                     },
                     streaming_build_result_tx,
                 );
@@ -1010,6 +1027,8 @@ struct TestDriverState<'a, 'e> {
     ignore_tests_attribute: bool,
     build_default_info: bool,
     build_run_info: bool,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 }
 
 type DriverWorkResult = ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>;
@@ -1052,7 +1071,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
             labels_tested: BuckMutSet::default(),
             errors: BuildTargetResultBuilder::new(
                 streaming_build_result_tx.clone(),
-                std::time::Instant::now(),
+                state.build_start,
             ),
             first_internal_error: None,
             build_target_result: BuildTargetResult::new(),
@@ -1379,26 +1398,39 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                 }
             };
 
-            let oncall = node.oncall().map(|s| s.to_owned());
+            let oncall = match node.body() {
+                Ok(body) => body.oncall().map(|s| s.to_owned()),
+                Err(e) => {
+                    return ControlFlow::Break(create_and_map_configured_build_error(
+                        label, e, modifiers,
+                    ));
+                }
+            };
 
             // Build and then test this: it's compatible.
             let mut work = vec![TestDriverTask::BuildTarget {
-                label,
+                label: label.dupe(),
                 modifiers: modifiers.dupe(),
                 test_config_unification_rollout,
                 oncall,
                 tenting_acl_names: tenting_acl_names.dupe(),
             }];
 
-            // If this node is a forward, it'll get flattened when we do analysis and run the
-            // test later, but its `tests` attribute here will not be, and that means we'll
-            // just ignore it (since we don't traverse `tests` recursively). So ... just
-            // flatten it?
-            let node = node.forward_target().unwrap_or(&node);
-
             // Look up `tests` in the target we're testing, and if we find any tests, add them to the test backlog.
             if !state.ignore_tests_attribute {
-                for test in node.tests() {
+                // If this node is a forward, it'll get flattened when we do analysis and run the
+                // test later, but its `tests` attribute here will not be, and that means we'll
+                // just ignore it (since we don't traverse `tests` recursively). So ... just
+                // flatten it?
+                let tests = match node.unwrap_forward().body() {
+                    Ok(body) => body.tests(),
+                    Err(e) => {
+                        return ControlFlow::Break(create_and_map_configured_build_error(
+                            label, e, modifiers,
+                        ));
+                    }
+                };
+                for test in tests {
                     work.push(TestDriverTask::ConfigureTarget {
                         label_with_modifiers: ProvidersLabelWithModifiers {
                             providers_label: test.unconfigured(),
@@ -1465,6 +1497,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                             state.build_default_info,
                             state.build_run_info,
                             streaming_build_result_tx,
+                            state.build_start,
+                            state.graph_properties,
                         )
                         .await
                     }
@@ -1551,6 +1585,8 @@ async fn build_target_result(
     build_default_info: bool,
     build_run_info: bool,
     streaming_build_result_tx: Option<UnboundedSender<BuildTargetResult>>,
+    build_start: Instant,
+    graph_properties: GraphPropertiesOptions,
 ) -> buck2_error::Result<(BuildTargetResult, FrozenProviderCollectionValue)> {
     // NOTE: We fail if we hit an incompatible target here. This can happen if we reach an
     // incompatible target via `tests = [...]`. This should perhaps change, but that's how it works
@@ -1568,7 +1604,7 @@ async fn build_target_result(
     // 3. --build-run-info is requested and the target produces a RunInfo
     if let Some(test_info) = test_provider_from_collection(collections)? {
         let skip_build_based_on_labels = !label_filtering.build_filtered_targets
-            && label_filtering.is_excluded(test_info.labels());
+            && label_filtering.is_excluded(test_info.labels()?);
         if skip_build_based_on_labels {
             return Ok((BuildTargetResult::new(), providers));
         }
@@ -1584,7 +1620,7 @@ async fn build_target_result(
 
     let materialization_and_upload = MaterializationAndUploadContext::skip();
     let (result_builder, consumer) =
-        AsyncBuildTargetResultBuilder::new(streaming_build_result_tx, std::time::Instant::now());
+        AsyncBuildTargetResultBuilder::new(streaming_build_result_tx, build_start);
     let configured_target = label.target().dupe();
     let target = TargetLabelWithModifiers {
         target_label: configured_target.unconfigured().dupe(),
@@ -1609,7 +1645,7 @@ async fn build_target_result(
                 },
                 BuildConfiguredLabelOptions {
                     skippable: false,
-                    graph_properties: Default::default(),
+                    graph_properties,
                     return_run_args: false,
                 },
                 None, // TODO: is this right?
@@ -1660,7 +1696,8 @@ async fn test_target<'a, 'e>(
         if use_internal_runner {
             let excluded = {
                 let provider = internal_provider.as_ref().value().as_ref();
-                label_filtering.is_excluded(provider.labels().collect())
+                label_filtering
+                    .is_excluded(provider.labels().collect::<buck2_error::Result<Vec<_>>>()?)
             };
             if excluded {
                 return Ok(None);
@@ -1697,24 +1734,24 @@ async fn test_target<'a, 'e>(
                 let provider = internal_provider.as_ref().value().as_ref();
                 let listing_spec = build_external_runner_spec(
                     provider.listing_command(),
-                    provider.env().map(|(k, _)| k),
+                    provider.env().map(|entry| Ok(entry?.0)),
                     provider.test_type(),
                     provider.labels(),
                     provider.contacts(),
                     handle.clone(),
                     working_dir_cell,
                     &tenting_acl_names,
-                );
+                )?;
                 let spec = build_external_runner_spec(
                     provider.command(),
-                    provider.env().map(|(k, _)| k),
+                    provider.env().map(|entry| Ok(entry?.0)),
                     provider.test_type(),
                     provider.labels(),
                     provider.contacts(),
                     handle,
                     working_dir_cell,
                     &tenting_acl_names,
-                );
+                )?;
                 (spec, listing_spec)
             };
             crate::internal_runner::run_internal_test(
@@ -1731,7 +1768,7 @@ async fn test_target<'a, 'e>(
 
     let fut = match test_provider_from_collection(collection)? {
         Some(test_info) => {
-            if label_filtering.is_excluded(test_info.labels()) {
+            if label_filtering.is_excluded(test_info.labels()?) {
                 return Ok(None);
             }
             run_tests(

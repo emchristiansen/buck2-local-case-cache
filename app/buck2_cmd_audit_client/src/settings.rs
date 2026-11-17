@@ -14,7 +14,6 @@ use buck2_client_ctx::common::BuckArgMatches;
 use buck2_client_ctx::common::CommonCommandOptions;
 use buck2_client_ctx::common::target_cfg::TargetCfgUnusedOptions;
 use buck2_error::BuckErrorContext;
-use buck2_settings::SettingsReport;
 
 use crate::AuditSubcommand;
 
@@ -34,7 +33,7 @@ pub struct AuditSettingsCommand {
     /// Also show each setting's documentation, type, defaults and override
     /// policy.
     #[clap(long)]
-    verbose: bool,
+    detailed: bool,
 
     /// Command doesn't need these flags, but they are used in mode files, so we need to keep them.
     #[clap(flatten)]
@@ -50,7 +49,7 @@ impl AuditSettingsCommand {
         _matches: BuckArgMatches<'_>,
         ctx: ClientCommandContext<'_>,
     ) -> buck2_error::Result<()> {
-        let report = SettingsReport::new(&ctx.resolved_settings()?);
+        let report = ctx.settings_report()?;
         let text = if self.json {
             serde_json::to_string_pretty(&report)
                 .map_err(|e| {
@@ -58,7 +57,7 @@ impl AuditSettingsCommand {
                 })
                 .buck_error_context("Serializing the settings report")?
         } else {
-            report.render(self.verbose)
+            report.render(self.detailed)
         };
         buck2_client_ctx::println!("{}", text.trim_end())?;
         Ok(())

@@ -53,6 +53,7 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::BuckMutMap;
 use buck2_hash::IntentionallyStdHashMap;
 use buck2_util::threads::ignore_stack_overflow_checks_for_future;
+use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use jiff::SignedDuration;
 use jiff::Timestamp;
@@ -305,6 +306,7 @@ fn clean_unused() -> CleanStaleArtifactsArgs {
         },
         dry_run: false,
         tracked_only: false,
+        origin: buck2_data::clean_stale_result::Origin::CleanCommand,
     }
 }
 
@@ -370,7 +372,7 @@ async fn materialize_held(
     dm: &DiskStateMaterializer<StubIoHandler>,
     artifacts: Vec<(ProjectRelativePathBuf, ArtifactValue)>,
 ) -> buck2_error::Result<MaterializeResponse> {
-    let mut response = dm.as_dyn().materialize(request(artifacts)).await?;
+    let mut response = dm.materialize(request(artifacts)).await?;
     for result in std::mem::take(&mut response.results) {
         result?;
     }
@@ -383,16 +385,15 @@ async fn report(
     path: &ProjectRelativePathBuf,
     value: ArtifactValue,
 ) -> buck2_error::Result<WriteLease> {
-    let lease = dm.as_dyn().prepare_outputs(vec![path.clone()]).await?;
-    dm.as_dyn()
-        .declare_existing(
-            &lease,
-            vec![DeclareArtifactPayload {
-                path: path.clone(),
-                artifact: value,
-            }],
-        )
-        .await?;
+    let lease = dm.prepare_outputs(vec![path.clone()]).await?;
+    dm.declare_existing(
+        &lease,
+        vec![DeclareArtifactPayload {
+            path: path.clone(),
+            artifact: value,
+        }],
+    )
+    .await?;
     Ok(lease)
 }
 
@@ -446,7 +447,7 @@ async fn test_reported_content_is_not_fetched() -> buck2_error::Result<()> {
         assert_eq!(io.take_log(), vec![]);
 
         // Preparing the path for a new output forgets it.
-        drop(dm.as_dyn().prepare_outputs(vec![p.clone()]).await?);
+        drop(dm.prepare_outputs(vec![p.clone()]).await?);
         assert!(!dm.has_artifact_at(p.clone()).await?);
         materialize_ok(&dm, vec![(p.clone(), file("A"))]).await?;
         assert_eq!(io.take_log(), vec![(Op::Materialize, p.clone())]);
@@ -463,9 +464,8 @@ async fn test_a_report_outside_the_lease_is_refused() -> buck2_error::Result<()>
         let (dm, _io) = make(temp.path(), None, None);
         let (a, b) = (path("buck-out/v2/gen/a"), path("buck-out/v2/gen/b"));
 
-        let lease = dm.as_dyn().prepare_outputs(vec![a.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![a.clone()]).await?;
         let err = dm
-            .as_dyn()
             .declare_existing(
                 &lease,
                 vec![DeclareArtifactPayload {
@@ -478,7 +478,7 @@ async fn test_a_report_outside_the_lease_is_refused() -> buck2_error::Result<()>
         assert!(format!("{err:#}").contains("outside the write roots"));
         // A lease this materializer did not grant is refused too.
         let err = dm
-            .declare_existing_impl(
+            .declare_existing(
                 &WriteLease::noop(),
                 vec![DeclareArtifactPayload {
                     path: a.clone(),
@@ -618,7 +618,6 @@ async fn test_each_pair_gets_its_own_result() -> buck2_error::Result<()> {
         io.set_fail_on(vec![bad.clone()]);
 
         let response = dm
-            .as_dyn()
             .materialize(request(vec![
                 (good.clone(), file("G")),
                 (bad.clone(), file("B")),
@@ -708,7 +707,7 @@ async fn test_a_prepared_output_blocks_readers_until_it_is_reported() -> buck2_e
         let (dm, io) = make(temp.path(), None, None);
         let p = path("buck-out/v2/gen/out");
 
-        let lease = dm.as_dyn().prepare_outputs(vec![p.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![p.clone()]).await?;
         let reader = tokio::spawn({
             let dm = dm.dupe();
             let p = p.clone();
@@ -719,15 +718,14 @@ async fn test_a_prepared_output_blocks_readers_until_it_is_reported() -> buck2_e
 
         // Once the producer has reported, the reader finds the content there and shares it,
         // while the producer still holds its lease.
-        dm.as_dyn()
-            .declare_existing(
-                &lease,
-                vec![DeclareArtifactPayload {
-                    path: p.clone(),
-                    artifact: file("A"),
-                }],
-            )
-            .await?;
+        dm.declare_existing(
+            &lease,
+            vec![DeclareArtifactPayload {
+                path: p.clone(),
+                artifact: file("A"),
+            }],
+        )
+        .await?;
         let held = timeout(SLOW, reader)
             .await
             .expect("reported content is readable at once")
@@ -811,7 +809,6 @@ async fn test_a_request_holds_its_outputs_for_writing() -> buck2_error::Result<(
         drop(report(&dm, &output, file("old")).await?);
 
         let response = dm
-            .as_dyn()
             .materialize(MaterializeRequest {
                 artifacts: vec![(input.clone(), file("I"))],
                 outputs: vec![output.clone()],
@@ -823,24 +820,23 @@ async fn test_a_request_holds_its_outputs_for_writing() -> buck2_error::Result<(
         assert!(!dm.has_artifact_at(output.clone()).await?, "untracked");
         // Another producer of the same output waits for this one.
         assert!(
-            timeout(A_BIT, dm.as_dyn().prepare_outputs(vec![output.clone()]))
+            timeout(A_BIT, dm.prepare_outputs(vec![output.clone()]))
                 .await
                 .is_err()
         );
         let (read, outputs) = response.into_leases()?;
         let outputs = outputs.expect("the request had outputs");
-        dm.as_dyn()
-            .declare_existing(
-                &outputs,
-                vec![DeclareArtifactPayload {
-                    path: output.clone(),
-                    artifact: file("new"),
-                }],
-            )
-            .await?;
+        dm.declare_existing(
+            &outputs,
+            vec![DeclareArtifactPayload {
+                path: output.clone(),
+                artifact: file("new"),
+            }],
+        )
+        .await?;
         drop((read, outputs));
         drop(
-            timeout(SLOW, dm.as_dyn().prepare_outputs(vec![output]))
+            timeout(SLOW, dm.prepare_outputs(vec![output]))
                 .await
                 .unwrap()?,
         );
@@ -851,38 +847,56 @@ async fn test_a_request_holds_its_outputs_for_writing() -> buck2_error::Result<(
 }
 
 #[tokio::test]
-async fn test_publish_moves_the_content_and_tracks_it() -> buck2_error::Result<()> {
+async fn test_fill_keeps_a_matching_root_and_remakes_any_other() -> buck2_error::Result<()> {
     ignore_stack_overflow_checks_for_future(async {
         let temp = ProjectRootTemp::new()?;
         let fs = temp.path().dupe();
         let (dm, io) = make(&fs, None, None);
-        let src = path("buck-out/v2/gen/__action__/out");
-        let dest = path("buck-out/v2/gen/content/abc/out");
+        let output = path("buck-out/v2/gen/out");
+        let cancellations = CancellationContext::testing();
+        let fill = async |lease: &WriteLease, value: ArtifactValue| {
+            dm.fill(
+                lease,
+                output.clone(),
+                value,
+                None,
+                RemoteExecutorUseCase::buck2_default(),
+                &cancellations,
+            )
+            .await
+        };
 
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
-        fs.write_file(&src, "X", false)?;
-        drop(
-            dm.as_dyn()
-                .publish(&lease, src.clone(), dest.clone(), file("X"))
-                .await?,
-        );
-        drop(lease);
-        assert!(!fs.resolve(&src).exists());
-        assert_eq!(std::fs::read_to_string(fs.resolve(&dest))?, "X");
-        assert!(dm.has_artifact_at(dest.clone()).await?);
-
-        // The same content published again is redundant: the source goes, the destination stays.
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
-        fs.write_file(&src, "X", false)?;
-        drop(
-            dm.as_dyn()
-                .publish(&lease, src.clone(), dest.clone(), file("X"))
-                .await?,
-        );
-        drop(lease);
-        assert!(!fs.resolve(&src).exists());
-        assert_eq!(std::fs::read_to_string(fs.resolve(&dest))?, "X");
+        // Tracked with the wanted content: kept, nothing fetched; the run reports it again.
+        fs.write_file(&output, "old", false)?;
+        drop(report(&dm, &output, file("old")).await?);
+        io.take_log();
+        let lease = dm.prepare_outputs(vec![output.clone()]).await?;
+        fill(&lease, file("old")).await?;
         assert_eq!(io.take_log(), vec![]);
+        assert_eq!(std::fs::read_to_string(fs.resolve(&output))?, "old");
+        dm.declare_existing(
+            &lease,
+            vec![DeclareArtifactPayload {
+                path: output.clone(),
+                artifact: file("old"),
+            }],
+        )
+        .await?;
+        drop(lease);
+
+        // Tracked with other content: replaced.
+        let lease = dm.prepare_outputs(vec![output.clone()]).await?;
+        fill(&lease, file("new")).await?;
+        assert_eq!(io.take_log(), vec![(Op::Materialize, output.clone())]);
+        drop(lease);
+
+        // Untracked, whatever is there: replaced, what was there gone first.
+        let lease = dm.prepare_outputs(vec![output.clone()]).await?;
+        fs.write_file(&output, "left behind", false)?;
+        fill(&lease, file("new")).await?;
+        assert_eq!(io.take_log(), vec![(Op::Materialize, output.clone())]);
+        assert!(!fs.resolve(&output).exists());
+        drop(lease);
         abort(dm);
         Ok(())
     })
@@ -972,7 +986,7 @@ async fn test_a_final_output_materialization_promotes_a_tracked_root() -> buck2_
         drop(report(&dm, &p, file("promoted")).await?);
         let mut final_output = request(vec![(p.clone(), file("promoted"))]);
         final_output.purpose = MaterializationPurpose::FinalOutput { required: true };
-        let mut response = dm.as_dyn().materialize(final_output).await?;
+        let mut response = dm.materialize(final_output).await?;
         for result in std::mem::take(&mut response.results) {
             result?;
         }
@@ -989,27 +1003,46 @@ async fn test_a_final_output_materialization_promotes_a_tracked_root() -> buck2_
     .await
 }
 
+/// The store finds content a tracked path holds out of that path, and content no tracked path
+/// holds not at all.
 #[tokio::test]
-async fn test_a_published_output_enters_the_store() -> buck2_error::Result<()> {
+async fn test_the_store_finds_content_out_of_a_tracked_path() -> buck2_error::Result<()> {
     ignore_stack_overflow_checks_for_future(async {
         let temp = ProjectRootTemp::new()?;
         let fs = temp.path().dupe();
         let (dm, _io) = make(&fs, None, None);
-        let src = path("buck-out/v2/gen/__action__/out");
-        let dest = path("buck-out/v2/gen/content/def/out");
-        let lease = dm.as_dyn().prepare_outputs(vec![src.clone()]).await?;
-        fs.write_file(&src, "published here", false)?;
-        // Held as the action's value holds it; the store keeps nothing past the last holder.
-        let published = file("published here");
-        drop(
-            dm.as_dyn()
-                .publish(&lease, src, dest, published.dupe())
-                .await?,
-        );
-        drop(lease);
+        let digest = |content: &str| {
+            FileDigest::from_content(
+                content.as_bytes(),
+                DigestConfig::testing_default().cas_digest_config(),
+            )
+        };
+        let p = path("buck-out/v2/gen/out");
+        fs.write_file(&p, "on disk", false)?;
+        // Tracked, with nothing holding its digest: the store let go of the report's copy.
+        drop(report(&dm, &p, file("on disk")).await?);
+        dm.store().flush_collector().await;
         let copy = fs.resolve(path("buck-out/v2/gen/copy"));
-        assert!(in_store(&dm, b"published here", &copy).await?);
-        drop(published);
+        assert!(!in_store(&dm, b"on disk", &copy).await?);
+
+        let found = dm.store().find(&digest("on disk"), false, &*dm).await?;
+        assert!(found.is_some());
+        assert!(in_store(&dm, b"on disk", &copy).await?);
+        assert!(
+            dm.store()
+                .find(&digest("nowhere"), false, &*dm)
+                .await?
+                .is_none()
+        );
+        // Held by the store already: nothing to do, and no path needed.
+        std::fs::remove_file(fs.resolve(&p))?;
+        assert!(
+            dm.store()
+                .find(&digest("on disk"), false, &*dm)
+                .await?
+                .is_some()
+        );
+        drop(found);
         abort(dm);
         Ok(())
     })
@@ -1149,6 +1182,8 @@ async fn test_clean_stale_deletes_what_this_daemon_has_not_used() -> buck2_error
             .await?
             .stats
             .expect("stats");
+        assert!(stats.used_disk_space_bytes_start.is_some());
+        assert!(stats.used_disk_space_bytes_end.is_some());
         assert_eq!(
             (
                 stats.stale_artifact_count,
@@ -1210,7 +1245,7 @@ async fn test_clean_stale_leaves_what_someone_holds() -> buck2_error::Result<()>
         let (dm, _io) = make(&fs, None, None);
         // An output being produced is untracked on disk and held for writing.
         let out = path("buck-out/v2/gen/out");
-        let lease = dm.as_dyn().prepare_outputs(vec![out.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![out.clone()]).await?;
         fs.write_file(&out, "half", false)?;
 
         let stats = dm
@@ -1253,6 +1288,8 @@ async fn test_clean_stale_dry_run_deletes_nothing() -> buck2_error::Result<()> {
             .await?
             .stats
             .expect("stats");
+        assert!(stats.used_disk_space_bytes_start.is_some());
+        assert!(stats.used_disk_space_bytes_end.is_some());
         assert_eq!(
             (stats.stale_artifact_count, stats.cleaned_artifact_count),
             (1, 0)
@@ -1305,6 +1342,7 @@ async fn test_an_active_root_stays_when_its_upload_fails() -> buck2_error::Resul
                 policy: CleanStaleArtifactsPolicy::Configured,
                 dry_run: false,
                 tracked_only: false,
+                origin: buck2_data::clean_stale_result::Origin::CleanCommand,
             })
             .await?
             .stats
@@ -1349,7 +1387,7 @@ async fn test_a_copy_of_buck_out_content_is_nothing_to_the_core() -> buck2_error
         assert!(!dm.has_artifact_at(dest).await?);
         // The source is not held: it can be taken for writing right away.
         drop(
-            timeout(A_BIT, dm.as_dyn().prepare_outputs(vec![src]))
+            timeout(A_BIT, dm.prepare_outputs(vec![src]))
                 .await
                 .expect("nothing holds the source")?,
         );
@@ -1400,7 +1438,7 @@ async fn test_tracked_files_are_read_only_under_the_knob() -> buck2_error::Resul
         let w = path("buck-out/v2/gen/written");
         let blocking = DummyBlockingExecutor { fs: fs.dupe() };
         write_locally(
-            dm.as_dyn(),
+            &*dm,
             &blocking,
             &fs,
             DigestConfig::testing_default(),
@@ -1434,7 +1472,7 @@ async fn test_tracked_files_are_read_only_under_the_knob() -> buck2_error::Resul
         drop(lease);
 
         // The run of an incremental action may write them again.
-        let lease = dm.as_dyn().prepare_outputs(vec![d.clone()]).await?;
+        let lease = dm.prepare_outputs(vec![d.clone()]).await?;
         dm.make_outputs_writable(vec![d.clone()]).await?;
         assert!(!readonly(&a)? && !readonly(&b)?);
         drop(lease);
@@ -1463,7 +1501,7 @@ async fn test_produced_content_is_tracked_and_enters_the_store() -> buck2_error:
             path_kind: BuckOutPathKind::Configuration,
         };
         let (value, produced) = write_locally(
-            dm.as_dyn(),
+            &*dm,
             &blocking,
             temp.path(),
             DigestConfig::testing_default(),
@@ -1492,7 +1530,7 @@ async fn test_produced_content_is_tracked_and_enters_the_store() -> buck2_error:
         #[cfg(unix)]
         let inode = inode_of(&temp.path().resolve(&p))?;
         let (_, produced) = write_locally(
-            dm.as_dyn(),
+            &*dm,
             &blocking,
             temp.path(),
             DigestConfig::testing_default(),
@@ -1537,7 +1575,7 @@ async fn test_content_a_previous_daemon_left_is_found_and_enters_the_store()
         let inode = inode_of(&temp.path().resolve(&p))?;
         // Held as a value would hold it; the store keeps content only while something does.
         let value = file("left by a previous daemon");
-        let produced = produce_locally(dm.as_dyn(), &blocking, p.clone(), value.dupe(), || {
+        let produced = produce_locally(&*dm, &blocking, p.clone(), value.dupe(), || {
             unreachable!("the path holds the content")
         })
         .await?;
@@ -1584,11 +1622,21 @@ async fn test_content_the_store_has_is_linked_rather_than_downloaded() -> buck2_
         assert!(dm.has_artifact_at(p).await?);
 
         // A directory with one file the store has and one it lacks: the served file is linked,
-        // and the structure and the other file are the CAS's.
+        // and the structure and the other file are the CAS's. Content of its own, which no
+        // tracked path holds.
+        let in_dir = b"from the store, in a directory";
+        let held_in_dir =
+            TrackedFileDigest::from_content(in_dir, CasDigestConfig::testing_default());
+        dm.store()
+            .insert_bytes(in_dir.to_vec(), &held_in_dir, false)
+            .await?;
         let d = path("buck-out/v2/gen/dir");
         materialize_ok(
             &dm,
-            vec![(d.clone(), dir(&[("a", "from the store"), ("b", "not")]))],
+            vec![(
+                d.clone(),
+                dir(&[("a", "from the store, in a directory"), ("b", "not")]),
+            )],
         )
         .await?;
         assert_eq!(io.take_log(), vec![(Op::Materialize, d.clone())]);
@@ -1597,8 +1645,9 @@ async fn test_content_the_store_has_is_linked_rather_than_downloaded() -> buck2_
                 temp.path()
                     .resolve(d.join(ForwardRelativePath::unchecked_new("a")))
             )?,
-            "from the store"
+            "from the store, in a directory"
         );
+        assert_eq!(dm.store().stats().served, 2);
         assert!(
             !temp
                 .path()
@@ -1611,8 +1660,7 @@ async fn test_content_the_store_has_is_linked_rather_than_downloaded() -> buck2_
     .await
 }
 
-/// Content tracked at another path is copied from there before the CAS is asked, when the stash
-/// does not have it: content the CAS holds, say, which the stash lets go of.
+/// Content tracked at another path comes from there, and the CAS is not asked.
 #[tokio::test]
 async fn test_content_tracked_elsewhere_is_copied_rather_than_downloaded() -> buck2_error::Result<()>
 {
@@ -1678,6 +1726,13 @@ async fn test_content_tracked_elsewhere_is_copied_rather_than_downloaded() -> bu
         {
             use std::os::unix::fs::PermissionsExt;
             assert!(std::fs::metadata(&a)?.permissions().mode() & 0o111 != 0);
+            // The paths it could have come from keep the mode they were tracked with.
+            for holder in [&first, &second] {
+                let mode = std::fs::metadata(temp.path().resolve(holder))?
+                    .permissions()
+                    .mode();
+                assert!(mode & 0o111 == 0, "`{holder}` became executable");
+            }
         }
         assert!(
             !temp
@@ -1685,6 +1740,57 @@ async fn test_content_tracked_elsewhere_is_copied_rather_than_downloaded() -> bu
                 .resolve(d.join(ForwardRelativePath::unchecked_new("b")))
                 .exists()
         );
+        abort(dm);
+        Ok(())
+    })
+    .await
+}
+
+/// Content a tracked path holds comes from that path even where the store holds it too, and
+/// from the store when the path turns out not to have it.
+#[tokio::test]
+async fn test_a_tracked_path_is_asked_before_the_store() -> buck2_error::Result<()> {
+    ignore_stack_overflow_checks_for_future(async {
+        let temp = ProjectRootTemp::new()?;
+        let (dm, io) = make(temp.path(), None, None);
+        let out = path("buck-out/v2/gen/out");
+        // Held as the action's value holds it, so that the store keeps its copy.
+        let built = file("tracked, and in the store too");
+        drop(
+            write_and_report(
+                &dm,
+                temp.path(),
+                &out,
+                "tracked, and in the store too",
+                &built,
+            )
+            .await?,
+        );
+        let DirectoryEntry::Leaf(ActionDirectoryMember::File(metadata)) = built.entry() else {
+            panic!("a file");
+        };
+        assert!(metadata.digest.stash().is_some());
+
+        let second = path("buck-out/v2/gen/second");
+        materialize_ok(&dm, vec![(second.clone(), built.dupe())]).await?;
+        assert_eq!(io.take_log(), vec![]);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().resolve(&second))?,
+            "tracked, and in the store too"
+        );
+        assert_eq!(dm.store().stats().served, 0);
+
+        // The first tracked path loses its file behind the core's back: the copy from it
+        // fails, which is a soft error, and the store gives the content.
+        std::fs::remove_file(temp.path().resolve(&out))?;
+        let third = path("buck-out/v2/gen/third");
+        materialize_ok(&dm, vec![(third.clone(), built.dupe())]).await?;
+        assert_eq!(io.take_log(), vec![]);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().resolve(&third))?,
+            "tracked, and in the store too"
+        );
+        assert_eq!(dm.store().stats().served, 1);
         abort(dm);
         Ok(())
     })
@@ -1778,17 +1884,16 @@ async fn write_and_report(
     content: &str,
     value: &ArtifactValue,
 ) -> buck2_error::Result<WriteLease> {
-    let lease = dm.as_dyn().prepare_outputs(vec![p.clone()]).await?;
+    let lease = dm.prepare_outputs(vec![p.clone()]).await?;
     fs.write_file(p, content, false)?;
-    dm.as_dyn()
-        .declare_existing(
-            &lease,
-            vec![DeclareArtifactPayload {
-                path: p.clone(),
-                artifact: value.dupe(),
-            }],
-        )
-        .await?;
+    dm.declare_existing(
+        &lease,
+        vec![DeclareArtifactPayload {
+            path: p.clone(),
+            artifact: value.dupe(),
+        }],
+    )
+    .await?;
     Ok(lease)
 }
 
@@ -1812,7 +1917,6 @@ async fn test_strict_leases_remove_a_released_root_and_serve_it_again() -> buck2
 
         // And comes back from the stash when asked for.
         let response = dm
-            .as_dyn()
             .materialize(request(vec![(p.clone(), value.dupe())]))
             .await?;
         let lease = response.ensure_results_ok()?;
@@ -1842,12 +1946,7 @@ async fn test_strict_leases_keep_final_outputs_and_what_is_read_after_the_comman
         eventually(async || Ok(!dm.has_artifact_at(out.clone()).await?)).await?;
         let mut final_output = request(vec![(out.clone(), x.dupe())]);
         final_output.purpose = MaterializationPurpose::FinalOutput { required: true };
-        drop(
-            dm.as_dyn()
-                .materialize(final_output)
-                .await?
-                .ensure_results_ok()?,
-        );
+        drop(dm.materialize(final_output).await?.ensure_results_ok()?);
 
         // So does a test's output, which the runner reads after the command.
         let test_output = path("buck-out/v2/test/execution/out");
@@ -1914,15 +2013,4 @@ async fn test_strict_leases_remove_a_released_root_nothing_holds() -> buck2_erro
         Ok(())
     })
     .await
-}
-
-/// The public API of the materializer under test, which lives on the trait object.
-trait AsDyn {
-    fn as_dyn(&self) -> &dyn Materializer;
-}
-
-impl AsDyn for DiskStateMaterializer<StubIoHandler> {
-    fn as_dyn(&self) -> &dyn Materializer {
-        self
-    }
 }

@@ -31,6 +31,7 @@ import com.facebook.buck.step.StepExecutionResults;
 import com.facebook.buck.step.isolatedsteps.IsolatedStep;
 import com.facebook.buck.util.CapturingPrintStream;
 import com.facebook.buck.util.Verbosity;
+import com.facebook.infer.annotation.Nullsafe;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
@@ -42,10 +43,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.Optional;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 
 /** Kotlin compile Step */
+@Nullsafe(Nullsafe.Mode.LOCAL)
 public class KotlincStep implements IsolatedStep {
   private static final Logger LOG = Logger.get(KotlincStep.class);
 
@@ -87,6 +90,8 @@ public class KotlincStep implements IsolatedStep {
   private final boolean shouldKosabiJvmAbiGenUseK2;
   private final boolean shouldKosabiUseShallowClassUsage;
   private final String kosabiAbiValidationMode;
+  private final ImmutableList<String> kosabiJvmAbiGenOptions;
+  private final boolean disableKosabiKeptBodyStubCheck;
 
   private static final String COMPOSE_PLUGIN_PATH_FRAGMENT = "compose-compiler-plugin";
 
@@ -116,7 +121,9 @@ public class KotlincStep implements IsolatedStep {
       LanguageVersion languageVersion,
       boolean shouldKosabiJvmAbiGenUseK2,
       boolean shouldKosabiUseShallowClassUsage,
-      String kosabiAbiValidationMode) {
+      String kosabiAbiValidationMode,
+      ImmutableList<String> kosabiJvmAbiGenOptions,
+      boolean disableKosabiKeptBodyStubCheck) {
     this.invokingRule = invokingRule;
     this.outputDirectory = outputDirectory;
     this.sourceFilePaths = sourceFilePaths;
@@ -143,6 +150,8 @@ public class KotlincStep implements IsolatedStep {
     this.shouldKosabiJvmAbiGenUseK2 = shouldKosabiJvmAbiGenUseK2;
     this.shouldKosabiUseShallowClassUsage = shouldKosabiUseShallowClassUsage;
     this.kosabiAbiValidationMode = kosabiAbiValidationMode;
+    this.kosabiJvmAbiGenOptions = kosabiJvmAbiGenOptions;
+    this.disableKosabiKeptBodyStubCheck = disableKosabiKeptBodyStubCheck;
   }
 
   @Override
@@ -450,6 +459,14 @@ public class KotlincStep implements IsolatedStep {
         builder.add(
             "plugin:com.facebook.k2.jvm.abi.gen:abiValidationMode=" + kosabiAbiValidationMode);
       }
+      for (String option : kosabiJvmAbiGenOptions) {
+        builder.add(PLUGIN);
+        builder.add("plugin:com.facebook.k2.jvm.abi.gen:" + option);
+      }
+      if (disableKosabiKeptBodyStubCheck) {
+        builder.add(PLUGIN);
+        builder.add("plugin:com.facebook.k2.jvm.abi.gen:keptBodyStubCheck=false");
+      }
     }
 
     addClasspath(builder, this.compilationClasspath);
@@ -474,7 +491,7 @@ public class KotlincStep implements IsolatedStep {
     if (fullErrorMessage.isEmpty()) return false;
 
     int earlyTerminationMessageIndex =
-        fullErrorMessage.indexOf(kosabiEarlyTerminationMessagePrefix);
+        fullErrorMessage.indexOf(Objects.requireNonNull(kosabiEarlyTerminationMessagePrefix));
     if (earlyTerminationMessageIndex >= 0) {
       return true;
     }

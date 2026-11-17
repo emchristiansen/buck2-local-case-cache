@@ -21,8 +21,15 @@ KotlinToolchainInfo = provider(
         "kapt_base64_encoder": provider_field(typing.Any, default = None),
         "kosabi_abi_validation_mode": provider_field(str, default = "off"),
         "kosabi_applicability_plugin": provider_field(typing.Any, default = None),
+        # Reduces the applicability classpath to class names and Kotlin facade metadata; see
+        # AvailabilityJars. Without it, the full compile reads the dependencies' ABI jars.
+        "kosabi_availability_jars": provider_field(typing.Any, default = None),
         "kosabi_jvm_abi_gen_k2_plugin": provider_field(typing.Any, default = None),
+        # `option=value` pairs for the K2 JVM ABI gen plugin of source-only ABI actions.
+        "kosabi_jvm_abi_gen_options": provider_field(list[str], default = []),
+        "kosabi_kept_body_stub_check": provider_field(bool, default = True),
         "kosabi_shallow_class_usage": provider_field(bool, default = False),
+        "kosabi_stubgen_engine": provider_field(str, default = "kotlinc"),
         "kosabi_stubs_gen_k2_plugin": provider_field(typing.Any, default = None),
         "kotlin_error_handler": provider_field(typing.Any, default = None),
         "kotlin_home_libraries": provider_field(typing.Any, default = None),
@@ -37,7 +44,12 @@ KotlinToolchainInfo = provider(
         "kotlincd_jvm_args_target": provider_field(typing.Any, default = None),
         "kotlincd_main_class": provider_field(typing.Any, default = None),
         "kotlincd_remote_worker": provider_field(typing.Any, default = None),
+        # JVM arguments for kotlincd runs outside persistent workers (remote execution) of compiles with at most
+        # `kotlincd_small_action_max_srcs` sources: such a JVM lives a few seconds and spends most of its CPU in the JIT.
+        "kotlincd_small_action_jvm_args": provider_field(list[str], default = []),
+        "kotlincd_small_action_max_srcs": provider_field(int, default = 0),
         "kotlincd_worker": provider_field(typing.Any, default = None),
+        "rokoko_stubgen_so": provider_field(typing.Any, default = None),
         "semanticdb_kotlinc": provider_field(typing.Any, default = None),
         "semanticdb_sourceroot": provider_field(typing.Any, default = None),
         "track_class_usage_plugin": provider_field(typing.Any, default = None),

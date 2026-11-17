@@ -89,6 +89,7 @@ load(
     "@prelude//tests:re_utils.bzl",
     "get_re_executors_from_props",
 )
+load("@prelude//tests:remote_test_execution_toolchain.bzl", "RemoteTestExecutionToolchainInfo")
 load(
     "@prelude//utils:build_graph_pattern.bzl",
     "new_build_graph_info",
@@ -128,6 +129,7 @@ load(
 load(":named_deps.bzl", "write_named_deps_names")
 load(":outputs.bzl", "RustcExtraOutputsInfo", "output_as_diag_subtargets")
 load(":profile.bzl", "make_profile_providers")
+load(":cargo_test_runtime.bzl", "cargo_test_runtime", "cargo_test_runtime_attrs")
 load(":resources.bzl", "rust_attr_resources")
 load(":rust_toolchain.bzl", "PanicRuntime", "RustToolchainInfo", "toolchain_supports_miri")
 
@@ -210,6 +212,7 @@ def _native_test_info(
     ctx: AnalysisContext,
     args: cmd_args,
     re_executors,
+    runtime_env: dict[str, typing.Any] = {},
 ) -> list[Provider]:
     """Default (native) test execution for a test rule."""
     return inject_test_run_info(
@@ -217,7 +220,7 @@ def _native_test_info(
         ExternalRunnerTestInfo(
             type = "rust",
             command = [args],
-            env = ctx.attrs.env | ctx.attrs.run_env,
+            env = ctx.attrs.env | ctx.attrs.run_env | runtime_env,
             labels = ctx.attrs.labels,
             contacts = ctx.attrs.contacts,
             default_executor = re_executors.default_executor,
@@ -996,6 +999,65 @@ def rust_binary_impl(ctx: AnalysisContext) -> list[Provider]:
 
     return native.providers + [native.default_info, RunInfo(args = native.args)]
 
+# Environment the toolchain's host secret read route sets.
+_HOST_ROUTE_ENV = ["MUNINN_SECRET_READ_ROUTE", "OP_CONNECT_HOST"]
+
+# A test that may reach live services. Without a qualification of that effect,
+# the test belongs to this host.
+_LIVE_EFFECT_LABEL = "unqualified-live-effect"
+
+def _rust_test_runs_remotely(ctx: AnalysisContext, re_executors) -> bool:
+    """Whether the resolved executor may send this test to a worker.
+
+    True for any remote-test profile that enables remote execution, whether the
+    target names it, gives it inline, or inherits the remote-test toolchain's
+    default; independent of the profile's name or of local_enabled.
+    """
+    remote_execution = ctx.attrs.remote_execution
+    remote_toolchain = ctx.attrs._remote_test_execution_toolchain
+    if remote_execution == "disabled":
+        return False
+    if type(remote_execution) == "dict":
+        profile = remote_execution
+    elif remote_execution != None:
+        profile = remote_toolchain[RemoteTestExecutionToolchainInfo].profiles.get(remote_execution)
+    elif remote_toolchain != None:
+        profile = remote_toolchain[RemoteTestExecutionToolchainInfo].default_profile
+    else:
+        profile = None
+    if profile == None or profile.get("remote_enabled", True) == False:
+        return False
+
+    # re_utils resolves a profile to a remote executor with a listing override,
+    # unless configuration forces tests local.
+    return "listing" in re_executors.executor_overrides
+
+def _rust_test_remote_boundary(ctx: AnalysisContext, toolchain_info: RustToolchainInfo):
+    """Refuse a remote test that belongs to this host or lacks its worker runtime.
+
+    The boundary is the test's, not the executor's: any profile that sends the
+    test to a worker, including the toolchain's default, meets it. A test it
+    refuses sets remote_execution = "disabled" and runs here.
+    """
+    disable = "; set remote_execution = \"disabled\""
+
+    # Host secrets and live effects never reach a worker, cacheable or not.
+    if toolchain_info.test_secret_read_route != None:
+        fail("{}: a remote rust_test must not carry the host secret read route{}".format(ctx.label, disable))
+    if _LIVE_EFFECT_LABEL in ctx.attrs.labels:
+        fail("{}: a remote rust_test must not have the {} label{}".format(ctx.label, _LIVE_EFFECT_LABEL, disable))
+    environment = ctx.attrs.env | ctx.attrs.run_env
+    for name in _HOST_ROUTE_ENV:
+        if name in environment:
+            fail("{}: a remote rust_test must not carry host-route environment {}{}".format(ctx.label, name, disable))
+
+    # The worker runs the declared runtime under the per-test runner, which
+    # makes the worker-local HOME and TMPDIR absolute for listing and tests.
+    if not ctx.attrs.framework or toolchain_info.test_process_runner == None:
+        fail("{}: a remote rust_test needs the libtest process runner (framework = True){}".format(ctx.label, disable))
+    if toolchain_info.trial_nix_manifest == None:
+        fail("{}: a remote rust_test needs the toolchain's declared runtime manifest{}".format(ctx.label, disable))
+
 def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     compile_ctx = compile_context(ctx, binary = True)
     toolchain_info = compile_ctx.toolchain_info
@@ -1009,6 +1071,9 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     default_roots = ctx.attrs.default_roots or ["main.rs", "lib.rs"]
 
     re_executors = get_re_executors_from_props(ctx)
+    remote = _rust_test_runs_remotely(ctx, re_executors)
+    if remote:
+        _rust_test_remote_boundary(ctx, toolchain_info)
     strategy_params = _strategy_params(ctx, compile_ctx)
     # Every test provides `[miri]`, unless `miri_interpreted` makes the target
     # itself the Miri run; omitted without a Miri toolchain.
@@ -1043,7 +1108,32 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
         miri_sub_targets = miri_sub_targets,
     )
 
-    return _native_test_info(ctx, native.args, re_executors) + native.providers + [native.default_info]
+    test_command = cmd_args(native.args, hidden = [toolchain_info.trial_nix_manifest] if toolchain_info.trial_nix_manifest != None else [])
+
+    # Run each libtest test in its own process. A custom harness
+    # (`framework = False`) need not speak libtest's listing protocol.
+    runner_applies = toolchain_info.test_process_runner != None and ctx.attrs.framework
+    if runner_applies:
+        test_command = cmd_args(toolchain_info.test_process_runner, test_command)
+
+    # The prelude alone writes the Cargo-style runtime path entries; the runner
+    # makes each absolute before any test or listing sees it.
+    runtime_env, runtime_runner_args = cargo_test_runtime(ctx, runner_applies, remote, toolchain_info.trial_nix_manifest)
+    test_command = cmd_args(test_command, runtime_runner_args)
+
+    # Set the host's secret read route for the test, outside the per-test runner so
+    # that every test process it starts inherits the route. The prefix reads a host
+    # file that is no action input, so a cacheable test, whose result could be
+    # reused after that file changes, gets none. A remote test never reaches here
+    # with a route (_rust_test_remote_boundary).
+    if toolchain_info.test_secret_read_route != None and not ctx.attrs.supports_test_execution_caching:
+        test_command = cmd_args(toolchain_info.test_secret_read_route, test_command)
+
+    # The target's own test arguments follow the binary, so a runner passes them
+    # to libtest unchanged.
+    test_command = cmd_args(test_command, ctx.attrs.args)
+
+    return _native_test_info(ctx, test_command, re_executors, runtime_env) + native.providers + [native.default_info]
 
 rust_binary = prelude_rule(
     name = "rust_binary",
@@ -1122,6 +1212,7 @@ rust_binary = prelude_rule(
             "_generated_build_info_enabled": attrs.bool(default = False),
             "_generated_build_info_mode": attrs.enum(["full", "stable"], default = "stable"),
             "_generated_build_info_spec": BUILD_INFO_ATTR,
+            "_pgo_profile": attrs.option(attrs.dep(), default = None),
         }
     ),
     uses_plugins = [RustProcMacroPlugin],
@@ -1198,8 +1289,15 @@ rust_test = prelude_rule(
                 same command-line parameters and produce the same output as the test framework.
             """,
             ),
+            # Muninn: test results are reused only for targets that opt in, so a
+            # host-bound test (secret read route, live effect) is never cached.
             "supports_test_execution_caching": attrs.bool(default = False),
+            "args": attrs.list(attrs.string(), default = [], doc = """
+                Arguments appended to the test command after the binary, and
+                after any test process runner's own arguments.
+            """),
         }
+        | cargo_test_runtime_attrs()
         | miri_interpreted_attr()
         | re_test_common.test_args()
         | rust_common.cxx_toolchain_arg()

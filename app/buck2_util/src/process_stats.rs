@@ -165,10 +165,12 @@ mod proc_self_stat {
 #[cfg(test)]
 mod tests {
     use crate::process_stats::proc_self_stat::ProcSelfStat;
+    #[cfg(not(miri))]
     use crate::process_stats::process_stats;
 
+    // Calls `getrusage`, which Miri does not implement.
+    #[cfg(not(miri))]
     #[test]
-    #[cfg_attr(miri, ignore = "calls `getrusage`, which Miri does not implement")]
     fn test_process_stats() {
         let process_stats = process_stats();
         if cfg!(unix) {
@@ -183,7 +185,13 @@ mod tests {
             let rss_bytes = process_stats
                 .rss_bytes
                 .unwrap_or_else(|| panic!("no rss in {process_stats:?}"));
-            assert!(rss_bytes > 0, "{process_stats:?}");
+            // Linux keeps a process's RSS in per-CPU counters and folds them into the total only
+            // in batches of two pages per CPU, so on a many-core host `/proc/self/stat` can say
+            // `0` for a process holding a hundred megabytes: only that there is a reading is
+            // asserted there.
+            if cfg!(target_os = "windows") {
+                assert!(rss_bytes > 0, "{process_stats:?}");
+            }
         }
     }
 
@@ -199,16 +207,16 @@ mod tests {
         assert_eq!(215, ProcSelfStat::parse(stat).unwrap().rss);
     }
 
+    // Reads `/proc`, which Miri's isolation hides.
+    #[cfg(not(miri))]
     #[test]
-    #[cfg_attr(miri, ignore = "reads `/proc`, which Miri's isolation hides")]
     fn test_proc_self_stat_read() {
         if cfg!(target_os = "linux") {
             // Read it here too, so that a failure says which step failed.
             let raw = std::fs::read_to_string("/proc/self/stat")
                 .unwrap_or_else(|e| panic!("reading /proc/self/stat: {e}"));
-            let stat =
-                ProcSelfStat::parse(&raw).unwrap_or_else(|| panic!("could not parse {raw:?}"));
-            assert!(stat.rss > 0, "{raw:?}");
+            // Not `> 0`: the kernel may say `0` for a live process (see `test_process_stats`).
+            ProcSelfStat::parse(&raw).unwrap_or_else(|| panic!("could not parse {raw:?}"));
             assert!(ProcSelfStat::read().is_some());
         }
     }

@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import org.jetbrains.annotations.Nullable;
 
@@ -180,6 +181,7 @@ public final class ApkBuilder implements IArchiveBuilder {
 
   private final NullZipFilter mNullFilter = new NullZipFilter();
   private final JavaAndNativeResourceFilter mFilter;
+  private final Predicate<String> mStoredPaths;
   private final Map<String, File> mAddedFiles = new HashMap<String, File>();
 
   /**
@@ -242,8 +244,57 @@ public final class ApkBuilder implements IArchiveBuilder {
       @Nullable PrintStream verboseStream,
       Set<String> excludedResources)
       throws ApkCreationException {
+    this(
+        apkFile,
+        resFile,
+        dexFile,
+        packageMetaInfVersionFiles,
+        verboseStream,
+        excludedResources,
+        archivePath -> false);
+  }
+
+  /**
+   * Creates a new instance that writes the files whose archive path matches {@code storedPaths}
+   * without compressing them.
+   */
+  public ApkBuilder(
+      File apkFile,
+      File resFile,
+      @Nullable File dexFile,
+      boolean packageMetaInfVersionFiles,
+      @Nullable PrintStream verboseStream,
+      Set<String> excludedResources,
+      Predicate<String> storedPaths)
+      throws ApkCreationException {
+    this(
+        apkFile,
+        resFile,
+        dexFile,
+        packageMetaInfVersionFiles,
+        verboseStream,
+        excludedResources,
+        storedPaths,
+        null);
+  }
+
+  /**
+   * Creates a new instance that deflates entries on {@code fastPackaging}'s threads when it is set.
+   * The APK is byte-identical either way.
+   */
+  public ApkBuilder(
+      File apkFile,
+      File resFile,
+      @Nullable File dexFile,
+      boolean packageMetaInfVersionFiles,
+      @Nullable PrintStream verboseStream,
+      Set<String> excludedResources,
+      Predicate<String> storedPaths,
+      @Nullable FastPackaging fastPackaging)
+      throws ApkCreationException {
     mFilter = new JavaAndNativeResourceFilter(excludedResources);
-    init(apkFile, resFile, dexFile, packageMetaInfVersionFiles, verboseStream);
+    mStoredPaths = storedPaths;
+    init(apkFile, resFile, dexFile, packageMetaInfVersionFiles, verboseStream, fastPackaging);
   }
 
   private void init(
@@ -251,7 +302,8 @@ public final class ApkBuilder implements IArchiveBuilder {
       File resFile,
       @Nullable File dexFile,
       boolean packageMetaInfVersionFiles,
-      @Nullable PrintStream verboseStream)
+      @Nullable PrintStream verboseStream,
+      @Nullable FastPackaging fastPackaging)
       throws ApkCreationException {
 
     try {
@@ -266,7 +318,9 @@ public final class ApkBuilder implements IArchiveBuilder {
 
       mBuilder =
           new ApkJarBuilder(
-              new FileOutputStream(mApkFile, false /* append */), packageMetaInfVersionFiles);
+              new FileOutputStream(mApkFile, false /* append */),
+              packageMetaInfVersionFiles,
+              fastPackaging == null ? 0 : fastPackaging.getCompressionThreads());
 
       verbosePrintln("Packaging %s", mApkFile.getName());
 
@@ -509,6 +563,9 @@ public final class ApkBuilder implements IArchiveBuilder {
 
                 try {
                   doAddFile(lib, path);
+                } catch (DuplicateFileException e) {
+                  mBuilder.cleanUp();
+                  throw e;
                 } catch (IOException e) {
                   mBuilder.cleanUp();
                   throw new ApkCreationException(e, "Failed to add %s", lib);
@@ -577,7 +634,11 @@ public final class ApkBuilder implements IArchiveBuilder {
     }
 
     mAddedFiles.put(archivePath, file);
-    mBuilder.writeFile(file, archivePath);
+    if (mStoredPaths.test(archivePath)) {
+      mBuilder.writeStoredFile(file, archivePath);
+    } else {
+      mBuilder.writeFile(file, archivePath);
+    }
   }
 
   /**

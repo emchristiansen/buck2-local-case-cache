@@ -44,7 +44,8 @@ use crate::values::StarlarkValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
 use crate::values::ValueError;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::ValueOf;
+use crate::values::ValueTyped;
 use crate::values::types::num::typecheck::NumTy;
 use crate::values::types::num::typecheck::typecheck_num_bin_op;
 use crate::values::types::num::value::NumRef;
@@ -240,47 +241,30 @@ impl StarlarkFloat {
     }
 }
 
-impl StarlarkTypeRepr for f64 {
-    type Canonical = <StarlarkFloat as StarlarkTypeRepr>::Canonical;
-
-    fn starlark_type_repr() -> Ty {
-        StarlarkFloat::starlark_type_repr()
-    }
-}
-
-impl<'v> AllocValue<'v> for StarlarkFloat {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc_simple(self)
-    }
-}
-
-impl<'fv> AllocFrozenValue<'fv> for StarlarkFloat {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc_simple(self)
-    }
-}
-
 impl<'v> AllocValue<'v> for f64 {
-    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-        heap.alloc(StarlarkFloat(self))
+    type Type = StarlarkFloat;
+
+    fn alloc_value(self, heap: Heap<'v>) -> ValueOf<'v, Self::Type> {
+        ValueOf::alloc(heap, StarlarkFloat(self))
     }
 }
 
 impl<'fv> AllocFrozenValue<'fv> for f64 {
-    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> Value<'fv> {
-        heap.alloc(StarlarkFloat(self))
+    type Type = StarlarkFloat;
+
+    fn alloc_frozen_value(self, heap: FrozenHeap<'fv>) -> ValueOf<'fv, Self::Type> {
+        ValueOf::alloc_frozen(heap, StarlarkFloat(self))
     }
 }
 
 /// Allows only a float - an int will not be accepted.
 impl<'v> UnpackValue<'v> for StarlarkFloat {
+    type Type = Self;
     type Error = Infallible;
 
-    fn unpack_value_impl(value: Value<'v>) -> Result<Option<Self>, Self::Error> {
-        let Some(value) = value.downcast_ref::<StarlarkFloat>() else {
-            return Ok(None);
-        };
-        Ok(Some(*value))
+    #[inline]
+    fn unpack(_value: ValueOf<'v, Self>, get: ValueTyped<'v, Self>) -> Result<Self, Infallible> {
+        Ok(*get.as_ref())
     }
 }
 
@@ -314,17 +298,17 @@ impl<'v> StarlarkValue<'v> for StarlarkFloat {
     }
 
     fn plus(&self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
-        Ok(heap.alloc(*self))
+        Ok(heap.alloc(*self).to_value())
     }
 
     fn minus(&self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
-        Ok(heap.alloc(StarlarkFloat(-self.0)))
+        Ok(heap.alloc(StarlarkFloat(-self.0)).to_value())
     }
 
     fn add(&self, other: Value, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         Some(
             (NumRef::Float(*self) + other.unpack_num()?)
-                .map(|x| heap.alloc(x))
+                .map(|x| heap.alloc(x).to_value())
                 .map_err(Into::into),
         )
     }
@@ -332,14 +316,14 @@ impl<'v> StarlarkValue<'v> for StarlarkFloat {
     fn sub(&self, other: Value, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match other.unpack_num() {
             None => ValueError::unsupported_with(self, "-", other),
-            Some(other) => Ok(heap.alloc((NumRef::Float(*self) - other)?)),
+            Some(other) => Ok(heap.alloc((NumRef::Float(*self) - other)?).to_value()),
         }
     }
 
     fn mul(&self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         Some(
             (NumRef::Float(*self) * other.unpack_num()?)
-                .map(|x| heap.alloc(x))
+                .map(|x| heap.alloc(x).to_value())
                 .map_err(Into::into),
         )
     }
@@ -347,13 +331,13 @@ impl<'v> StarlarkValue<'v> for StarlarkFloat {
     fn div(&self, other: Value, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match other.unpack_num() {
             None => ValueError::unsupported_with(self, "/", other),
-            Some(other) => Ok(heap.alloc(NumRef::Float(*self).div(other)?)),
+            Some(other) => Ok(heap.alloc(NumRef::Float(*self).div(other)?).to_value()),
         }
     }
 
     fn percent(&self, other: Value, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match other.unpack_num() {
-            Some(other) => Ok(heap.alloc(NumRef::Float(*self).percent(other)?)),
+            Some(other) => Ok(heap.alloc(NumRef::Float(*self).percent(other)?).to_value()),
             None => ValueError::unsupported_with(self, "%", other),
         }
     }
@@ -361,7 +345,9 @@ impl<'v> StarlarkValue<'v> for StarlarkFloat {
     fn floor_div(&self, other: Value, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match other.unpack_num() {
             None => ValueError::unsupported_with(self, "//", other),
-            Some(other) => Ok(heap.alloc(NumRef::Float(*self).floor_div(other)?)),
+            Some(other) => Ok(heap
+                .alloc(NumRef::Float(*self).floor_div(other)?)
+                .to_value()),
         }
     }
 
