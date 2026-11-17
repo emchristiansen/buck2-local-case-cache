@@ -1307,7 +1307,7 @@ def symlinked_dirs(
             # Don't take a dependency on all the artifacts in here, just the dynamic names; the
             # rmetas/rlibs we only want to create symlinks to, so there's no need for them to
             # actually be available
-            hidden = [transitive_deps.project_as_args("dynamic_name_args"), transitive_deps.project_as_args("artifacts_args")] if ctx.attrs._rust_toolchain[RustToolchainInfo].trial_nix_manifest != None else transitive_deps.project_as_args("dynamic_name_args"),
+            hidden = transitive_deps.project_as_args("dynamic_name_args"),
         ),
     ]
 
@@ -1320,16 +1320,10 @@ def symlinked_dirs(
             )
         )
 
-    # The copy helper and worker both receive the declared manifest explicitly.
-    nix_manifest = ctx.attrs._rust_toolchain[RustToolchainInfo].trial_nix_manifest
-    deps_env = {} if nix_manifest == None else {
-        "TRIAL_NIX_MANIFEST": cmd_args(nix_manifest, replace_regex = ("^\\./", "")),
-    }
     ctx.actions.run(
         arguments,
         category = "deps",
         identifier = "{}-{}".format(prefix, len(transitive_dependency_dirs)),
-        env = deps_env,
     )
 
     transitive_dependency_dirs.add(transitive_dependency_dir)

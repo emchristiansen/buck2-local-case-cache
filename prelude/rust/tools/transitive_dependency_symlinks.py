@@ -57,7 +57,6 @@
 import argparse
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import IO, NamedTuple, Optional
 
@@ -74,12 +73,8 @@ def symlink_relative(link: Path, target: Path) -> None:
 
     The link is created by constructing a path to the target that is relative to link_name's parent.
     """
-    if os.environ.get("TRIAL_NIX_MANIFEST") is not None:
-        shutil.copyfile(target, link)
-        shutil.copymode(target, link)
-    else:
-        target_relative = os.path.relpath(target, start=os.path.dirname(link))
-        os.symlink(target_relative, link)
+    target_relative = os.path.relpath(target, start=os.path.dirname(link))
+    os.symlink(target_relative, link)
 
 
 def main():
