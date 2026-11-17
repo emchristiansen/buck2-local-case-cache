@@ -150,6 +150,8 @@ class Args(NamedTuple):
     strip_dwo_members: Optional[str]
     archiver: Optional[list[str]]
     archiver_deterministic: bool
+    closed_nix_env: bool
+    local_compile: bool
     rustc: list[str]
 
 
@@ -245,6 +247,16 @@ def arg_parse(argv: Optional[list[str]] = None) -> Args:
         help="Pass the `D` modifier to the archiver so the rewritten archive carries no timestamps",
     )
     parser.add_argument(
+        "--closed-nix-env",
+        action="store_true",
+        help="Do not inherit ambient Nix wrapper inputs; explicit environment overlays remain declared",
+    )
+    parser.add_argument(
+        "--local-compile",
+        action="store_true",
+        help="Mark a local-only compile; it changes the action digest and nothing else",
+    )
+    parser.add_argument(
         "rustc",
         nargs=argparse.REMAINDER,
         help="Compiler command line",
@@ -285,9 +297,11 @@ def arg_eval(arg: str) -> str:
             arg = arg[begin + len("$(") :]
 
 
-def inherited_env() -> dict[str, str]:
+def inherited_env(closed_nix_env: bool) -> dict[str, str]:
     env = {}
     for pattern in INHERITED_ENV:
+        if closed_nix_env and pattern.startswith("NIX_"):
+            continue
         if pattern.endswith("*"):
             for k in os.environ:
                 if k.startswith(pattern[:-1]):
@@ -474,7 +488,7 @@ async def main() -> int:  # noqa: C901
         return 0
 
     # Inherit a very limited initial environment, then add the new things
-    env = inherited_env()
+    env = inherited_env(args.closed_nix_env)
     if args.env:
         env.update({k: arg_eval(unescape_env_value(v)) for k, v in args.env})
     if args.path_env:

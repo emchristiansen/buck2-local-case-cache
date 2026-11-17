@@ -8,6 +8,11 @@
 
 load("@prelude//:prelude_rule.bzl", "prelude_rule")
 load("@prelude//decls:common.bzl", "buck")
+
+_PINNED_GIT = "@buck2_git_fetch_git@"
+_PINNED_PYTHON = "@buck2_git_fetch_python@"
+GIT_FETCH_RUNTIME_MANIFEST = "@buck2_git_fetch_runtime_manifest@"
+
 _HEX_DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
 
 def _is_hex(rev: str, *, length: int) -> bool:
@@ -53,15 +58,15 @@ def git_fetch_impl(ctx: AnalysisContext) -> list[Provider]:
         cmd_args("--rev=", rev, delimiter = ""),
         update_submodules,
     ]
-    if ctx.attrs.git != None:
-        cmd.append(cmd_args("--git=", ctx.attrs.git, delimiter = ""))
+    if ctx.attrs.git != None and ctx.attrs.git != _PINNED_GIT:
+        fail("git_fetch requires the declared pinned Git: {}".format(_PINNED_GIT))
     if object_format != None:
         cmd.append(cmd_args("--object-format=", object_format, delimiter = ""))
 
     ctx.actions.run(
         cmd,
         category = "git_fetch",
-        local_only = True,
+        prefer_remote = True,
         allow_cache_upload = ctx.attrs.allow_cache_upload,
     )
 
@@ -108,9 +113,9 @@ git_fetch = prelude_rule(
                 attrs.string(),
                 default = None,
                 doc = """
-                Path to the git binary to use. If not specified, the system
-                git from PATH is used, with fallback to common system
-                locations (/usr/bin/git, /usr/local/bin/git).
+                Optional assertion of the declared pinned Git path.
+                A different executable is refused; fetches never discover
+                Git from the client or worker environment.
             """,
             ),
             "object_format": attrs.option(
@@ -154,4 +159,32 @@ git_fetch = prelude_rule(
         | buck.labels_arg()
         | buck.contacts_arg()
     ),
+)
+
+def _git_fetch_tool_impl(ctx: AnalysisContext) -> list[Provider]:
+    command = cmd_args(
+        [
+            _PINNED_PYTHON,
+            "-I",
+            "-B",
+            ctx.attrs.main,
+            "--git",
+            _PINNED_GIT,
+            "--runtime-manifest",
+            GIT_FETCH_RUNTIME_MANIFEST,
+        ],
+        hidden = [ctx.attrs.runtime_manifest],
+    )
+    return [
+        DefaultInfo(default_output = ctx.attrs.main),
+        RunInfo(args = command),
+    ]
+
+
+git_fetch_tool = rule(
+    impl = _git_fetch_tool_impl,
+    attrs = {
+        "main": attrs.source(),
+        "runtime_manifest": attrs.source(),
+    },
 )

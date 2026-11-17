@@ -237,7 +237,8 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
                 )
                 metadata_link = rlib_for_staticlib
 
-            if toolchain_info.nightly_features:
+            # Opted-in crates expand proc macros once for full metadata and link.
+            if toolchain_info.nightly_features and not ctx.attrs.full_metadata_from_link:
                 # Pipelined build: dependents that need full metadata compile
                 # against the `-Zno-codegen` "hollow rlib" instead of waiting
                 # for this crate's codegen.
@@ -1359,6 +1360,11 @@ rust_library = prelude_rule(
             "doctests": attrs.option(attrs.bool(), default = None),
             "include_in_android_merge_map_output": attrs.bool(default = True),
             "proc_macro": attrs.bool(default = False),
+            "full_metadata_from_link": attrs.bool(default = False, doc = """
+                Use the link output as full metadata. Nondeterministic proc-macro
+                expansion can otherwise produce different SVHs across pipelined
+                metadata-full and link invocations, causing E0460 in dependents.
+            """),
             "supports_python_dlopen": attrs.option(attrs.bool(), default = None),
         }
         | rust_binary_attrs_group(prefix = "doc_")

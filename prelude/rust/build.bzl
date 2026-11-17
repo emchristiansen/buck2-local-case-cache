@@ -203,6 +203,7 @@ def generate_rustdoc(
     rustdoc_args = cmd_args(
         toolchain_info.rustdoc_flags,
         ctx.attrs.rustdoc_flags,
+        _lint_flags(ctx.label, compile_ctx, False, False),
         common_args.args,
         cmd_args(output.as_output(), format = "--out-dir={}"),
         hidden = [compile_ctx.symlinked_srcs],
@@ -214,6 +215,7 @@ def generate_rustdoc(
     rustdoc_common = cmd_args(
         [cmd_args("--env=", k, "=", v, delimiter = "") for k, v in plain_env.items()],
         [cmd_args("--path-env=", k, "=", v, delimiter = "") for k, v in path_env.items()],
+        "--closed-nix-env" if toolchain_info.trial_nix_manifest != None else [],
     )
     if compile_ctx.arch_toolchain_info == None:
         rustdoc_cmd = _long_command(
@@ -306,6 +308,7 @@ def generate_rustdoc_coverage(
     rustdoc_common = cmd_args(
         [cmd_args("--env=", k, "=", v, delimiter = "") for k, v in plain_env.items()],
         [cmd_args("--path-env=", k, "=", v, delimiter = "") for k, v in path_env.items()],
+        "--closed-nix-env" if toolchain_info.trial_nix_manifest != None else [],
     )
     rustdoc_args = cmd_args(
         toolchain_info.rustdoc_flags,
@@ -492,12 +495,14 @@ def generate_rustdoc_test(
     rustdoc_env = cmd_args(
         [cmd_args("--env=", k, "=", v, delimiter = "") for k, v in plain_env.items()],
         [cmd_args("--path-env=", k, "=", v, delimiter = "") for k, v in path_env.items()],
+        "--closed-nix-env" if toolchain_info.trial_nix_manifest != None else [],
     )
     rustdoc_args = cmd_args(
         "--test",
         unstable_options,
         toolchain_info.rustdoc_flags,
         ctx.attrs.rustdoc_flags,
+        _lint_flags(ctx.label, compile_ctx, False, False),
         common_args.args,
         extern_arg([], attr_crate(ctx), rlib),
         "--extern=proc_macro" if ctx.attrs.proc_macro else [],
@@ -699,7 +704,7 @@ def miri_command(
         [cmd_args("-Zmiri-env-set=", k, "=", v, delimiter = "") for (k, v) in runtime_env.items()],
         "--rustc-action-separator",
         # Same order as `rust_compile`: lints first so later args override.
-        _lint_flags(compile_ctx, infallible_diagnostics = False, is_clippy = False),
+        _lint_flags(ctx.label, compile_ctx, infallible_diagnostics = False, is_clippy = False),
         common_args.args,
         "-o",
         miri_out,
@@ -775,7 +780,7 @@ def rust_compile(
         if profile_mode in (ProfileMode("llvm-time-trace"), ProfileMode("self-profile")):
             fail("`{}` profiling uses unstable `-Z` flags and requires a toolchain with `nightly_features = True`".format(profile_mode.value))
 
-    lints = _lint_flags(compile_ctx, infallible_diagnostics, emit == Emit("clippy"))
+    lints = _lint_flags(ctx.label, compile_ctx, infallible_diagnostics, emit == Emit("clippy"))
 
     common_args = _compute_common_args(
         ctx = ctx,
@@ -1293,7 +1298,7 @@ def symlinked_dirs(
             # Don't take a dependency on all the artifacts in here, just the dynamic names; the
             # rmetas/rlibs we only want to create symlinks to, so there's no need for them to
             # actually be available
-            hidden = transitive_deps.project_as_args("dynamic_name_args"),
+            hidden = [transitive_deps.project_as_args("dynamic_name_args"), transitive_deps.project_as_args("artifacts_args")] if ctx.attrs._rust_toolchain[RustToolchainInfo].trial_nix_manifest != None else transitive_deps.project_as_args("dynamic_name_args"),
         ),
     ]
 
@@ -1306,10 +1311,16 @@ def symlinked_dirs(
             )
         )
 
+    # The copy helper and worker both receive the declared manifest explicitly.
+    nix_manifest = ctx.attrs._rust_toolchain[RustToolchainInfo].trial_nix_manifest
+    deps_env = {} if nix_manifest == None else {
+        "TRIAL_NIX_MANIFEST": cmd_args(nix_manifest, replace_regex = ("^\\./", "")),
+    }
     ctx.actions.run(
         arguments,
         category = "deps",
         identifier = "{}-{}".format(prefix, len(transitive_dependency_dirs)),
+        env = deps_env,
     )
 
     transitive_dependency_dirs.add(transitive_dependency_dir)
@@ -1327,7 +1338,19 @@ def _lintify(flag: str, clippy: bool, lints: list[str | ResolvedStringWithMacros
         format = "-{}{{}}".format(flag),
     )
 
-def _lint_flags(compile_ctx: CompileContext, infallible_diagnostics: bool, is_clippy: bool) -> cmd_args:
+def _package_lint_flags(label: Label, toolchain_info: RustToolchainInfo) -> list[str]:
+    if toolchain_info.package_lint_flags == None:
+        return []
+    package = "{}//{}".format(label.cell, label.package)
+    flags = toolchain_info.package_lint_flags.get(package)
+    if flags != None:
+        return flags
+    for prefix in toolchain_info.package_lint_flags_exempt_prefixes:
+        if package.startswith(prefix):
+            return []
+    fail("package `{}` has no entry in the Rust toolchain's package lint flags".format(package))
+
+def _lint_flags(label: Label, compile_ctx: CompileContext, infallible_diagnostics: bool, is_clippy: bool) -> cmd_args:
     toolchain_info = compile_ctx.toolchain_info
 
     return cmd_args(
@@ -1335,6 +1358,8 @@ def _lint_flags(compile_ctx: CompileContext, infallible_diagnostics: bool, is_cl
         _lintify("D", is_clippy, toolchain_info.deny_lints),
         _lintify("D" if infallible_diagnostics else "W", is_clippy, toolchain_info.deny_on_check_lints),
         _lintify("W", is_clippy, toolchain_info.warn_lints),
+        # Unlike the lists above, clippy lints here reach rustc too, as Cargo passes them.
+        _package_lint_flags(label, toolchain_info),
     )
 
 def _check_restricted_rustc_flags(flags: list[str | ResolvedStringWithMacros | Artifact], toolchain_info: RustToolchainInfo):
@@ -2143,6 +2168,9 @@ def _rustc_invoke(
     if toolchain_info.nightly_features and "RUSTC_BOOTSTRAP" not in plain_env:
         plain_env["RUSTC_BOOTSTRAP"] = "1"
 
+    # A compile that bakes a checkout path runs here and is never cached.
+    local_compile = getattr(ctx.attrs, "local_only_compile", False)
+
     # Save diagnostic outputs
     diag = "clippy" if is_clippy else "diag"
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
@@ -2154,6 +2182,8 @@ def _rustc_invoke(
         cmd_args(diag_txt.as_output(), format = "--diag-txt={}"),
         ["--remap-cwd-prefix=."] if not toolchain_info.nightly_features else [],
         "--buck-target={}".format(ctx.label.raw_target()),
+        ["--local-compile"] if local_compile else [],
+        "--closed-nix-env" if toolchain_info.trial_nix_manifest != None else [],
         hidden = [compile_ctx.transitive_srcs.project_as_args("artifacts")] + ([rustc_bin] if arch_programs == None else []),
     )
 
@@ -2231,14 +2261,14 @@ def _rustc_invoke(
             arch_commands = arch_commands,
         )
 
-    local_only = incremental_enabled
+    local_only = incremental_enabled or local_compile
     prefer_local = False
     weight = 1
     if common_args.crate_type == CrateType("bin") and common_args.emit == Emit("link"):
         # A rustc-driven binary link is as heavy on the host as a cxx link of
         # the same binary, so it shares the toolchain's link weight.
         weight = compile_ctx.cxx_toolchain_info.linker_info.link_weight
-        if not incremental_enabled and link_cxx_binary_locally(ctx):
+        if not local_only and link_cxx_binary_locally(ctx):
             prefer_local = True
 
     if is_clippy:
@@ -2274,6 +2304,8 @@ def _rustc_invoke(
         #    https://github.com/rust-lang/rust/pull/139453.
         # For additional context, please see this zulip conversation:
         # https://rust-lang.zulipchat.com/#narrow/channel/131828-t-compiler/topic/Possible.20Reproducibility.20Bug.20in.20Soundness.20Fix.3F/with/616729102.
+        action_allow_cache_upload = False
+    elif local_compile:
         action_allow_cache_upload = False
     elif allow_cache_upload:
         action_allow_cache_upload = True

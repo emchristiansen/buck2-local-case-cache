@@ -6,6 +6,8 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@prelude//rust:rust_toolchain.bzl", "RustToolchainInfo")
+
 def _get_artifacts(sources: Artifact) -> list[Artifact]:
     return [sources]
 
@@ -93,7 +95,9 @@ def symlinked_srcs(ctx: AnalysisContext) -> Artifact:
 
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
 
-    if "generated" in getattr(ctx.attrs, "labels", []):
+    toolchain = getattr(ctx.attrs, "_rust_toolchain", None)
+    nix_worker = toolchain != None and toolchain[RustToolchainInfo].trial_nix_manifest != None
+    if nix_worker or "generated" in getattr(ctx.attrs, "labels", []):
         # For generated code targets, we always want to copy files in the [sources]
         # subtarget, never symlink.
         #

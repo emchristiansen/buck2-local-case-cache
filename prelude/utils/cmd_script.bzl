@@ -39,7 +39,7 @@ def cmd_script(
         wrapper, _ = actions.write(
             actions.declare_output("{}.sh".format(name), has_content_based_path = has_content_based_path),
             [
-                "#!/usr/bin/env bash",
+                "#!@buck2_bash@",
                 cmd_args(cmd_args(shell_quoted, delimiter = " \\\n"), format = '{} "$@"\n'),
             ],
             is_executable = True,

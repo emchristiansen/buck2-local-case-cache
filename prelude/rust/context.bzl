@@ -207,18 +207,27 @@ def _linker(ctx: AnalysisContext, linker_info: LinkerInfo, binary: bool = False)
     linker_flags = ctx.attrs.linker_flags
     if getattr(ctx.attrs, "_generated_build_info_enabled", False):
         linker_flags = strip_build_info_linker_flags(linker_flags)
-    return cmd_script(
-        actions = ctx.actions,
-        name = "linker_wrapper",
-        cmd = cmd_args(
-            linker_info.linker,
+    rust_toolchain = ctx.attrs._rust_toolchain[RustToolchainInfo]
+    if rust_toolchain.linker != None:
+        linker = rust_toolchain.linker.args
+        pre_args = []
+    else:
+        linker = linker_info.linker
+        pre_args = cmd_args(
             linker_info.linker_flags or [],
             # For "binary" rules, add C++ toolchain binary-specific linker flags.
             # TODO(agallagher): This feels a bit wrong -- it might be better to have
             # the Rust toolchain have it's own `binary_linker_flags` instead of
             # implicitly using the one from the C++ toolchain.
             linker_info.binary_linker_flags if binary else [],
-            ctx.attrs._rust_toolchain[RustToolchainInfo].linker_flags,
+        )
+    return cmd_script(
+        actions = ctx.actions,
+        name = "linker_wrapper",
+        cmd = cmd_args(
+            linker,
+            pre_args,
+            rust_toolchain.linker_flags,
             linker_flags,
         ),
         language = ctx.attrs._exec_os_type[OsLookup].script,

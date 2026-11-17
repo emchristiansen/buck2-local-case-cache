@@ -90,6 +90,12 @@ rust_toolchain_attrs = {
     "rustc_target_triple": provider_field(str | None, default = None),
     # Extra env variables that should be made available to the rustc executable.
     "rustc_env": provider_field(dict[str, typing.Any], default = {}),
+    # Hidden source required by the maintained workstation NativeLink worker.
+    "trial_nix_manifest": provider_field(Artifact | None, default = None),
+    # Prefix for libtest test commands that runs each test in its own process.
+    "test_process_runner": provider_field(RunInfo | None, default = None),
+    # Prefix for a Rust test command that sets the host's secret read route.
+    "test_secret_read_route": provider_field(RunInfo | None, default = None),
     # Baseline compiler config
     "rustc_flags": provider_field(list[typing.Any], default = []),
     # Extra rustc flags applied only while compiling a proc-macro crate.
@@ -113,6 +119,8 @@ rust_toolchain_attrs = {
     "rustdoc_env": provider_field(dict[str, typing.Any], default = {}),
     # Extra flags for rustdoc invocations
     "rustdoc_flags": provider_field(list[typing.Any], default = []),
+    # A Rust-specific driver; when present C/C++ linker pre-args do not apply.
+    "linker": provider_field(RunInfo | None, default = None),
     # Extra flags to pass to the linker
     "linker_flags": provider_field(list[typing.Any], default = []),
     # Native dependencies added to every crate, and therefore to every link
@@ -161,6 +169,11 @@ rust_toolchain_attrs = {
     # to deny from our codebase without slowing down your inner dev loop, or encouraging you to
     # --cap-warns=lint for your projects.
     "deny_on_check_lints": provider_field(list[typing.Any], default = []),
+    # Lint and check-cfg flags for each package, keyed by "cell//package" and applied
+    # unchanged to every compile of that package's targets. When this is set, a target
+    # in a package that is neither keyed nor under an exempt prefix fails analysis.
+    "package_lint_flags": provider_field(dict[str, list[str]] | None, default = None),
+    "package_lint_flags_exempt_prefixes": provider_field(list[str], default = []),
     # Clippy configuration file clippy.toml
     "clippy_toml": provider_field(Artifact | None, default = None),
     # Setting this enables additional behaviors that improves linking at the

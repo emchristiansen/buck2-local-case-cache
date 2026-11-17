@@ -272,6 +272,11 @@ def rust_common_attributes(is_binary: bool):
             "default_platform": attrs.option(attrs.string(), default = None),
             "flagged_deps": attrs.list(attrs.tuple(rust_target_dep(is_binary), attrs.list(attrs.string())), default = []),
             "incremental_enabled": attrs.bool(default = False),
+            "local_only_compile": attrs.bool(default = False, doc = """
+                Compile on this host, never upload, and mark the action so no
+                cached result of an unmarked compile can serve it. For a crate
+                whose output bakes a checkout path.
+            """),
             "resources": attrs.named_set(attrs.one_of(attrs.dep(), attrs.source()), sorted = True, default = []),
             "rustdoc_flags": attrs.list(attrs.arg(), default = []),
             "separate_debug_info": attrs.bool(default = False),
