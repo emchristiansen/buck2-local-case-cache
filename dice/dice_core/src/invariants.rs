@@ -9,7 +9,9 @@
  */
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 
+use crate::cert::Cert;
 use crate::collections::KeySet;
 use crate::env::Env;
 use crate::history::Entry;
@@ -20,11 +22,15 @@ use crate::resolve::Attached;
 use crate::resolve::Resolved;
 use crate::state::CoreState;
 
-impl<E: Env> CoreState<E> {
+impl<E: Env> CoreState<E>
+where
+    E::Attribute: PartialEq + Debug,
+{
     /// Checks, by full scan, everything the state promises about itself: the branch tree, the
     /// histories, Invariants 1 to 3 of `incrementality.md` §4.6 (3 as an equality of edge
-    /// sets), the exactness of every `closed_index` and of the key count, that no key is both
-    /// asserted and certified, and that nothing refers to a deleted branch. Panics with the first
+    /// sets), that every attached claim carries the attribute of its derivation (§4.7), the
+    /// exactness of every `closed_index` and of the key count, that no key is both asserted and
+    /// certified, and that nothing refers to a deleted branch. Panics with the first
     /// violation found. Meant for tests and fuzzers after every operation; the master invariant
     /// itself is not a property of the state alone and is checked against the recorded history by
     /// the test oracle instead.
@@ -91,8 +97,8 @@ impl<E: Env> CoreState<E> {
         let mut closed: Vec<KeySet> = (0..self.branches.len())
             .map(|_| KeySet::default())
             .collect();
-        for (key, slots) in &self.slots {
-            if self.assertions.contains_key(key) {
+        for (key, slots) in self.slots.iter() {
+            if self.assertions.contains_key(&key) {
                 assert!(
                     slots.iter().all(|slot| slot.claim.is_none()),
                     "{key:?} is both asserted and certified"
@@ -120,7 +126,7 @@ impl<E: Env> CoreState<E> {
                     continue;
                 };
                 assert_eq!(
-                    claim.cert.key, *key,
+                    claim.cert.key, key,
                     "claim of {key:?} holds another key's cert"
                 );
                 assert!(
@@ -138,7 +144,7 @@ impl<E: Env> CoreState<E> {
                         "Invariant 1: closed window of {key:?} at {:?} reaches the head",
                         slot.branch
                     );
-                    closed[slot.branch.index()].insert(*key);
+                    closed[slot.branch.index()].insert(key);
                 }
             }
         }
@@ -165,7 +171,7 @@ impl<E: Env> CoreState<E> {
     fn check_attachment(&self, b: BranchId) {
         let head = self.head(b);
         let mut expected: HashSet<(Key, Key)> = HashSet::new();
-        for key in self.slots.keys().copied() {
+        for key in self.slots.keys() {
             let Some(attached) = self.attached(key, b) else {
                 continue;
             };
@@ -210,12 +216,17 @@ impl<E: Env> CoreState<E> {
                 }
                 expected.insert((premise.key, key));
             }
+            assert_eq!(
+                Some(claim.attribute),
+                self.derivation_attribute(&claim.cert, head),
+                "attribute of {key:?} at {b:?} is not that of its derivation at the head"
+            );
         }
         let actual: HashSet<(Key, Key)> = self
             .branch(b)
             .rdeps
             .iter()
-            .flat_map(|(dep, dependents)| dependents.iter().map(move |k| (*dep, *k)))
+            .flat_map(|(dep, dependents)| dependents.iter().map(move |k| (dep, *k)))
             .collect();
         assert!(
             actual == expected,
@@ -223,5 +234,27 @@ impl<E: Env> CoreState<E> {
             actual.difference(&expected).collect::<Vec<_>>(),
             expected.difference(&actual).collect::<Vec<_>>(),
         );
+    }
+
+    /// The attribute of the derivation of `cert` at `v` as resolution finds it, `None` if some
+    /// premise does not resolve to its recorded revision there.
+    fn derivation_attribute(&self, cert: &Cert<E::Premises>, v: Version) -> Option<E::Attribute> {
+        let (epsilon, mut attribute) = self.untracked(cert.key, v);
+        if epsilon != cert.epsilon {
+            return None;
+        }
+        for premise in cert.premises() {
+            let of_premise = match self.resolve(premise.key, v) {
+                Resolved::Claim { claim, .. } if claim.revision() == premise.revision => {
+                    claim.attribute
+                }
+                Resolved::Asserted { owner, entry } if entry.revision == premise.revision => {
+                    E::assertion(Version::new(owner, entry.seq), entry.data)
+                }
+                _ => return None,
+            };
+            attribute = E::combine(attribute, of_premise);
+        }
+        Some(attribute)
     }
 }

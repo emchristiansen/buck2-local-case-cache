@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::iter;
 
 use buck2_build_api::artifact_groups::promise::PromiseArtifactAttr;
-use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkArtifactView;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_promise_artifact::StarlarkPromiseArtifact;
 use buck2_build_api::interpreter::rule_defs::provider::dependency::Dependency;
 use buck2_build_api::interpreter::rule_defs::resolved_macro::ResolvedStringWithMacros;
@@ -45,7 +45,6 @@ use dupe::Dupe;
 use dupe::IterDupedExt;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
-use starlark::values::dict::Dict;
 use starlark::values::dict::DictRef;
 use starlark::values::list::ListRef;
 use starlark::values::string::STRING_TYPE;
@@ -107,7 +106,7 @@ impl AnonTargetAttrTypeCoerce for AttrType {
                         let attr_type = match x.transition {
                             DepAttrTransition::Identity(..) => x.clone(),
                             DepAttrTransition::Exec => {
-                                match dep.execution_platform()? {
+                                match dep.execution_platform() {
                                 Some(exec_dep_resolution) => {
                                     // Compare only base platform, not the full resolution
                                     if exec_dep_resolution.platform()? != ctx.execution_platform_resolution.platform()? {
@@ -142,8 +141,10 @@ impl AnonTargetAttrTypeCoerce for AttrType {
                             has_content_based_path: promise_artifact.has_content_based_path,
                         },
                     )))
-                } else if let Some(artifact_like) = ValueAsInputArtifactLike::unpack_value(value)? {
-                    let artifact = artifact_like.0.get_bound_artifact()?;
+                } else if let Some(artifact_like) = StarlarkArtifactView::unpack_value(value)? {
+                    let artifact = artifact_like
+                        .as_input_artifact_like()
+                        .get_bound_artifact()?;
                     Ok(AnonTargetAttr::Artifact(artifact))
                 } else {
                     // TODO(nga): `EnsuredArtifact` gets here with unhelpful error message like:
@@ -384,7 +385,7 @@ fn to_anon_target_dict(
         }
         Ok(AnonTargetAttr::Dict(DictLiteral(res.into())))
     } else {
-        Err(AnonTargetCoercionError::type_error(Dict::TYPE, value).into())
+        Err(AnonTargetCoercionError::type_error("dict", value).into())
     }
 }
 
@@ -441,7 +442,7 @@ fn to_anon_target_tuple(
     } else if let Some(list) = ListRef::from_value(value) {
         coerce(value, list.content())
     } else {
-        Err(AnonTargetCoercionError::type_error(TupleRef::TYPE, value).into())
+        Err(AnonTargetCoercionError::type_error("tuple", value).into())
     }
 }
 
@@ -470,6 +471,6 @@ fn to_anon_target_list(
                 .into(),
         )))
     } else {
-        Err(AnonTargetCoercionError::type_error(ListRef::TYPE, value).into())
+        Err(AnonTargetCoercionError::type_error("list", value).into())
     }
 }

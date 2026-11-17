@@ -38,6 +38,7 @@ use buck2_core::tag_error;
 use buck2_data::CleanStaleResultKind;
 use buck2_data::CleanStaleStats;
 use buck2_data::clean_stale_result::AdaptiveOutcome;
+use buck2_data::clean_stale_result::Origin;
 use buck2_data::clean_stale_result::Trigger;
 use buck2_error::ErrorTag;
 use buck2_error::internal_error;
@@ -68,6 +69,7 @@ use crate::materializers::deferred::artifact_tree::ArtifactClassification;
 use crate::materializers::deferred::artifact_tree::UnmaterializationEligibility;
 use crate::materializers::deferred::artifact_tree::UnmaterializationIneligibilityReason;
 use crate::materializers::deferred::artifact_tree::UnmaterializationIneligibleArtifact;
+use crate::materializers::deferred::clean_stale::CleanDiskSpace;
 use crate::materializers::deferred::clean_stale::CleanFailure;
 use crate::materializers::deferred::clean_stale::CleanFailurePhase;
 use crate::materializers::deferred::clean_stale::CleanOutcome;
@@ -182,6 +184,7 @@ impl<T: IoHandler> Cleaner<T> {
                     false,
                     false,
                     Trigger::Scheduled,
+                    Origin::DaemonSchedule,
                 );
                 let _ignored = cleaner.run(command).await;
             }
@@ -244,9 +247,11 @@ impl<T: IoHandler> Cleaner<T> {
         let cleaner = self.dupe();
         async move {
             let start = Instant::now();
+            let disk_space = CleanDiskSpace::new(cleaner.buck_out_abs_path.as_deref());
             let observer = cleaner.begin();
-            let result = cleaner.dupe().run_inner(command.clone(), observer).await;
+            let mut result = cleaner.dupe().run_inner(command.clone(), observer).await;
             cleaner.interrupt();
+            disk_space.record(&mut result);
             let trace_id = match command.trigger {
                 Trigger::Scheduled => None,
                 _ => Some(command.dispatcher.trace_id().dupe()),
@@ -257,6 +262,7 @@ impl<T: IoHandler> Cleaner<T> {
                 command.dispatcher.daemon_id(),
                 (Instant::now() - start).as_secs(),
                 command.trigger,
+                command.origin,
                 command.policy_mode,
                 command.tracked_only,
             ));

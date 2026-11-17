@@ -18,6 +18,7 @@ buck2_events.workspace = true
 buck2_fs.workspace = true
 buck2_resource_control.workspace = true
 buck2_server.workspace = true
+buck2_settings.workspace = true
 buck2_util.workspace = true
 buck2_wrapper_common.workspace = true
 clap.workspace = true
@@ -37,6 +38,7 @@ buck2_certs.workspace = true
 fbinit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+buck2_tenant_proxy.workspace = true
 nix.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

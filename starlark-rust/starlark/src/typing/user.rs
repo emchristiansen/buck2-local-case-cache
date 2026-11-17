@@ -337,10 +337,10 @@ mod tests {
     use crate::typing::TyUser;
     use crate::typing::callable::TyCallable;
     use crate::typing::user::TyUserParams;
-    use crate::values::AllocValue;
     use crate::values::Heap;
     use crate::values::StarlarkValue;
     use crate::values::Value;
+    use crate::values::ValueOf;
     use crate::values::typing::TypeInstanceId;
 
     #[derive(
@@ -376,12 +376,6 @@ mod tests {
         ty_fruit_callable: Ty,
         #[starlark_pagable(pagable)]
         ty_fruit: Ty,
-    }
-
-    impl<'v> AllocValue<'v> for FruitCallable {
-        fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-            heap.alloc_simple(self)
-        }
     }
 
     #[starlark_value(type = "fruit_callable")]
@@ -420,12 +414,6 @@ mod tests {
         name: String,
     }
 
-    impl<'v> AllocValue<'v> for Fruit {
-        fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
-            unreachable!("not needed in test")
-        }
-    }
-
     #[starlark_value(type = "fruit")]
     impl<'v> StarlarkValue<'v> for Fruit {
         fn get_type_starlark_repr() -> Ty {
@@ -444,12 +432,6 @@ mod tests {
     )]
     #[display("coin")]
     struct Coin;
-
-    impl<'v> AllocValue<'v> for Coin {
-        fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
-            heap.alloc_simple(self)
-        }
-    }
 
     #[starlark_value(type = "coin")]
     impl<'v> StarlarkValue<'v> for Coin {
@@ -473,11 +455,11 @@ mod tests {
     #[starlark_module]
     #[starlark_types(AbstractPlant as Plant)]
     fn globals(globals: &mut GlobalsBuilder) {
-        fn fruit(name: String) -> starlark::Result<FruitCallable> {
+        fn fruit<'v>(name: &str, heap: Heap<'v>) -> starlark::Result<ValueOf<'v, FruitCallable>> {
             let ty_fruit = Ty::custom(TyUser::new(
-                name.clone(),
+                name.to_owned(),
                 TyStarlarkValue::new::<Fruit>(),
-                TypeInstanceId::for_test(&("fruit", name.as_str())),
+                TypeInstanceId::for_test(&("fruit", name)),
                 TyUserParams {
                     supertypes: AbstractPlant::get_type_starlark_repr()
                         .iter_union()
@@ -488,25 +470,28 @@ mod tests {
             let ty_fruit_callable = Ty::custom(TyUser::new(
                 format!("fruit[{name}]"),
                 TyStarlarkValue::new::<FruitCallable>(),
-                TypeInstanceId::for_test(&("fruit_callable", name.as_str())),
+                TypeInstanceId::for_test(&("fruit_callable", name)),
                 TyUserParams {
                     callable: Some(TyCallable::new(ParamSpec::empty(), ty_fruit.clone())),
 
                     ..TyUserParams::default()
                 },
             )?);
-            Ok(FruitCallable {
-                name,
-                ty_fruit_callable,
-                ty_fruit,
-            })
+            Ok(ValueOf::alloc(
+                heap,
+                FruitCallable {
+                    name: name.to_owned(),
+                    ty_fruit_callable,
+                    ty_fruit,
+                },
+            ))
         }
 
         fn mk_fruit() -> anyhow::Result<Fruit> {
             panic!("not needed in test")
         }
 
-        fn mk_coin() -> anyhow::Result<Coin> {
+        fn mk_coin<'v>() -> anyhow::Result<ValueOf<'v, Coin>> {
             panic!("not needed in test")
         }
     }

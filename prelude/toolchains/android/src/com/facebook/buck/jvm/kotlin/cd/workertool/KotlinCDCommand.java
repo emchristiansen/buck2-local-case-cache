@@ -37,6 +37,7 @@ import com.facebook.buck.jvm.kotlin.cd.workertool.postexecutors.PreviousStateWri
 import com.facebook.buck.jvm.kotlin.cd.workertool.postexecutors.SkippedCompilationTracker;
 import com.facebook.buck.jvm.kotlin.cd.workertool.postexecutors.SkippedCompilationTrackerFactory;
 import com.facebook.buck.util.zip.ZipScrubber;
+import com.facebook.infer.annotation.Nullsafe;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedSet;
@@ -51,10 +52,11 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.stream.Collectors;
-import javax.annotation.Nullable;
+import org.jspecify.annotations.Nullable;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.Option;
@@ -64,6 +66,7 @@ import org.kohsuke.args4j.Option;
  *
  * <p>This provides a simple executable that can run any of the kotlincd actions.
  */
+@Nullsafe(Nullsafe.Mode.LOCAL)
 public class KotlinCDCommand implements JvmCDCommand {
 
   private static final String ACTION_META_DATA_FILE = "action_metadata.json";
@@ -77,13 +80,15 @@ public class KotlinCDCommand implements JvmCDCommand {
   protected Path commandFile;
 
   @Option(name = "--incremental-config-file")
+  @Nullable
   protected Path incrementalConfigFile;
 
   @Option(name = "--logging-level")
   private int loggingLevel = 0;
 
-  private final String buildUuid;
+  @Nullable private final String buildUuid;
   private final String executionPlatform;
+  private final Path scratchDir;
 
   private final KotlinStepsBuilder stepsBuilder;
   private final BuildKotlinCommand buildKotlinCommand;
@@ -110,11 +115,17 @@ public class KotlinCDCommand implements JvmCDCommand {
     try (Reader reader = new FileReader(commandFile.toFile())) {
       JsonFormat.parser().ignoringUnknownFields().merge(reader, builder);
     }
-    RelPath buckScratchPath = RelPath.get(env.get(WORKING_DIRECTORY_ENV_VAR));
+    String scratchPath = env.get(WORKING_DIRECTORY_ENV_VAR);
+    if (scratchPath == null || scratchPath.isEmpty()) {
+      throw new IllegalStateException(
+          "BUCK_SCRATCH_PATH environment variable must be set and non-empty");
+    }
+    RelPath buckScratchPath = RelPath.get(scratchPath);
+    scratchDir = buckScratchPath.getPath();
     com.facebook.buck.cd.model.kotlin.BuildKotlinCommand proto = builder.build();
     this.buildKotlinCommand =
         BuildKotlinCommand.Companion.fromProto(
-            proto.getBuildCommand(), Optional.ofNullable(buckScratchPath));
+            proto.getBuildCommand(), Optional.of(buckScratchPath));
     this.postBuildParams = PostBuildParams.Companion.fromProto(proto.getPostBuildParams());
     CompilerClassToSourceMap.prepare(
         buildKotlinCommand
@@ -273,11 +284,13 @@ public class KotlinCDCommand implements JvmCDCommand {
   }
 
   protected void maybeWriteAbiDir() throws IOException {
-    if (postBuildParams.getAbiOutputDir() == null) {
+    Path abiOutputDir = postBuildParams.getAbiOutputDir();
+    if (abiOutputDir == null) {
       Preconditions.checkState(postBuildParams.getAbiJar() == null);
       return;
     }
-    AbiDirWriter.writeAbiOutputDir(postBuildParams.getAbiJar(), postBuildParams.getAbiOutputDir());
+    AbiDirWriter.writeAbiOutputDir(
+        Objects.requireNonNull(postBuildParams.getAbiJar()), abiOutputDir);
   }
 
   public void maybeWriteDepFile() throws IOException {
@@ -398,7 +411,7 @@ public class KotlinCDCommand implements JvmCDCommand {
     Path libraryJar = postBuildParams.getLibraryJar();
     Preconditions.checkNotNull(libraryJar, "libraryJar must be set when postProcessorCmd is set");
 
-    Path tempDir = Files.createTempDirectory("postprocessor");
+    Path tempDir = Files.createTempDirectory(scratchDir, "postprocessor");
     try {
       Path postprocessedJar = tempDir.resolve("postprocessed_output.jar");
       List<String> cmd = new ArrayList<>(Arrays.asList(postProcessorCmd.split("\\s+")));

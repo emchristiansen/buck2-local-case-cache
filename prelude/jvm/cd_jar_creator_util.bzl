@@ -207,6 +207,20 @@ def get_source_only_abi_compiling_deps(
         source_only_abi_compiling_deps = [compiling_dep for compiling_dep in list(compiling_deps_tset.traverse()) if filter_compiling_deps(compiling_dep)]
     return actions.tset(SourceOnlyAbiCompilingDepsTSet, value = source_only_abi_compiling_deps)
 
+def get_source_only_abi_jars(
+    source_only_abi_compiling_deps: JavaCompilingDepsTSet | SourceOnlyAbiCompilingDepsTSet,
+    compiling_deps_tset: [JavaCompilingDepsTSet, None],
+    source_only_abi_deps: list[Dependency],
+) -> list[Artifact]:
+    """
+    The jars of the `source_only_abi_jars` projection of `get_source_only_abi_compiling_deps`'s
+    result, in its order.
+    """
+    if not source_only_abi_deps and compiling_deps_tset != None:
+        # `get_source_only_abi_compiling_deps` returned the compiling deps themselves.
+        return [entry.abi for entry in source_only_abi_compiling_deps.traverse() if entry.required_for_source_only_abi]
+    return [entry.abi for entries in source_only_abi_compiling_deps.traverse() for entry in entries]
+
 def _apply_ap_param_overrides(params: list[str], overrides: dict[str, [str, None]]) -> list[str]:
     result = [param for param in params if param.split("=", 1)[0].removeprefix("-A") not in overrides]
     for key, value in overrides.items():
@@ -305,7 +319,7 @@ def encode_base_jar_command(
         if use_abi_dirs:
             compiling_classpath = cmd_args(compiling_deps_tset.project_as_args("abi_and_dir", ordering = "topological")) if compiling_deps_tset else []
         else:
-            compiling_classpath = compiling_deps_tset.project_as_json("javacd_json", ordering = "topological") if compiling_deps_tset else []
+            compiling_classpath = cmd_args(compiling_deps_tset.project_as_args("args_for_compiling", ordering = "topological")) if compiling_deps_tset else []
         # The snapshot inputs are tagged for association with dep_files, but they are not marked as used,
         # as they serve the incremental compiler's internal needs,
         # which are utilized after the build system has determined whether a rebuild is necessary.
@@ -386,6 +400,7 @@ def prepare_cd_exe(
     extra_jvm_args: list[str],
     extra_jvm_args_target: list[Label],
     java_runtime_version: [int, None],
+    non_worker_jvm_args: list[str] = [],
 ) -> tuple:
     local_only = False
     jvm_args = ["-XX:-MaxFDLimit"] + unsafe_memory_access_jvm_args(java_runtime_version)
@@ -443,7 +458,9 @@ def prepare_cd_exe(
         local_only = True
         jvm_args.extend(["-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address={}".format(debug_port)])
 
-    non_worker_args = cmd_args([java, jvm_args, "-cp", compiler, "-jar", class_loader_bootstrapper, main_class])
+    # `non_worker_jvm_args` apply only to the one-shot JVM below (remote execution, or no worker), never to a
+    # persistent worker, whose long-lived JVM profits from the full JIT.
+    non_worker_args = cmd_args([java, jvm_args, non_worker_jvm_args, "-cp", compiler, "-jar", class_loader_bootstrapper, main_class])
 
     if local_only or not worker:
         # buck doesn't support the case where remote_worker is provided but worker is not.

@@ -15,6 +15,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -52,7 +53,9 @@ use buck2_core::error::SoftErrorContext;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::logging::LogConfigurationReloadHandle;
 use buck2_core::pattern::unparsed::UnparsedPatternPredicate;
+use buck2_core::tag_error;
 use buck2_error::BuckErrorContext;
+use buck2_error::BuckErrorOptionContext;
 use buck2_error::ErrorTag;
 use buck2_error::buck2_error;
 use buck2_events::Event;
@@ -89,9 +92,11 @@ use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use buck2_server_ctx::test_command::TEST_COMMAND;
 use buck2_server_starlark_debug::run::run_dap_server_command;
 use buck2_test::executor_launcher::get_all_test_executors;
+use buck2_util::system_stats::container_memory_limit_bytes;
 use buck2_util::system_stats::num_cores;
 use buck2_util::system_stats::system_memory_stats;
 use buck2_util::threads::thread_spawn;
+use buck2_wrapper_common::invocation_id::TraceId;
 use dice::BranchId;
 use dice::Dice;
 use dice::EvictionPolicy;
@@ -110,6 +115,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::future::BoxFuture;
 use futures::stream;
 use pagable::DeferredReadFailures;
+use parking_lot::Mutex;
 use rand::Rng as _;
 use rand::SeedableRng;
 use tokio::runtime::Handle;
@@ -133,6 +139,7 @@ use crate::daemon::dice::TenantDiceProvider;
 use crate::daemon::multi_event_stream::MultiEventStream;
 use crate::daemon::server_allocative::spawn_allocative;
 use crate::daemon::state::DaemonState;
+use crate::daemon::state::Registrant;
 use crate::file_status::file_status_command;
 use crate::hydration::hydration_command;
 use crate::new_generic::new_generic_command;
@@ -217,6 +224,8 @@ impl DaemonInactivityConfig {
 
 #[derive(Allocative)]
 struct DaemonShutdown {
+    /// Whether a shutdown was triggered.
+    started: AtomicBool,
     /// This channel is used to trigger a graceful shutdown of the grpc server. After
     /// an item is sent on this channel, the server will start rejecting new requests
     /// and once current requests are finished the server will shutdown. The item is
@@ -229,9 +238,15 @@ impl DaemonShutdown {
     /// Trigger a graceful server shutdown with a timeout. Once the timeout expires,
     /// `spawn_shutdown_watchdog` takes the process down whether or not the drain finished.
     ///
+    /// A daemon shuts down once: only the first call does anything.
+    ///
     /// As we might be processing a `kill()` (or other) request, we cannot wait for the server to actually
     /// shutdown (as it will wait for current requests to finish), so this returns immediately.
     fn start_shutdown(&self, reason: buck2_data::DaemonShutdown, timeout: Option<Duration>) {
+        if self.started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
         // The daemon's stderr is `buckd.stderr`, which the client tails into the console and the
         // invocation record and `rage` collects: it is where a daemon's last words are looked
         // for, so the reason goes there directly.
@@ -244,6 +259,11 @@ impl DaemonShutdown {
         // Ignore errors on shutdown_channel as that would mean we've already started shutdown;
         let _ = self.shutdown_channel.unbounded_send(shutdown_deadline);
     }
+
+    /// Whether a shutdown was triggered. The daemon then takes no new commands.
+    fn has_started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Allocative)]
@@ -253,13 +273,16 @@ pub struct BuckdServerInitPreferences {
     pub daemon_startup_config: DaemonStartupConfig,
     pub daemon_originating_cgroup: Option<String>,
     pub started_for_clean_stale: bool,
+    /// This daemon runs as a thread inside its only client (`--no-buckd`).
+    pub in_process: bool,
 }
 
-#[derive(Allocative)]
+#[derive(Allocative, Clone)]
 pub(crate) struct TenantStateInitPreferences {
     pub(crate) enable_trace_io: bool,
     pub(crate) reject_materializer_state: Option<SqliteIdentity>,
     pub(crate) daemon_startup_config: DaemonStartupConfig,
+    pub(crate) in_process: bool,
 }
 
 impl BuckdServerInitPreferences {
@@ -269,6 +292,7 @@ impl BuckdServerInitPreferences {
             reject_materializer_state,
             daemon_startup_config,
             daemon_originating_cgroup,
+            in_process,
             ..
         } = self;
         (
@@ -276,6 +300,7 @@ impl BuckdServerInitPreferences {
                 enable_trace_io,
                 reject_materializer_state,
                 daemon_startup_config,
+                in_process,
             },
             daemon_originating_cgroup,
         )
@@ -373,14 +398,15 @@ impl Interceptor for BuckCheckAuthTokenInterceptor {
 
 #[derive(Allocative)]
 pub(crate) struct BuckdServerData {
-    /// The flag that is set to true when server is shutting down.
-    stop_accepting_requests: AtomicBool,
     #[allocative(skip)]
     process_info: DaemonProcessInfo,
     base_daemon_constraints: buck2_cli_proto::DaemonConstraints,
+    /// Whether the daemon's tenants record I/O traces: a startup choice that every tenant's I/O
+    /// provider is built from, so it is known before any tenant initializes.
+    enable_trace_io: bool,
     start_time: prost_types::Timestamp,
     start_instant: Instant,
-    daemon_shutdown: DaemonShutdown,
+    daemon_shutdown: Arc<DaemonShutdown>,
     daemon_state: Arc<DaemonState>,
     #[allocative(skip)]
     cert_state: CertState,
@@ -394,6 +420,26 @@ pub(crate) struct BuckdServerData {
     rt: Handle,
 }
 
+/// How long a daemon that is restarting gives its commands to hear of it.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The shutdown of the daemon that this process runs. An in-process daemon's is not kept
+/// here: its client is the only one that could start another.
+static DAEMON_SHUTDOWN: Mutex<Weak<DaemonShutdown>> = Mutex::new(Weak::new());
+
+/// Shuts the daemon down for `error`, for its clients to start another. An in-process daemon
+/// is left running.
+pub fn restart_daemon(error: &buck2_error::Error) {
+    let Some(daemon_shutdown) = DAEMON_SHUTDOWN.lock().upgrade() else {
+        return;
+    };
+    let shutdown = buck2_data::DaemonShutdown {
+        reason: format!("{error:#}"),
+        callers: Vec::new(),
+    };
+    daemon_shutdown.start_shutdown(shutdown, Some(RESTART_TIMEOUT));
+}
+
 /// The BuckdServer implements the DaemonApi.
 ///
 /// Simple endpoints are implemented here and complex things will be implemented in a sibling
@@ -401,11 +447,58 @@ pub(crate) struct BuckdServerData {
 #[derive(Allocative)]
 pub struct BuckdServer(Arc<BuckdServerData>);
 
+/// A reserved tenant generation whose registration has not run to completion. Dropping it with
+/// the registration unfinished, as a client's disconnect does, evicts the generation when this
+/// was its last registrant and it never initialized, so that it does not stay registered without
+/// a client or a tenant; a generation that other clients are registering, or that already serves
+/// clients, stays.
+struct PendingRegistration {
+    server: Option<BuckdServer>,
+    registrant: Option<Registrant>,
+    context: ClientContext,
+    generation: u64,
+    published: bool,
+}
+
+impl PendingRegistration {
+    fn disarm(&mut self) {
+        self.server = None;
+        if let Some(registrant) = self.registrant.take() {
+            registrant.leave();
+        }
+    }
+}
+
+impl Drop for PendingRegistration {
+    fn drop(&mut self) {
+        let Some(server) = self.server.take() else {
+            return;
+        };
+        let unclaimed = self
+            .registrant
+            .take()
+            .is_some_and(|registrant| registrant.leave());
+        tracing::info!(
+            generation = self.generation,
+            unclaimed,
+            "Tenant registration dropped before it completed"
+        );
+        if !unclaimed {
+            return;
+        }
+        let context = std::mem::take(&mut self.context);
+        let generation = self.generation;
+        let published = self.published;
+        server.0.rt.clone().spawn(async move {
+            server
+                .evict_failed_registration(&context, generation, published)
+                .await;
+        });
+    }
+}
+
 impl BuckdServer {
     fn shutdown_after_final_tenant_eviction(&self) {
-        self.0
-            .stop_accepting_requests
-            .store(true, Ordering::Release);
         self.0.daemon_shutdown.start_shutdown(
             buck2_data::DaemonShutdown {
                 reason: "The final tenant was evicted".to_owned(),
@@ -415,6 +508,239 @@ impl BuckdServer {
         );
     }
 
+    /// The spec of the proxy for a tenant generation, from what is known before the tenant
+    /// initializes. The I/O provider and the materializer state identity come out of
+    /// initialization, and clients take them from the daemon, not the proxy.
+    fn tenant_proxy_spec(
+        &self,
+        context: &ClientContext,
+        generation: u64,
+    ) -> buck2_error::Result<buck2_common::daemon_compatibility::TenantProxySpec> {
+        let mut constraints = self.0.base_daemon_constraints.clone();
+        constraints.extra = Some(buck2_cli_proto::ExtraDaemonConstraints {
+            trace_io_enabled: self.0.enable_trace_io,
+            materializer_state_identity: None,
+        });
+        let key = buck2_common::daemon_compatibility::DaemonCompatibilityKey::new(
+            &constraints.version,
+            constraints.user_version.as_deref(),
+            constraints
+                .daemon_startup_config
+                .as_deref()
+                .internal_error("Daemon constraints lack a startup config")?,
+            self.0.enable_trace_io,
+        );
+        Ok(buck2_common::daemon_compatibility::TenantProxySpec {
+            reference: buck2_common::daemon_compatibility::UnidaemonTenantReference {
+                compatibility_key: key,
+                daemon_id: constraints.daemon_id.clone(),
+                generation,
+            },
+            tenant: context
+                .tenant_identity
+                .clone()
+                .internal_error("Client context lacks a tenant identity")?,
+            daemon: self.0.process_info.clone(),
+            constraints,
+            io_provider: None,
+        })
+    }
+
+    /// Registers the tenant addressed by `context`. With `proxy`, the tenant's proxy is
+    /// published before the tenant initializes, so that a `kill` that arrives during
+    /// initialization reaches the tenant through the proxy as it does afterwards. Returns the
+    /// generation and the proxy's connection record.
+    async fn register_tenant_with_proxy(
+        &self,
+        context: &ClientContext,
+        reject_materializer_state: Option<SqliteIdentity>,
+    ) -> Result<(u64, DaemonProcessInfo), Status> {
+        let data = self.0.daemon_state.data().clone();
+        let reservation = data
+            .reserve_tenant_for_client_context(context)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+        let generation = reservation.generation();
+        let mut pending = PendingRegistration {
+            server: Some(BuckdServer(self.0.dupe())),
+            registrant: Some(reservation.registrant()),
+            context: context.clone(),
+            generation,
+            published: false,
+        };
+        let launch = super::proxies::LAUNCH_PROXY
+            .get()
+            .ok_or_else(|| Status::unimplemented("Tenant proxy launcher is not installed"))?;
+        // An evicted generation's proxy owns the tenant's directory until its eviction
+        // completes, so the replacement's proxy cannot publish before then.
+        data.wait_for_earlier_evictions(&reservation).await;
+        let spec = self
+            .tenant_proxy_spec(context, generation)
+            .map_err(|error| Status::internal(format!("{error:#}")))?;
+        let published = match launch(spec, self.proxy_supervisor()).await {
+            Ok(info) => {
+                pending.published = true;
+                info
+            }
+            Err(error) => {
+                pending.disarm();
+                self.evict_failed_registration(context, generation, false)
+                    .await;
+                return Err(Status::internal(format!(
+                    "Launching tenant proxy: {error:#}"
+                )));
+            }
+        };
+        match data
+            .register_reserved_tenant(reservation, reject_materializer_state)
+            .await
+        {
+            Ok(generation) => {
+                pending.disarm();
+                Ok((generation, published))
+            }
+            Err(error) => {
+                pending.disarm();
+                self.evict_failed_registration(context, generation, true)
+                    .await;
+                Err(Status::failed_precondition(format!("{error:#}")))
+            }
+        }
+    }
+
+    /// Evicts a generation whose registration failed. The eviction retires the generation's
+    /// proxy; a proxy that published after the generation was already evicted is retired here,
+    /// as nothing else would. The proxy of a final tenant is left to exit with the daemon. No
+    /// watchdog bounds the eviction: no client waits for it, and it completes once the tenant's
+    /// initialization, which cannot be interrupted, has returned.
+    async fn evict_failed_registration(
+        &self,
+        context: &ClientContext,
+        generation: u64,
+        published: bool,
+    ) {
+        let mut daemon_exits = false;
+        match self
+            .0
+            .daemon_state
+            .data()
+            .evict_tenant_generation(context, Some(generation))
+        {
+            Ok(Some(eviction)) => {
+                eviction.completed.await;
+                daemon_exits = eviction.final_tenant;
+                if daemon_exits {
+                    self.shutdown_after_final_tenant_eviction();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(generation, "Evicting a failed registration: {error:#}");
+            }
+        }
+        if published
+            && !daemon_exits
+            && let (Some(retire), Some(identity)) = (
+                super::proxies::RETIRE_PROXY.get(),
+                context.tenant_identity.clone(),
+            )
+        {
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                retire(&identity.project_root, &identity.isolation, generation)
+            })
+            .await
+            {
+                tracing::warn!(
+                    generation,
+                    "Retiring the proxy of a failed registration: {error:#}"
+                );
+            }
+        }
+    }
+
+    fn proxy_supervisor(&self) -> super::proxies::ProxySupervisor {
+        let weak = Arc::downgrade(&self.0);
+        let replacement = weak.clone();
+        super::proxies::ProxySupervisor {
+            runtime: self.0.rt.clone(),
+            begin_eviction: Arc::new(move |spec, recovery_allowed| {
+                let Some(inner) = weak.upgrade() else {
+                    return Ok(None);
+                };
+                let server = BuckdServer(inner);
+                let context = ClientContext {
+                    working_dir: spec.tenant.project_root.clone(),
+                    tenant_identity: Some(spec.tenant),
+                    command_name: "proxy-liveness-loss".to_owned(),
+                    ..Default::default()
+                };
+                let Some(eviction) = server.0.daemon_state.data().evict_tenant_after_proxy_loss(
+                    &context,
+                    spec.reference.generation,
+                    recovery_allowed,
+                )?
+                else {
+                    return Ok(None);
+                };
+                super::proxies::arm_tenant_eviction_watchdog(
+                    &eviction,
+                    super::proxies::PROXY_EVICTION_TIMEOUT,
+                );
+                let final_tenant = eviction.final_tenant;
+                let recovery_allowed = eviction.recovery_allowed.clone();
+                Ok(Some(super::proxies::ProxyEviction {
+                    final_tenant,
+                    recovery_allowed,
+                    completed: async move {
+                        eviction.completed.await;
+                        if final_tenant {
+                            server.shutdown_after_final_tenant_eviction();
+                        }
+                    }
+                    .boxed(),
+                }))
+            }),
+            register_replacement: Arc::new(move |previous| {
+                let weak = replacement.clone();
+                async move {
+                    let Some(inner) = weak.upgrade() else {
+                        return Ok(None);
+                    };
+                    let server = BuckdServer(inner);
+                    server
+                        .check_if_accepting_requests()
+                        .map_err(buck2_error::Error::from)?;
+                    let context = ClientContext {
+                        working_dir: previous.tenant.project_root.clone(),
+                        tenant_identity: Some(previous.tenant),
+                        command_name: "recover-tenant-proxy".to_owned(),
+                        ..Default::default()
+                    };
+                    if server
+                        .0
+                        .daemon_state
+                        .data()
+                        .tenant_generation_for_client_context(&context)?
+                        .is_some()
+                    {
+                        return Ok(None);
+                    }
+                    let (_, published) = server
+                        .register_tenant_with_proxy(&context, None)
+                        .await
+                        .map_err(|status| {
+                            buck2_error::buck2_error!(
+                                buck2_error::ErrorTag::Input,
+                                "{}",
+                                status.message()
+                            )
+                        })?;
+                    Ok(Some(published))
+                }
+                .boxed()
+            }),
+        }
+    }
+
     #[tracing::instrument(name = "daemon_listener", skip_all)]
     pub async fn run(
         fb: fbinit::FacebookInit,
@@ -422,7 +748,6 @@ impl BuckdServer {
         paths: InvocationPaths,
         init_ctx: BuckdServerInitPreferences,
         process_info: DaemonProcessInfo,
-        in_process: bool,
         prepped_cgroups: Option<PreppedBuckCgroups>,
         base_daemon_constraints: buck2_cli_proto::DaemonConstraints,
         listener: Pin<Box<dyn Stream<Item = Result<tokio::net::TcpStream, io::Error>> + Send>>,
@@ -482,7 +807,9 @@ impl BuckdServer {
                 .daemon_idle_timeout_s,
             init_ctx.started_for_clean_stale,
         )?;
+        let in_process = init_ctx.in_process;
 
+        let enable_trace_io = init_ctx.enable_trace_io;
         let daemon_state = Arc::new(
             DaemonState::new(
                 fb,
@@ -493,21 +820,29 @@ impl BuckdServer {
                 cwd,
                 cgroup_tree,
                 daemon_id,
+                base_daemon_constraints.user_version.clone(),
             )
             .await?,
         );
 
         let auth_token = process_info.auth_token.clone();
+        let daemon_shutdown = Arc::new(DaemonShutdown {
+            started: AtomicBool::new(false),
+            shutdown_channel,
+        });
+        if !in_process {
+            *DAEMON_SHUTDOWN.lock() = Arc::downgrade(&daemon_shutdown);
+        }
         let api_server = BuckdServer(Arc::new(BuckdServerData {
-            stop_accepting_requests: AtomicBool::new(false),
             process_info,
             base_daemon_constraints,
+            enable_trace_io,
             start_time: prost_types::Timestamp {
                 seconds: now.as_secs() as i64,
                 nanos: now.subsec_nanos() as i32,
             },
             start_instant: Instant::now(),
-            daemon_shutdown: DaemonShutdown { shutdown_channel },
+            daemon_shutdown,
             daemon_state: daemon_state.clone(),
             cert_state,
             inactivity_config: inactivity_config.clone(),
@@ -735,6 +1070,7 @@ impl BuckdServer {
                     }
                 },
                 num_cores: Some(num_cores() as u64),
+                container_memory_limit_bytes: container_memory_limit_bytes(),
             });
 
             // Fire off a snapshot before we start doing anything else. We use the metrics emitted here
@@ -944,7 +1280,7 @@ impl BuckdServer {
     /// Checks if the server is accepting requests.
     #[allow(clippy::result_large_err)]
     fn check_if_accepting_requests(&self) -> Result<(), Status> {
-        if self.0.stop_accepting_requests.load(Ordering::Relaxed) {
+        if self.0.daemon_shutdown.has_started() {
             Err(Status::failed_precondition(
                 "Failed to run command, `buckd` is shutting down soon!",
             ))
@@ -1118,19 +1454,30 @@ where
     // control events; our first step is to spawn it.
 
     let trace_id = dispatcher.trace_id().dupe();
-    let task_dispatcher = dispatcher.dupe();
-    let (spawned, cancellation) = cancellation_scope.spawn(rt, move |context| {
-        buck2_events::dispatch::with_dispatcher_async(task_dispatcher, func(context)).boxed()
+    // Created outside the task so that a task that never runs still reports.
+    let report = ReportCancelledCommand {
+        dispatcher: Some(dispatcher.dupe()),
+        trace_id: trace_id.dupe(),
+    };
+    let (_spawned, cancellation) = cancellation_scope.spawn(rt, move |context| {
+        async move {
+            buck2_events::dispatch::with_dispatcher_async(dispatcher, func(context)).await;
+            // `func` sends its own result and the event pump stops at the first one, so the guard
+            // is disarmed in the same poll that `func` returns in. This relies on `func` not
+            // awaiting between sending its result and returning, which holds for both callers.
+            // Blocking on purpose: the test needs the task to stay in this poll.
+            if let Ok(Some(ms)) = buck2_env!(
+                "BUCK2_TEST_COMMAND_END_STALL_MS",
+                type = u64,
+                applicability = testing
+            ) {
+                thread::sleep(Duration::from_millis(ms));
+            }
+            report.disarm();
+        }
+        .boxed()
     });
     let cancellation = CancelCommandOnDrop(cancellation);
-    let _monitor = rt.spawn(async move {
-        if let Err(error) = spawned.await {
-            dispatcher.command_result(error_to_command_result(buck2_error!(
-                ErrorTag::Input,
-                "Tenant command stopped: {error}"
-            )));
-        }
-    });
     let (output_send, output_recv) = tokio::sync::mpsc::unbounded_channel();
 
     // We run the event consumer on new non-tokio thread to avoid the consumer task from getting stuck behind
@@ -1197,6 +1544,30 @@ impl Drop for CancelCommandOnDrop {
     }
 }
 
+/// Sends the command's result if the task is dropped before the body returns.
+struct ReportCancelledCommand {
+    dispatcher: Option<EventDispatcher>,
+    trace_id: TraceId,
+}
+
+impl ReportCancelledCommand {
+    fn disarm(mut self) {
+        self.dispatcher = None;
+    }
+}
+
+impl Drop for ReportCancelledCommand {
+    fn drop(&mut self) {
+        if let Some(dispatcher) = self.dispatcher.take() {
+            dispatcher.command_result(error_to_command_result(buck2_error!(
+                ErrorTag::InterruptedByDaemonShutdown,
+                "Command {} was cancelled before it completed: its daemon tenant was evicted or the daemon is shutting down",
+                self.trace_id
+            )));
+        }
+    }
+}
+
 struct QueryCommandOptions {
     /// `buck2_cli_proto::ProfileMode`.
     profile_mode: Option<i32>,
@@ -1235,6 +1606,25 @@ type ResponseStream =
 
 #[async_trait]
 impl DaemonApi for BuckdServer {
+    async fn restart(
+        &self,
+        req: Request<RestartRequest>,
+    ) -> Result<Response<RestartResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let error = buck2_error!(
+            ErrorTag::InterruptedByDaemonShutdown,
+            "Daemon restart requested: {}",
+            req.into_inner().reason
+        );
+        let _reported = tag_error!(
+            "daemon_restart_requested",
+            error,
+            daemon_restart_requested: true,
+            task: false
+        );
+        Ok(Response::new(RestartResponse {}))
+    }
+
     async fn kill(&self, req: Request<KillRequest>) -> Result<Response<CommandResult>, Status> {
         struct KillRunCommandOptions;
 
@@ -1246,10 +1636,6 @@ impl DaemonApi for BuckdServer {
         }
 
         self.oneshot(req, KillRunCommandOptions, move |req| async move {
-            self.0
-                .stop_accepting_requests
-                .store(true, Ordering::Relaxed);
-
             let timeout = req
                 .timeout
                 .as_ref()
@@ -1261,7 +1647,32 @@ impl DaemonApi for BuckdServer {
                 callers: req.callers,
             };
 
-            self.0.daemon_shutdown.start_shutdown(reason, timeout);
+            if self.0.daemon_state.data().routing().is_shared() {
+                // A process-state rejection covers shared services. Retire all generations and
+                // revoke proxy recovery before acknowledging Kill; the watchdog also covers
+                // cleanup already in progress. Finer failure scopes can be handled separately.
+                let evictions = self.0.daemon_state.data().evict_all_tenants("kill");
+                let budget = timeout
+                    .unwrap_or(super::proxies::PROXY_EVICTION_TIMEOUT)
+                    .min(super::proxies::PROXY_EVICTION_TIMEOUT);
+                for eviction in &evictions {
+                    super::proxies::arm_tenant_eviction_watchdog(eviction, budget);
+                }
+                crate::active_commands::broadcast_shutdown(&reason);
+                let data = self.0.clone();
+                self.0.rt.spawn(async move {
+                    futures::stream::iter(evictions)
+                        .map(|eviction| eviction.completed)
+                        .buffer_unordered(16)
+                        .collect::<Vec<_>>()
+                        .await;
+                    // Every generation's work has drained, so the daemon shuts down normally;
+                    // an eviction that does not drain is ended by its watchdog instead.
+                    data.daemon_shutdown.start_shutdown(reason, timeout);
+                });
+            } else {
+                self.0.daemon_shutdown.start_shutdown(reason, timeout);
+            }
             Ok(KillResponse {})
         })
         .await
@@ -1788,28 +2199,109 @@ impl DaemonApi for BuckdServer {
         Ok(Response::new(UnstableListTenantsResponse { tenants }))
     }
 
+    async fn unstable_register_tenant(
+        &self,
+        req: Request<buck2_cli_proto::UnstableRegisterTenantRequest>,
+    ) -> Result<Response<buck2_cli_proto::UnstableRegisterTenantResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let req = req.into_inner();
+        let context = req
+            .context
+            .ok_or_else(|| Status::invalid_argument("missing tenant client context"))?;
+        // A rejected materializer database belongs to one generation of the tenant. That
+        // generation is evicted, bounded as a client's direct eviction is, so that the
+        // registration below creates one with a fresh database. The daemon keeps serving
+        // through the eviction even when the generation was its only tenant.
+        if let Some(rejected) = &req.reject_materializer_state {
+            let data = self.0.daemon_state.data();
+            let current = data
+                .tenant_generation_for_client_context(&context)
+                .map_err(|error| Status::failed_precondition(format!("{error:#}")))?;
+            // A generation whose metadata cannot be read is still initializing or already
+            // replaced, so it is not the one that produced the rejected database.
+            if let Some(generation) = current
+                && data
+                    .proxy_metadata(&context, generation)
+                    .ok()
+                    .and_then(|metadata| metadata.materializer_state_identity)
+                    .is_some_and(|identity| identity.to_string() == *rejected)
+                && let Some(eviction) = data
+                    .evict_tenant_generation_for_replacement(&context, generation)
+                    .map_err(|error| Status::internal(format!("{error:#}")))?
+            {
+                super::proxies::arm_tenant_eviction_watchdog(&eviction, Duration::from_secs(10));
+                eviction.completed.await;
+            }
+        }
+        let (generation, _) = self
+            .register_tenant_with_proxy(&context, req.reject_materializer_state.map(Into::into))
+            .await?;
+        let materializer_state_identity = self
+            .0
+            .daemon_state
+            .data()
+            .proxy_metadata(&context, generation)
+            .map_err(|error| Status::failed_precondition(format!("{error:#}")))?
+            .materializer_state_identity
+            .map(|identity| identity.to_string());
+        Ok(Response::new(
+            buck2_cli_proto::UnstableRegisterTenantResponse {
+                generation,
+                materializer_state_identity,
+            },
+        ))
+    }
+
     async fn evict_tenant(
         &self,
         req: Request<EvictTenantRequest>,
     ) -> Result<Response<EvictTenantResponse>, Status> {
-        self.check_if_accepting_requests()?;
+        let req = req.into_inner();
+        if req.expected_generation.is_none() {
+            self.check_if_accepting_requests()?;
+        }
+        let timeout = req.eviction_timeout_ms.map(Duration::from_millis);
         let context = req
-            .into_inner()
             .context
             .ok_or_else(|| Status::invalid_argument("missing tenant client context"))?;
         let eviction = self
             .0
             .daemon_state
             .data()
-            .evict_tenant_for_client_context(&context)
+            .evict_tenant_generation(&context, req.expected_generation)
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
         let shutting_down = eviction
             .as_ref()
             .is_some_and(|eviction| eviction.final_tenant);
-        if shutting_down {
+        // The watchdog stops the whole process tree, which is only a fallback for a shared
+        // daemon; an unshared daemon's eviction is its shutdown.
+        if let (Some(eviction), Some(timeout)) = (&eviction, timeout)
+            && self.0.daemon_state.data().routing().is_shared()
+        {
+            super::proxies::arm_tenant_eviction_watchdog(eviction, timeout);
+        }
+        if shutting_down && req.expected_generation.is_none() && timeout.is_none() {
             self.shutdown_after_final_tenant_eviction();
         }
-        if let Some(eviction) = &eviction {
+        if shutting_down && (req.expected_generation.is_some() || timeout.is_some()) {
+            // A fenced or bounded eviction of the final tenant shuts the daemon down once the
+            // eviction completes, whether or not this request waits for it.
+            let completed = eviction.as_ref().map(|eviction| eviction.completed.clone());
+            let server = BuckdServer(self.0.dupe());
+            let shutdown = async move {
+                if let Some(completed) = completed {
+                    completed.await;
+                }
+                server.shutdown_after_final_tenant_eviction();
+            };
+            if req.wait_for_completion.unwrap_or(true) {
+                shutdown.await;
+            } else {
+                tokio::spawn(shutdown);
+            }
+        } else if req.wait_for_completion.unwrap_or(true)
+            && let Some(eviction) = &eviction
+        {
             eviction.completed.clone().await;
         }
         Ok(Response::new(EvictTenantResponse {
@@ -2548,14 +3040,263 @@ impl<Req> StreamingCommandOptions<Req> for DapCommandOptions {
 mod tests {
     use std::time::Duration;
 
+    use buck2_events::BuckEvent;
+    use buck2_events::EventSink;
     use futures::channel::mpsc;
+    use parking_lot::Mutex;
 
     use super::*;
+    use crate::active_commands::ActiveCommandDropGuard;
+    use crate::active_commands::REGISTRY_TEST_LOCK;
 
     /// These tests drive the shutdown signal to completion inside the test binary, under
     /// `tokio::time::pause`. A watchdog would sleep against the wall clock the paused deadline has
     /// no relation to, and then `_exit` the test binary out from under the other tests.
     const IN_PROCESS: bool = true;
+
+    /// Records the `CommandResult`s sent to the event pump's channel.
+    struct RecordingSink {
+        send: crossbeam_channel::Sender<Event>,
+        results: Arc<Mutex<Vec<CommandResult>>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn send(&self, event: Event) {
+            if let Event::CommandResult(result) = &event {
+                self.results.lock().push((**result).clone());
+            }
+            let _ignored = self.send.send(event);
+        }
+    }
+
+    struct StreamingCommand {
+        response: Option<Response<ResponseStream>>,
+        dispatcher: EventDispatcher,
+        results: Arc<Mutex<Vec<CommandResult>>>,
+        /// Another sender on the pump's channel, which fails once the pump has exited.
+        probe: crossbeam_channel::Sender<Event>,
+        _guard: ActiveCommandDropGuard,
+        /// Dropping the scope would cancel the command.
+        _scope: CancellationScope,
+    }
+
+    impl StreamingCommand {
+        fn start(
+            func: impl FnOnce(EventDispatcher) -> BoxFuture<'static, ()> + Send + 'static,
+        ) -> Self {
+            Self::start_in(CancellationScope::new(), func)
+        }
+
+        fn start_in(
+            scope: CancellationScope,
+            func: impl FnOnce(EventDispatcher) -> BoxFuture<'static, ()> + Send + 'static,
+        ) -> Self {
+            let (send, recv) = crossbeam_channel::unbounded();
+            let results = Arc::new(Mutex::new(Vec::new()));
+            let dispatcher = EventDispatcher::new(
+                TraceId::new(),
+                DaemonId::new(),
+                RecordingSink {
+                    send: send.clone(),
+                    results: results.dupe(),
+                },
+            );
+            let ActiveCommand {
+                guard,
+                state,
+                daemon_shutdown_channel,
+            } = ActiveCommand::new(&dispatcher, Vec::new());
+            let body_dispatcher = dispatcher.dupe();
+            let response = streaming(
+                ChannelEventSource::new(recv),
+                state,
+                dispatcher.dupe(),
+                daemon_shutdown_channel,
+                &scope,
+                move |_| func(body_dispatcher),
+                &Handle::current(),
+            );
+            Self {
+                response: Some(response),
+                dispatcher,
+                results,
+                probe: send,
+                _guard: guard,
+                _scope: scope,
+            }
+        }
+
+        async fn wait_for_pump_exit(&self) {
+            let probe = || {
+                Event::Buck(BuckEvent::new(
+                    SystemTime::now(),
+                    self.dispatcher.trace_id().dupe(),
+                    None,
+                    None,
+                    buck2_data::SpanStartEvent {
+                        data: Some(buck2_data::AnalysisStart::default().into()),
+                    }
+                    .into(),
+                ))
+            };
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while self.probe.send(probe()).is_ok() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the event pump should exit after the first result");
+        }
+
+        /// What tonic does when the client disconnects.
+        fn drop_response(&mut self) {
+            self.response = None;
+        }
+
+        fn results(&self) -> Vec<CommandResult> {
+            self.results.lock().clone()
+        }
+
+        fn cancelled_message(&self) -> String {
+            format!(
+                "Command {} was cancelled before it completed: its daemon tenant was evicted or the daemon is shutting down",
+                self.dispatcher.trace_id()
+            )
+        }
+    }
+
+    fn error_report(result: &CommandResult) -> &buck2_data::ErrorReport {
+        match &result.result {
+            Some(command_result::Result::Error(report)) => report,
+            other => panic!("expected an error result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_reports_command_dropped_before_its_result() {
+        let _registry = REGISTRY_TEST_LOCK.lock().await;
+        let (started_send, started_recv) = oneshot::channel();
+        let (_park_send, park_recv) = oneshot::channel::<()>();
+        let (dropped_send, dropped_recv) = oneshot::channel::<()>();
+        let mut command = StreamingCommand::start(move |dispatcher| {
+            async move {
+                let _dropped = dropped_send;
+                started_send.send(()).unwrap();
+                let _ignored = park_recv.await;
+                dispatcher.command_result(error_to_command_result(buck2_error!(
+                    ErrorTag::Input,
+                    "body result"
+                )));
+            }
+            .boxed()
+        });
+        started_recv.await.unwrap();
+
+        command.drop_response();
+        command.wait_for_pump_exit().await;
+        // The body is dropped by then, so nothing can send another result.
+        assert!(dropped_recv.await.is_err());
+
+        let results = command.results();
+        assert_eq!(
+            1,
+            results.len(),
+            "only the guard should report: {results:?}"
+        );
+        let report = error_report(&results[0]);
+        assert_eq!(
+            Some(command.cancelled_message().as_str()),
+            report.message.lines().next()
+        );
+        assert!(
+            report
+                .tags
+                .contains(&(ErrorTag::InterruptedByDaemonShutdown as i32))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_does_not_report_completed_command_again() {
+        let _registry = REGISTRY_TEST_LOCK.lock().await;
+        let (dropped_send, dropped_recv) = oneshot::channel::<()>();
+        let mut command = StreamingCommand::start(move |dispatcher| {
+            async move {
+                let _dropped = dropped_send;
+                dispatcher.command_result(error_to_command_result(buck2_error!(
+                    ErrorTag::Input,
+                    "body result"
+                )));
+            }
+            .boxed()
+        });
+        command.wait_for_pump_exit().await;
+        assert!(dropped_recv.await.is_err());
+
+        command.drop_response();
+        tokio::task::yield_now().await;
+
+        let results = command.results();
+        assert_eq!(1, results.len(), "only the body should report: {results:?}");
+        assert_eq!(
+            Some("body result"),
+            error_report(&results[0]).message.lines().next()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_does_not_report_command_cancelled_after_its_result() {
+        let _registry = REGISTRY_TEST_LOCK.lock().await;
+        let (release_send, release_recv) = std::sync::mpsc::channel::<()>();
+        let (dropped_send, dropped_recv) = oneshot::channel::<()>();
+        let mut command = StreamingCommand::start(move |dispatcher| {
+            async move {
+                let _dropped = dropped_send;
+                dispatcher.command_result(error_to_command_result(buck2_error!(
+                    ErrorTag::Input,
+                    "body result"
+                )));
+                // Blocks without yielding, so the cancel below arrives during the task's final
+                // poll, after the body has sent its result.
+                release_recv.recv().unwrap();
+            }
+            .boxed()
+        });
+        command.wait_for_pump_exit().await;
+
+        command.drop_response();
+        release_send.send(()).unwrap();
+        assert!(dropped_recv.await.is_err());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let results = command.results();
+        assert_eq!(1, results.len(), "only the body should report: {results:?}");
+        assert_eq!(
+            Some("body result"),
+            error_report(&results[0]).message.lines().next()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_reports_command_admitted_after_scope_closed() {
+        let _registry = REGISTRY_TEST_LOCK.lock().await;
+        let scope = CancellationScope::new();
+        scope.cancel();
+        let command = StreamingCommand::start_in(scope, |_| {
+            async { unreachable!("a closed scope should not run the command") }.boxed()
+        });
+        command.wait_for_pump_exit().await;
+
+        let results = command.results();
+        assert_eq!(
+            1,
+            results.len(),
+            "only the guard should report: {results:?}"
+        );
+        assert_eq!(
+            Some(command.cancelled_message().as_str()),
+            error_report(&results[0]).message.lines().next()
+        );
+    }
 
     #[tokio::test]
     async fn test_server_shutdown_custom_idle_timeout() {
@@ -2689,5 +3430,290 @@ mod tests {
         shutdown_future.await;
 
         assert_eq!(expected_deadline, shutdown_deadline.await.unwrap());
+    }
+
+    /// `streaming` must dispatch exactly one `CommandResult` per command, however the command's
+    /// completion interleaves with its cancellation. `pump_events` stops at the first result, and
+    /// `ChannelEventSink` reports a control event that finds its receiver gone as a soft error,
+    /// which is a panic under the hard errors these tests run with. These tests record every
+    /// result dispatched, and a panic in a spawned task fails them.
+    ///
+    /// The cancellation primitive makes a second one easy to produce: a task whose body completes
+    /// in the same poll in which a cancel arrives still resolves as cancelled, so "the task was
+    /// cancelled" does not mean "the body did not report". A client that receives its result and
+    /// closes its stream cancels the command exactly like that.
+    mod one_result_per_command {
+        use std::sync::mpsc;
+
+        use buck2_events::EventSink;
+        use buck2_wrapper_common::invocation_id::TraceId;
+        use parking_lot::Mutex;
+
+        use super::super::*;
+        use crate::active_commands::ActiveCommandDropGuard;
+        use crate::active_commands::REGISTRY_TEST_LOCK;
+
+        /// Records every `CommandResult` dispatched for a command, in front of the sink the
+        /// command's client reads from.
+        struct RecordingSink<S> {
+            results: Arc<Mutex<Vec<CommandResult>>>,
+            inner: S,
+            /// Dropped with the last clone of the dispatcher, after which nothing can send.
+            _held: oneshot::Sender<()>,
+        }
+
+        impl<S: EventSink> EventSink for RecordingSink<S> {
+            fn send(&self, event: Event) {
+                if let Event::CommandResult(result) = &event {
+                    self.results.lock().push((**result).clone());
+                }
+                self.inner.send(event);
+            }
+        }
+
+        /// A command's plumbing before `streaming` takes it: what `run_streaming_erased` sets up.
+        struct CommandUnderTest {
+            dispatcher: EventDispatcher,
+            events: ChannelEventSource,
+            active: ActiveCommand,
+            results: Arc<Mutex<Vec<CommandResult>>>,
+            released: oneshot::Receiver<()>,
+        }
+
+        /// What is left once the command is streaming: the results dispatched so far, and the
+        /// means to wait until nothing can dispatch another.
+        struct Dispatched {
+            results: Arc<Mutex<Vec<CommandResult>>>,
+            released: oneshot::Receiver<()>,
+            guard: ActiveCommandDropGuard,
+        }
+
+        impl CommandUnderTest {
+            fn new() -> Self {
+                let (events, sink) = buck2_events::create_source_sink_pair();
+                let results = Arc::new(Mutex::new(Vec::new()));
+                let (held, released) = oneshot::channel();
+                let dispatcher = EventDispatcher::new(
+                    TraceId::new(),
+                    DaemonId::new(),
+                    RecordingSink {
+                        results: results.dupe(),
+                        inner: sink,
+                        _held: held,
+                    },
+                );
+                let active = ActiveCommand::new(&dispatcher, Vec::new());
+                Self {
+                    dispatcher,
+                    events,
+                    active,
+                    results,
+                    released,
+                }
+            }
+
+            fn stream<F>(self, scope: &CancellationScope, func: F) -> (ResponseStream, Dispatched)
+            where
+                F: for<'a> FnOnce(&'a CancellationContext) -> BoxFuture<'a, ()> + Send + 'static,
+            {
+                let ActiveCommand {
+                    guard,
+                    daemon_shutdown_channel,
+                    state,
+                } = self.active;
+                let response = streaming(
+                    self.events,
+                    state,
+                    self.dispatcher,
+                    daemon_shutdown_channel,
+                    scope,
+                    func,
+                    &Handle::current(),
+                );
+                (
+                    response.into_inner(),
+                    Dispatched {
+                        results: self.results,
+                        released: self.released,
+                        guard,
+                    },
+                )
+            }
+        }
+
+        impl Dispatched {
+            /// Waits until every holder of the command's dispatcher is gone: the command's task,
+            /// whatever `streaming` spawned beside it, and the active command registry. Only then
+            /// is the list of dispatched results final.
+            async fn settled(self) -> Vec<CommandResult> {
+                drop(self.guard);
+                let _ = timeout(Duration::from_secs(60), self.released)
+                    .await
+                    .expect("the command's dispatcher should be released once its task is done");
+                self.results.lock().clone()
+            }
+        }
+
+        fn body_result() -> CommandResult {
+            CommandResult {
+                result: Some(command_result::Result::PingResponse(PingResponse::default())),
+            }
+        }
+
+        fn is_error(result: &CommandResult) -> bool {
+            matches!(result.result, Some(command_result::Result::Error(_)))
+        }
+
+        /// The result the client reads from the stream.
+        async fn delivered(response: &mut ResponseStream) -> CommandResult {
+            while let Some(batch) = response.next().await {
+                for message in batch
+                    .expect("the stream carries no transport errors")
+                    .messages
+                {
+                    if let Some(command_progress::Progress::Result(result)) = message.progress {
+                        return *result;
+                    }
+                }
+            }
+            panic!("the stream ended without a result");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_completed_command_reports_once() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            let command = CommandUnderTest::new();
+            let dispatcher = command.dispatcher.dupe();
+            let (mut response, dispatched) = command.stream(&scope, move |_| {
+                async move { dispatcher.command_result(body_result()) }.boxed()
+            });
+
+            assert!(!is_error(&delivered(&mut response).await));
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+        }
+
+        /// The client receives its result and closes its stream while the command's task is still
+        /// inside the poll that sent it. Closing the stream cancels the task, which then resolves
+        /// as cancelled even though its body reported; that must not be reported again. This is
+        /// the crash that fast-reverted the 2026-11-02 buck2 bump (D129074969).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_client_that_disconnects_after_its_result_does_not_get_a_second_one() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            let (release, released) = mpsc::channel::<()>();
+            let command = CommandUnderTest::new();
+            let dispatcher = command.dispatcher.dupe();
+            let (mut response, dispatched) = command.stream(&scope, move |_| {
+                async move {
+                    dispatcher.command_result(body_result());
+                    // Blocks inside the poll on purpose: the cancel has to land before the task
+                    // resolves, as a client's disconnect does when it wins the race with the
+                    // task's last few instructions.
+                    released.recv().unwrap();
+                }
+                .boxed()
+            });
+
+            assert!(!is_error(&delivered(&mut response).await));
+            drop(response);
+            release.send(()).unwrap();
+
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+            assert!(!is_error(&results[0]), "{results:?}");
+        }
+
+        /// The cancel lands in the poll that reports, before the body has sent its result. The
+        /// body still completes, so its result is the only one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_cancel_during_the_reporting_poll_does_not_add_a_result() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            let (started, polling) = oneshot::channel::<()>();
+            let (release, released) = mpsc::channel::<()>();
+            let command = CommandUnderTest::new();
+            let dispatcher = command.dispatcher.dupe();
+            let (response, dispatched) = command.stream(&scope, move |_| {
+                async move {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    dispatcher.command_result(body_result());
+                }
+                .boxed()
+            });
+
+            polling.await.unwrap();
+            drop(response);
+            release.send(()).unwrap();
+
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+            assert!(!is_error(&results[0]), "{results:?}");
+        }
+
+        /// The client disconnects while the body is pending: the body never reports, so the
+        /// cancellation is the one result.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_client_that_disconnects_mid_command_gets_one_result() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            let command = CommandUnderTest::new();
+            let (response, dispatched) =
+                command.stream(&scope, |_| futures::future::pending::<()>().boxed());
+
+            drop(response);
+
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+            assert!(is_error(&results[0]), "{results:?}");
+        }
+
+        /// The tenant is evicted while the body is pending and the client is still connected: the
+        /// client is told once that its command stopped.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_evicted_command_tells_its_client_once() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            let command = CommandUnderTest::new();
+            let (mut response, dispatched) =
+                command.stream(&scope, |_| futures::future::pending::<()>().boxed());
+
+            scope.cancel();
+            assert!(is_error(&delivered(&mut response).await));
+            scope.wait().await;
+
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+        }
+
+        /// The tenant was evicted before the command was spawned: the body never runs, and the
+        /// client is told once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_command_admitted_after_eviction_tells_its_client_once() {
+            let _registry = REGISTRY_TEST_LOCK.lock().await;
+            let scope = CancellationScope::new();
+            scope.cancel();
+            let ran = Arc::new(AtomicBool::new(false));
+            let command = CommandUnderTest::new();
+            let dispatcher = command.dispatcher.dupe();
+            let (mut response, dispatched) = command.stream(&scope, {
+                let ran = ran.dupe();
+                move |_| {
+                    async move {
+                        ran.store(true, Ordering::SeqCst);
+                        dispatcher.command_result(body_result());
+                    }
+                    .boxed()
+                }
+            });
+
+            assert!(is_error(&delivered(&mut response).await));
+
+            let results = dispatched.settled().await;
+            assert_eq!(1, results.len(), "{results:?}");
+            assert!(!ran.load(Ordering::SeqCst));
+        }
     }
 }

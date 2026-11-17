@@ -8,17 +8,27 @@
 
 """`lean_library`: compiles Lean modules and the C that `lean` generates.
 
+The modules are the files of `srcs` and the `.lean` files below the
+directories of `src_dirs`, usually generated, which `lean_deps` lists at build
+time, so their number need not be known in BUCK.
+
 One action runs `lean --deps-json` on all sources to read their imports. A
 dynamic action then declares one `lean` action per module, in import order,
 and one C compile action per module. The objects go into one static archive;
-`link_whole` says whether it links whole.
+`link_whole` says whether it links whole. When the toolchain has
+`c_export_flags`, a second C compile action per module makes the object that
+exports every symbol; `LeanModule.export_object` carries it for the rules
+that link shared libraries of Lean code. The `[lean]` sub-target is the
+directory of the `.olean` files, `[modules]` the module names, one per line,
+in build order: a module after the modules it imports.
 
 Imports resolve through `LEAN_PATH`: every module of a library writes its
 `.olean` below one directory of the library, and the `LEAN_PATH` of a module
 lists that directory for its own library and for every library it depends on,
 each once, in dependency order. Two libraries cannot have a module of the same
 name. The inputs of a module are only the `.olean` and IR files of the modules
-it imports, transitively.
+it imports, transitively, and the `resources` of the target: files that the
+modules read at compile time with `include_str`.
 """
 
 load("@prelude//cxx:archive.bzl", "archive_flags")
@@ -79,18 +89,33 @@ def _compile_impl(
     deps_json: ArtifactValue,
     src_names: list[str],
     src_files: list[Artifact],
+    src_dirs: list[Artifact],
+    resources: list[Artifact],
     dep_values: list[ResolvedDynamicValue],
     lean: RunInfo,
     lean_flags: list[typing.Any],
     lean_path_separator: str,
     c_compile: cmd_args,
+    c_export_flags: list[typing.Any],
     object_extension: str,
     archive_cmd: cmd_args,
     archiver_supports_argfiles: bool,
     archive: OutputArtifact,
     lean_dir: OutputArtifact,
+    module_list: OutputArtifact,
 ) -> list[Provider]:
-    headers = deps_json.read_json()["imports"]
+    deps = deps_json.read_json()
+
+    # The modules of `src_dirs` come after those of `srcs`, in the order of
+    # `lean_deps`, which is the order of `imports`.
+    src_names = list(src_names)
+    src_files = list(src_files)
+    for src_dir, paths in zip(src_dirs, deps["dirs"]):
+        for path in paths:
+            src_names.append(path[: -len(".lean")].replace("/", "."))
+            src_files.append(src_dir.project(path))
+
+    headers = deps["imports"]
     if len(headers) != len(src_files):
         fail("`lean --deps-json` returned {} results for {} files".format(len(headers), len(src_files)))
 
@@ -141,7 +166,9 @@ def _compile_impl(
     lean_dir_files = {}
     # Every module after the modules it imports. `post_order_traversal` fails
     # on an import cycle.
-    for name in post_order_traversal(own_imports_only):
+    order = post_order_traversal(own_imports_only)
+    actions.write(module_list, "".join([name + "\n" for name in order]))
+    for name in order:
         src = own[name]
         path = name.replace(".", "/")
         depth = len(name.split("."))
@@ -179,12 +206,29 @@ def _compile_impl(
                 "-c",
                 c_file.as_output(),
                 lean_flags,
-                hidden = [part.as_output() for part in parts] + [s.project_as_args("artifacts") for s in import_sets],
+                hidden = [part.as_output() for part in parts] + [s.project_as_args("artifacts") for s in import_sets] + resources,
             ),
             env = {"LEAN_PATH": cmd_args([root] + dep_roots.values(), delimiter = lean_path_separator)},
             category = "lean",
             identifier = name,
         )
+
+        obj = actions.declare_output("obj", path + "." + object_extension, has_content_based_path = False)
+        actions.run(
+            cmd_args(c_compile, "-c", c_file, "-o", obj.as_output()),
+            category = "lean_cc",
+            identifier = name,
+        )
+        objects.append(obj)
+
+        export_obj = None
+        if c_export_flags:
+            export_obj = actions.declare_output("obj-export", path + "." + object_extension, has_content_based_path = False)
+            actions.run(
+                cmd_args(c_compile, c_export_flags, "-c", c_file, "-o", export_obj.as_output()),
+                category = "lean_cc_export",
+                identifier = name,
+            )
 
         modules[name] = LeanModule(
             name = name,
@@ -195,15 +239,9 @@ def _compile_impl(
                 value = [olean] + parts,
                 children = import_sets,
             ),
+            object = obj,
+            export_object = export_obj,
         )
-
-        obj = actions.declare_output("obj", path + "." + object_extension, has_content_based_path = False)
-        actions.run(
-            cmd_args(c_compile, "-c", c_file, "-o", obj.as_output()),
-            category = "lean_cc",
-            identifier = name,
-        )
-        objects.append(obj)
 
     if archiver_supports_argfiles:
         objects_args = at_argfile(
@@ -234,6 +272,7 @@ _compile = dynamic_actions(
         "archive_cmd": dynattrs.value(cmd_args),
         "archiver_supports_argfiles": dynattrs.value(bool),
         "c_compile": dynattrs.value(cmd_args),
+        "c_export_flags": dynattrs.value(list[typing.Any]),
         "dep_values": dynattrs.list(dynattrs.dynamic_value()),
         "deps_json": dynattrs.artifact_value(),
         "label": dynattrs.value(Label),
@@ -241,7 +280,10 @@ _compile = dynamic_actions(
         "lean_dir": dynattrs.output(),
         "lean_flags": dynattrs.value(list[typing.Any]),
         "lean_path_separator": dynattrs.value(str),
+        "module_list": dynattrs.output(),
         "object_extension": dynattrs.value(str),
+        "resources": dynattrs.value(list[Artifact]),
+        "src_dirs": dynattrs.value(list[Artifact]),
         "src_files": dynattrs.value(list[Artifact]),
         "src_names": dynattrs.value(list[str]),
     },
@@ -282,9 +324,9 @@ def _archive_cmd(cxx: CxxToolchainInfo) -> cmd_args:
 def compile_lean_library(ctx: AnalysisContext, link_whole: bool) -> struct:
     """Compiles the sources of a `lean_library`, `lean_binary` or `lean_test`.
 
-    Returns a struct with `archive`, `lean_dir`, `modules` (the
-    `LeanLibraryInfo` dynamic value), `link_infos`, `merged_link_info` and
-    `native_deps`.
+    Returns a struct with `archive`, `lean_dir`, `module_list` (the module
+    names, one per line, in build order), `modules` (the `LeanLibraryInfo`
+    dynamic value), `link_infos`, `merged_link_info` and `native_deps`.
     """
     toolchain = ctx.attrs.lean_toolchain[LeanToolchainInfo]
     cxx = get_cxx_toolchain_info(ctx)
@@ -292,15 +334,26 @@ def compile_lean_library(ctx: AnalysisContext, link_whole: bool) -> struct:
     src_files = ctx.attrs.srcs
     src_names = [lean_module_name(src, ctx.label.package, ctx.attrs.root) for src in src_files]
 
-    # `lean --deps-json` writes to stdout; the tool puts it into the file.
+    # A copy of each source directory, at a path that does not change with
+    # the directory's content. A generated directory usually has a
+    # content-based path, which changes when any file in it changes; the
+    # path of every module is in its `lean` command, so with the original
+    # directory one changed module would miss the cache for all of them.
+    src_dirs = []
+    for i, src_dir in enumerate(ctx.attrs.src_dirs):
+        src_dirs.append(ctx.actions.copy_dir("src_dirs/{}".format(i), src_dir, has_content_based_path = False))
+
+    # `lean_deps` lists the modules and runs `lean --deps-json` on them, with
+    # the file names on stdin, so their number has no limit.
     deps_json = ctx.actions.declare_output("deps.json", has_content_based_path = False)
     ctx.actions.run(
         cmd_args(
-            ctx.attrs._stdout_to_file[RunInfo],
+            ctx.attrs._lean_deps[RunInfo],
             cmd_args(deps_json.as_output(), format = "--out={}"),
+            at_argfile(actions = ctx.actions, name = "deps.argsfile", args = cmd_args(src_files, format = "--src={}")),
+            cmd_args(src_dirs, format = "--src-dir={}"),
             toolchain.lean,
             "--deps-json",
-            src_files,
         ),
         category = "lean_deps",
     )
@@ -312,22 +365,27 @@ def compile_lean_library(ctx: AnalysisContext, link_whole: bool) -> struct:
     lean_deps = toolchain.stdlib + ctx.attrs.deps
     archive = ctx.actions.declare_output("lib{}.{}".format(ctx.label.name, cxx.linker_info.static_library_extension), has_content_based_path = False)
     lean_dir = ctx.actions.declare_output("lean", dir = True, has_content_based_path = False)
+    module_list = ctx.actions.declare_output("modules.txt", has_content_based_path = False)
     modules = ctx.actions.dynamic_output_new(
         _compile(
             label = ctx.label,
             deps_json = deps_json,
             src_names = src_names,
             src_files = src_files,
+            src_dirs = src_dirs,
+            resources = ctx.attrs.resources,
             dep_values = [dep[LeanLibraryInfo].modules for dep in lean_deps],
             lean = toolchain.lean,
             lean_flags = toolchain.lean_flags + ctx.attrs.lean_flags,
             lean_path_separator = lean_path_separator,
             c_compile = _c_compile_cmd(ctx, cxx, toolchain),
+            c_export_flags = toolchain.c_export_flags,
             object_extension = cxx.linker_info.object_file_extension,
             archive_cmd = _archive_cmd(cxx),
             archiver_supports_argfiles = bool(cxx.linker_info.archiver_supports_argfiles),
             archive = archive.as_output(),
             lean_dir = lean_dir.as_output(),
+            module_list = module_list.as_output(),
         )
     )
 
@@ -349,6 +407,7 @@ def compile_lean_library(ctx: AnalysisContext, link_whole: bool) -> struct:
     return struct(
         archive = archive,
         lean_dir = lean_dir,
+        module_list = module_list,
         modules = modules,
         link_infos = link_infos,
         merged_link_info = create_merged_link_info(
@@ -366,7 +425,10 @@ def lean_library_impl(ctx: AnalysisContext) -> list[Provider]:
     return [
         DefaultInfo(
             default_output = library.archive,
-            sub_targets = {"lean": [DefaultInfo(default_output = library.lean_dir)]},
+            sub_targets = {
+                "lean": [DefaultInfo(default_output = library.lean_dir)],
+                "modules": [DefaultInfo(default_output = library.module_list)],
+            },
         ),
         LeanLibraryInfo(modules = library.modules),
         library.merged_link_info,
@@ -399,14 +461,24 @@ lean_library_attrs = {
         default = "toolchains//:lean",
         doc = "The Lean toolchain. Bootstrap builds of the core library set it to an earlier stage.",
     ),
+    "resources": attrs.list(
+        attrs.source(),
+        default = [],
+        doc = "Files that the modules read at compile time, with `include_str`. Every `lean` action of the target gets them as inputs, at their source paths, so a module reaches them with a path relative to its own file. They are not runtime resources of a `lean_binary`.",
+    ),
     "root": attrs.string(
         default = "",
         doc = "The directory, relative to the package, that module names start at. `<root>/Foo/Bar.lean` is module `Foo.Bar`.",
     ),
+    "src_dirs": attrs.list(
+        attrs.source(allow_directory = True),
+        default = [],
+        doc = "Directories of `.lean` files, usually generated, for modules whose number is known only at build time. A module's name is its path below the directory: `<dir>/Foo/Bar.lean` is module `Foo.Bar`; `root` does not apply. Files that do not end in `.lean` are ignored. The modules join those of `srcs` in the library.",
+    ),
     "srcs": attrs.list(attrs.source(), default = [], doc = "The `.lean` files."),
     "_cxx_toolchain": attrs.toolchain_dep(default = "toolchains//:cxx", providers = [CxxToolchainInfo]),
     "_exec_os_type": buck.exec_os_type_arg(),
-    "_stdout_to_file": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//lean/tools:stdout_to_file")),
+    "_lean_deps": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//lean/tools:lean_deps")),
 }
 
 lean_library = rule(

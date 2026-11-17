@@ -22,7 +22,6 @@ use buck2_core::target::target_configured_target_label::TargetConfiguredTargetLa
 use buck2_hash::BuckMutSet;
 use buck2_node::attrs::configured_traversal::ConfiguredAttrTraversal;
 use buck2_node::attrs::inspect_options::AttrInspectOptions;
-use buck2_node::execution::EXECUTION_PLATFORMS_BUCKCONFIG;
 use buck2_node::execution::ExecutionPlatformCandidateOutcomes;
 use buck2_node::execution::GET_EXECUTION_PLATFORMS;
 use buck2_node::execution::GetExecutionPlatforms;
@@ -61,7 +60,7 @@ impl ServerAuditSubcommand for AuditExecutionPlatformResolutionCommand {
                     None => {
                         writeln!(
                             stdout,
-                            "Execution platforms are not configured: {EXECUTION_PLATFORMS_BUCKCONFIG} unset"
+                            "Execution platforms are not configured: the `execution_platforms.target` setting and the `build.execution_platforms` buckconfig are unset"
                         )?;
                         writeln!(stdout, "Using legacy execution platform")?;
                     }
@@ -119,7 +118,7 @@ impl ServerAuditSubcommand for AuditExecutionPlatformResolutionCommand {
                         }
                         ResultMaybeCompatible::Compatible(node) => node.dupe(),
                     };
-                    let resolution = configured_node.execution_platform_resolution();
+                    let resolution = configured_node.body()?.execution_platform_resolution();
                     let group_deps = GroupDeps::collect(&configured_node);
                     match resolution.platform() {
                         Ok(platform) => {
@@ -252,7 +251,7 @@ impl ConfiguredAttrTraversal for GroupDeps {
 impl GroupDeps {
     fn collect(node: &ConfiguredTargetNode) -> buck2_error::Result<Self> {
         let mut deps = Self::default();
-        for attr in node.attrs(AttrInspectOptions::All) {
+        for attr in node.body()?.attrs(AttrInspectOptions::All) {
             attr.traverse(node.label().pkg(), &mut deps)?;
         }
         Ok(deps)

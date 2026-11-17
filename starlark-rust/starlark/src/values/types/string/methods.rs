@@ -32,13 +32,14 @@ use crate::values::Heap;
 use crate::values::StringValue;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::ValueOfUnchecked;
+use crate::values::ValueOf;
 use crate::values::list::AllocList;
-use crate::values::list::UnpackList;
+use crate::values::list::ListType;
 use crate::values::none::NoneOr;
+use crate::values::string::StarlarkStr;
 use crate::values::string::dot_format;
-use crate::values::tuple::UnpackTuple;
-use crate::values::type_repr::StarlarkTypeRepr;
+use crate::values::tuple::TupleType;
+use crate::values::types::int::view::IntView;
 use crate::values::types::string::iter::iterate_chars;
 use crate::values::types::string::iter::iterate_codepoints;
 use crate::values::typing::iter::StarlarkIter;
@@ -98,10 +99,10 @@ fn rsplitn_whitespace(s: &str, maxsplit: usize) -> Vec<String> {
     v
 }
 
-#[derive(StarlarkTypeRepr, UnpackValue)]
+#[derive(UnpackValue)]
 enum StringOrTuple<'v> {
-    String(&'v str),
-    Tuple(UnpackTuple<&'v str>),
+    String(ValueOf<'v, StarlarkStr>),
+    Tuple(ValueOf<'v, TupleType<StarlarkStr>>),
 }
 
 /// A letter with a case: upper, lower, or titlecase such as `ǅ`, which is neither but maps to
@@ -167,7 +168,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn elems<'v>(
         this: StringValue<'v>,
         heap: Heap<'v>,
-    ) -> anyhow::Result<ValueOfUnchecked<'v, StarlarkIter<String>>> {
+    ) -> anyhow::Result<ValueOf<'v, StarlarkIter<StarlarkStr>>> {
         Ok(iterate_chars(this, heap))
     }
 
@@ -217,7 +218,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn codepoints<'v>(
         this: StringValue<'v>,
         heap: Heap<'v>,
-    ) -> anyhow::Result<ValueOfUnchecked<'v, StarlarkIter<u32>>> {
+    ) -> anyhow::Result<ValueOf<'v, StarlarkIter<IntView<'v>>>> {
         Ok(iterate_codepoints(this, heap))
     }
 
@@ -286,8 +287,8 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
             None => return Ok(false),
         };
         match suffix {
-            StringOrTuple::String(x) => Ok(haystack.ends_with(x)),
-            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| haystack.ends_with(x))),
+            StringOrTuple::String(x) => Ok(haystack.ends_with(x.as_str())),
+            StringOrTuple::Tuple(xs) => Ok(xs.items().any(|x| haystack.ends_with(x.as_str()))),
         }
     }
 
@@ -675,32 +676,40 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     #[starlark(speculative_exec_safe)]
     fn join<'v>(
         this: &str,
-        #[starlark(require = pos)] to_join: ValueOfUnchecked<'v, StarlarkIter<String>>,
+        #[starlark(require = pos)] to_join: ValueOf<'v, StarlarkIter<StarlarkStr>>,
         heap: Heap<'v>,
-    ) -> starlark::Result<ValueOfUnchecked<'v, String>> {
+    ) -> starlark::Result<StringValue<'v>> {
         #[inline(always)]
         fn as_str<'v>(x: Value<'v>) -> crate::Result<StringValue<'v>> {
             StringValue::unpack_named_param(x, "to_join")
         }
 
-        let mut it = to_join.get().iterate(heap)?;
+        let mut it = to_join.to_value().iterate(heap)?;
         match it.next() {
-            None => Ok(ValueOfUnchecked::new(Value::new_empty_string())),
+            None => Ok(StringValue::default()),
             Some(x1) => {
                 match it.next() {
                     None => {
                         // If there is a singleton we can avoid reallocation
-                        Ok(as_str(x1)?.to_value_of_unchecked().cast())
+                        as_str(x1)
                     }
                     Some(x2) => {
                         let s1 = as_str(x1)?.as_str();
                         let s2 = as_str(x2)?.as_str();
-                        // guess towards the upper bound, since we throw away over-allocations quickly
-                        // include a buffer (20 bytes)
+                        // Reserve the first two parts and every separator, and guess that
+                        // each later part is as long as the longer of the first two. The
+                        // guess is capped, as a long first part followed by many short ones
+                        // would otherwise reserve its length once per part; past the cap the
+                        // buffer grows as the parts are pushed.
+                        const MAX_GUESS: usize = 64 * 1024;
                         let n = it.size_hint().0 + 2;
-                        let guess =
-                            (cmp::max(s1.len(), s2.len()) * n) + (this.len() * (n - 1)) + 20;
-                        let mut r = String::with_capacity(guess);
+                        let guess = cmp::min(
+                            cmp::max(s1.len(), s2.len()).saturating_mul(n - 2),
+                            MAX_GUESS,
+                        );
+                        let mut r = String::with_capacity(
+                            s1.len() + s2.len() + this.len() * (n - 1) + guess + 20,
+                        );
                         r.push_str(s1);
                         r.push_str(this);
                         r.push_str(s2);
@@ -708,7 +717,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
                             r.push_str(this);
                             r.push_str(as_str(x)?.as_str());
                         }
-                        Ok(heap.alloc_typed_unchecked(r))
+                        Ok(heap.alloc_str(&r))
                     }
                 }
             }
@@ -779,9 +788,9 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         if let Some(offset) = this.find(needle.as_str()) {
             let offset2 = offset + needle.len();
             Ok((
-                heap.alloc_str(this.get(..offset).unwrap()),
+                heap.alloc_str(this.as_str().get(..offset).unwrap()),
                 needle,
-                heap.alloc_str(this.get(offset2..).unwrap()),
+                heap.alloc_str(this.as_str().get(offset2..).unwrap()),
             ))
         } else {
             let empty = StringValue::default();
@@ -947,9 +956,9 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         if let Some(offset) = this.rfind(needle.as_str()) {
             let offset2 = offset + needle.len();
             Ok((
-                heap.alloc_str(this.get(..offset).unwrap()),
+                heap.alloc_str(this.as_str().get(..offset).unwrap()),
                 needle,
-                heap.alloc_str(this.get(offset2..).unwrap()),
+                heap.alloc_str(this.as_str().get(offset2..).unwrap()),
             ))
         } else {
             let empty = StringValue::default();
@@ -978,7 +987,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos, default = NoneOr::None)] sep: NoneOr<&str>,
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
         heap: Heap<'v>,
-    ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
+    ) -> anyhow::Result<ValueOf<'v, ListType<StarlarkStr>>> {
         if sep.into_option() == Some("") {
             return Err(anyhow::anyhow!(
                 "Empty separator cannot be used for splitting"
@@ -996,12 +1005,8 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         };
         Ok(match sep.into_option() {
             None => match maxsplit {
-                None => heap
-                    .alloc_typed_unchecked(AllocList(this.split_whitespace()))
-                    .cast(),
-                Some(maxsplit) => heap
-                    .alloc_typed_unchecked(rsplitn_whitespace(this, maxsplit))
-                    .cast(),
+                None => heap.alloc(AllocList(this.split_whitespace())),
+                Some(maxsplit) => heap.alloc(AllocList(rsplitn_whitespace(this, maxsplit))),
             },
             Some(sep) => {
                 let mut v: Vec<_> = match maxsplit {
@@ -1009,7 +1014,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
                     Some(maxsplit) => this.rsplitn(maxsplit, sep).collect(),
                 };
                 v.reverse();
-                heap.alloc_typed_unchecked(AllocList(v)).cast()
+                heap.alloc(AllocList(v))
             }
         })
     }
@@ -1085,7 +1090,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos, default = NoneOr::None)] sep: NoneOr<&str>,
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
         heap: Heap<'v>,
-    ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
+    ) -> anyhow::Result<ValueOf<'v, ListType<StarlarkStr>>> {
         if sep.into_option() == Some("") {
             return Err(anyhow::anyhow!(
                 "Empty separator cannot be used for splitting"
@@ -1102,12 +1107,8 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
             }
         };
         Ok(match (sep.into_option(), maxsplit) {
-            (None, None) => heap
-                .alloc_typed_unchecked(AllocList(this.split_whitespace()))
-                .cast(),
-            (None, Some(maxsplit)) => heap
-                .alloc_typed_unchecked(AllocList(splitn_whitespace(this, maxsplit)))
-                .cast(),
+            (None, None) => heap.alloc(AllocList(this.split_whitespace())),
+            (None, Some(maxsplit)) => heap.alloc(AllocList(splitn_whitespace(this, maxsplit))),
             (Some(sep), None) => {
                 if sep.len() == 1 {
                     // If we are searching for a 1-byte string, we can provide a much faster path.
@@ -1121,15 +1122,12 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
                             .map(|x| unsafe { std::str::from_utf8_unchecked(x) }),
                     );
                     debug_assert_eq!(res.len(), count + 1);
-                    heap.alloc_typed_unchecked(AllocList(res)).cast()
+                    heap.alloc(AllocList(res))
                 } else {
-                    heap.alloc_typed_unchecked(AllocList(this.split(sep)))
-                        .cast()
+                    heap.alloc(AllocList(this.split(sep)))
                 }
             }
-            (Some(sep), Some(maxsplit)) => heap
-                .alloc_typed_unchecked(AllocList(this.splitn(maxsplit, sep)))
-                .cast(),
+            (Some(sep), Some(maxsplit)) => heap.alloc(AllocList(this.splitn(maxsplit, sep))),
         })
     }
 
@@ -1157,7 +1155,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         this: &str,
         #[starlark(require = pos, default = false)] keepends: bool,
         heap: Heap<'v>,
-    ) -> anyhow::Result<Vec<StringValue<'v>>> {
+    ) -> anyhow::Result<AllocList<Vec<StringValue<'v>>>> {
         let mut s = this;
         let mut lines: Vec<StringValue> = Vec::new();
         loop {
@@ -1173,14 +1171,14 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
                     lines.push(heap.alloc_str(s.get(..y).unwrap()))
                 }
                 if x == s.len() {
-                    return Ok(lines);
+                    return Ok(AllocList(lines));
                 }
                 s = s.get(x..).unwrap();
             } else {
                 if !s.is_empty() {
                     lines.push(heap.alloc_str(s));
                 }
-                return Ok(lines);
+                return Ok(AllocList(lines));
             }
         }
     }
@@ -1217,8 +1215,8 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
             None => return Ok(false),
         };
         match prefix {
-            StringOrTuple::String(x) => Ok(haystack.starts_with(x)),
-            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| haystack.starts_with(x))),
+            StringOrTuple::String(x) => Ok(haystack.starts_with(x.as_str())),
+            StringOrTuple::Tuple(xs) => Ok(xs.items().any(|x| haystack.starts_with(x.as_str()))),
         }
     }
 
@@ -1389,6 +1387,21 @@ mod tests {
         // Indices that do not both clamp still give an empty range.
         assert::eq(r#""abc".find("", -1, -2)"#, "-1");
         assert::eq(r#""abc".find("c", -1, -2)"#, "-1");
+    }
+
+    /// `join` reserves room for the later parts from a capped guess based on the first two,
+    /// so the result must not depend on whether that guess is far too large or too small.
+    #[test]
+    fn test_join_parts_of_different_lengths() {
+        assert::eq(
+            r#""-".join(["abcdef", "g", "", "hi"])"#,
+            r#""abcdef-g--hi""#,
+        );
+        assert::eq(r#""-".join(["", "g", "abcdef"])"#, r#""-g-abcdef""#);
+        assert::is_true(r#""".join(["x" * 100000] + [""] * 1000) == "x" * 100000"#);
+        assert::is_true(r#"",".join(["x" * 1000] + ["y"] * 1000) == "x" * 1000 + ",y" * 1000"#);
+        assert::is_true(r#"",".join(["a", "b", "z" * 100000]) == "a,b," + "z" * 100000"#);
+        assert::fail(r#""-".join(["a", "b", 1])"#, "to_join");
     }
 
     /// The spec says `split` fails on an empty separator.

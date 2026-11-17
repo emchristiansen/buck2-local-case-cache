@@ -21,6 +21,9 @@ use buck2_fs::paths::file_name::FileName;
 use buck2_http::ProxyHostAllowlist;
 use buck2_settings::BuckSettingChange;
 use buck2_settings::DaemonBuckSettings;
+use buck2_settings::Http;
+use buck2_settings::MacosQosClass;
+use buck2_settings::ResourceControl;
 use dice::EvictionPolicy;
 use dice::PagableStorageBackend;
 use dice::PageOutPolicy;
@@ -28,10 +31,9 @@ use dupe::Dupe;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::daemon_routing::DaemonRouting;
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::key::BuckconfigKeyRef;
-
-pub const DEFAULT_RETAINED_EVENT_LOGS: usize = 12;
 
 /// Helper enum to categorize the kind of timeout we get from the startup config.
 #[derive(Clone, Debug)]
@@ -65,6 +67,7 @@ impl Timeout {
     Eq
 )]
 pub struct HttpConfig {
+    /// Stays a buckconfig key: a list, which settings do not carry yet.
     #[cfg(fbcode_build)]
     pub proxy_env_allowlist: ProxyHostAllowlist,
     connect_timeout_ms: Option<u64>,
@@ -76,34 +79,8 @@ pub struct HttpConfig {
 }
 
 impl HttpConfig {
-    pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
-        let connect_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "connect_timeout_ms",
-        })?;
-        let read_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "read_timeout_ms",
-        })?;
-        let write_timeout_ms = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "write_timeout_ms",
-        })?;
-        let max_redirects = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "max_redirects",
-        })?;
-        let http2 = config
-            .parse(BuckconfigKeyRef {
-                section: "http",
-                property: "http2",
-            })?
-            .unwrap_or(true);
-        let max_concurrent_requests = config.parse(BuckconfigKeyRef {
-            section: "http",
-            property: "max_concurrent_requests",
-        })?;
-
+    pub fn from_settings(http: &Http, config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+        let mut buckconfig = config;
         Ok(Self {
             #[cfg(fbcode_build)]
             proxy_env_allowlist: config
@@ -113,12 +90,12 @@ impl HttpConfig {
                 })?
                 .unwrap_or_default()
                 .try_into()?,
-            connect_timeout_ms,
-            read_timeout_ms,
-            write_timeout_ms,
-            http2,
-            max_redirects,
-            max_concurrent_requests,
+            connect_timeout_ms: http.connect_timeout_ms(&mut buckconfig)?,
+            read_timeout_ms: http.read_timeout_ms(&mut buckconfig)?,
+            write_timeout_ms: http.write_timeout_ms(&mut buckconfig)?,
+            http2: http.http2(&mut buckconfig)?,
+            max_redirects: http.max_redirects(&mut buckconfig)?,
+            max_concurrent_requests: http.max_concurrent_requests(&mut buckconfig)?,
         })
     }
 
@@ -284,7 +261,7 @@ pub struct ResourceControlConfig {
 
 impl ResourceControlConfig {
     pub fn testing_default() -> Self {
-        Self::from_config(&LegacyBuckConfig::empty()).unwrap()
+        Self::from_settings(&ResourceControl::default(), &LegacyBuckConfig::empty()).unwrap()
     }
 }
 
@@ -388,108 +365,63 @@ const RESOURCE_CONTROL_ALGO_VERSION: u32 = 6;
 const DAEMON_CGROUP_VERSION: u32 = 1;
 
 impl ResourceControlConfig {
-    pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+    pub fn from_settings(
+        resource_control: &ResourceControl,
+        config: &LegacyBuckConfig,
+    ) -> buck2_error::Result<Self> {
         if let Some(env_conf) = buck2_env!(
             "BUCK2_TEST_RESOURCE_CONTROL_CONFIG",
             applicability = testing,
         )? {
-            Self::deserialize(env_conf)
-        } else {
-            let status: Option<ResourceControlStatus> = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "status",
-            })?;
-            let status = if let Some(status) = status {
-                status
-            } else {
-                let min_version_for_gated_status: Option<u32> = config.parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "min_version_for_gated_status",
-                })?;
-                if min_version_for_gated_status
-                    .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version)
-                {
-                    config
-                        .parse(BuckconfigKeyRef {
-                            section: "buck2_resource_control",
-                            property: "version_gated_default_status",
-                        })?
-                        .unwrap_or(ResourceControlStatus::IfAvailable)
+            return Self::deserialize(env_conf);
+        }
+        let mut buckconfig = config;
+        let status = match resource_control.status(&mut buckconfig)? {
+            Some(status) => status.parse()?,
+            None => {
+                let gated = resource_control
+                    .min_version_for_gated_status(&mut buckconfig)?
+                    .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version);
+                if gated {
+                    match resource_control.version_gated_default_status(&mut buckconfig)? {
+                        Some(status) => status.parse()?,
+                        None => ResourceControlStatus::IfAvailable,
+                    }
                 } else {
                     ResourceControlStatus::Off
                 }
+            }
+        };
+        let init = match resource_control.init(&mut buckconfig)? {
+            Some(init) => init.parse()?,
+            None => ResourceControlInit::Systemd,
+        };
+        let enable_suspension = resource_control
+            .enable_suspension(&mut buckconfig)?
+            .unwrap_or(false)
+            || resource_control
+                .enable_suspension_if_min_algo_version(&mut buckconfig)?
+                .is_some_and(|min_version| RESOURCE_CONTROL_ALGO_VERSION >= min_version);
+        let preferred_action_suspend_strategy =
+            match resource_control.preferred_action_suspend_strategy(&mut buckconfig)? {
+                Some(strategy) => strategy.parse()?,
+                None => ActionSuspendStrategy::KillAndRetry,
             };
-            let init = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "init",
-                })?
-                .unwrap_or(ResourceControlInit::Systemd);
-            let memory_max = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max",
-            })?;
-            let memory_high = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high",
-            })?;
-            let memory_max_per_action = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max_per_action",
-            })?;
-            let memory_high_per_action = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high_per_action",
-            })?;
-            let memory_high_actions = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_high_actions",
-            })?;
-            let memory_max_actions = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_max_actions",
-            })?;
-            let memory_swap_max_actions = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "memory_swap_max_actions",
-            })?;
-            let enable_suspension = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "enable_suspension",
-            })?;
-            let enable_suspension_if_min_algo_version: Option<u32> =
-                config.parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "enable_suspension_if_min_algo_version",
-                })?;
-            let enable_suspension = enable_suspension.unwrap_or(false)
-                || enable_suspension_if_min_algo_version
-                    .is_some_and(|min_version| RESOURCE_CONTROL_ALGO_VERSION >= min_version);
-            let experimental_suspension_algo_variant = config.parse(BuckconfigKeyRef {
-                section: "buck2_resource_control",
-                property: "experimental_suspension_algo_variant",
-            })?;
-            let preferred_action_suspend_strategy = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "preferred_action_suspend_strategy",
-                })?
-                .unwrap_or(ActionSuspendStrategy::KillAndRetry);
-            Ok(Self {
-                status,
-                init,
-                memory_max,
-                memory_high,
-                memory_max_per_action,
-                memory_high_per_action,
-                memory_high_actions,
-                memory_max_actions,
-                memory_swap_max_actions,
-                enable_suspension,
-                experimental_suspension_algo_variant,
-                preferred_action_suspend_strategy,
-            })
-        }
+        Ok(Self {
+            status,
+            init,
+            memory_max: resource_control.memory_max(&mut buckconfig)?,
+            memory_high: resource_control.memory_high(&mut buckconfig)?,
+            memory_max_per_action: resource_control.memory_max_per_action(&mut buckconfig)?,
+            memory_high_per_action: resource_control.memory_high_per_action(&mut buckconfig)?,
+            memory_high_actions: resource_control.memory_high_actions(&mut buckconfig)?,
+            memory_max_actions: resource_control.memory_max_actions(&mut buckconfig)?,
+            memory_swap_max_actions: resource_control.memory_swap_max_actions(&mut buckconfig)?,
+            enable_suspension,
+            experimental_suspension_algo_variant: resource_control
+                .experimental_suspension_algo_variant(&mut buckconfig)?,
+            preferred_action_suspend_strategy,
+        })
     }
 
     pub fn serialize(&self) -> buck2_error::Result<String> {
@@ -507,40 +439,6 @@ pub enum LogDownloadMethod {
     Manifold,
     Curl(String),
     None,
-}
-
-#[derive(
-    Allocative,
-    Clone,
-    Debug,
-    Default,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq
-)]
-pub struct HealthCheckConfig {
-    pub enable_health_checks: bool,
-    pub disabled_health_check_names: Option<String>,
-}
-
-impl HealthCheckConfig {
-    pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
-        let enable_health_checks = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "enable_health_checks",
-        })?;
-        let disabled_health_check_names = config.parse(BuckconfigKeyRef {
-            section: "buck2_health_check",
-            property: "disabled_health_check_names",
-        })?;
-
-        Ok(Self {
-            // TODO(rajneeshl): When the rollout is successful, change this to default to true.
-            enable_health_checks: enable_health_checks.unwrap_or(false),
-            disabled_health_check_names,
-        })
-    }
 }
 
 /// Pagable DICE storage settings, present (`Some`) only when paging is enabled by
@@ -604,6 +502,10 @@ pub struct DaemonStartupConfig {
 /// Any difference requires a new daemon; Buck Settings have a separate compatibility check.
 #[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonStartupOptions {
+    /// How clients select this daemon; a daemon serves only tenants routed the same way.
+    /// Absent from the startup options of older daemons, which were all unshared.
+    #[serde(default)]
+    pub routing: DaemonRouting,
     /// Share one DICE engine across isolated tenant roots for this daemon's lifetime.
     pub share_dice: bool,
     pub num_tokio_workers: Option<usize>,
@@ -612,15 +514,13 @@ pub struct DaemonStartupOptions {
     pub source_digest_algorithm: Option<String>,
     pub paranoid: bool,
     pub materializations: Option<String>,
-    /// Which materializer implementation the daemon runs (`buck2.materializer`); `None` is the
-    /// deferred one.
-    pub materializer: Option<String>,
+    /// `buck2.materializer_v2_version`: the daemon runs the disk-state materializer when its
+    /// `ROLLOUT_VERSION` is at least this, and the deferred one when this is unset.
+    pub materializer_v2_version: Option<u32>,
     pub http: HttpConfig,
     pub resource_control: ResourceControlConfig,
     pub log_download_method: LogDownloadMethod,
-    pub health_check_config: HealthCheckConfig,
-    pub retained_event_logs: usize,
-    pub macos_qos_class: Option<String>,
+    pub macos_qos_class: Option<MacosQosClass>,
     pub daemon_idle_timeout_s: Option<u64>,
     /// Pagable DICE storage settings, or `None` when paging is disabled.
     pub hydration: Option<HydrationConfig>,
@@ -640,125 +540,71 @@ impl DaemonStartupConfig {
         settings: &DaemonBuckSettings,
         paranoid: bool,
     ) -> buck2_error::Result<Self> {
-        // Intepreted client side because we need the value here.
+        // Resolved on the client, buckconfig fallbacks included, so the daemon
+        // only ever sees the result.
+        let mut buckconfig = config;
 
         let log_download_method = {
             let log_download = &settings.log_download;
-            // Determine the log download method to use. Only default to
-            // manifold in fbcode contexts, or when specifically asked.
-            let use_manifold = log_download
-                .log_use_manifold()
-                .map(Ok::<_, buck2_error::Error>)
-                .unwrap_or_else(|| {
-                    Ok(config
-                        .parse(BuckconfigKeyRef {
-                            section: "buck2",
-                            property: "log_use_manifold",
-                        })?
-                        .unwrap_or(cfg!(fbcode_build)))
-                })?;
-
-            if use_manifold {
-                Ok(LogDownloadMethod::Manifold)
-            } else {
-                let log_url = log_download.log_url().or_else(|| {
-                    config
-                        .get(BuckconfigKeyRef {
-                            section: "buck2",
-                            property: "log_url",
-                        })
-                        .map(str::to_owned)
-                });
-                if let Some(log_url) = log_url {
-                    if log_url.is_empty() {
-                        Err(buck2_error::buck2_error!(
-                            buck2_error::ErrorTag::Input,
-                            "log_url is empty, but log_use_manifold is false"
-                        ))
-                    } else {
-                        Ok(LogDownloadMethod::Curl(log_url))
-                    }
-                } else {
-                    Ok(LogDownloadMethod::None)
+            if log_download.log_use_manifold(&mut buckconfig)? {
+                LogDownloadMethod::Manifold
+            } else if let Some(log_url) = log_download.log_url(&mut buckconfig)? {
+                if log_url.is_empty() {
+                    return Err(buck2_error::buck2_error!(
+                        buck2_error::ErrorTag::Input,
+                        "log_url is empty, but log_use_manifold is false"
+                    ));
                 }
+                LogDownloadMethod::Curl(log_url)
+            } else {
+                LogDownloadMethod::None
             }
-        }?;
+        };
 
+        let routing = DaemonRouting::from_config(config)?;
+        let shared = routing.is_shared();
         let startup_options = DaemonStartupOptions {
+            routing,
             share_dice: config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
                     property: "share_dice",
                 })?
                 .unwrap_or(false),
-            num_tokio_workers: config
-                .parse(BuckconfigKeyRef {
-                    section: "build",
-                    property: "num_tokio_workers",
-                })
-                .unwrap_or(Some(0)),
-            daemon_buster: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "daemon_buster",
-                })
-                .map(ToOwned::to_owned),
-            digest_algorithms: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "digest_algorithms",
-                })
-                .map(ToOwned::to_owned),
-            source_digest_algorithm: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "source_digest_algorithm",
-                })
-                .map(ToOwned::to_owned),
+            num_tokio_workers: settings.daemon.num_tokio_workers(&mut buckconfig)?,
+            daemon_buster: {
+                let buster = settings.daemon.buster(&mut buckconfig)?;
+                if shared {
+                    Some(format!("shared-daemon-v1:{}", buster.unwrap_or_default()))
+                } else {
+                    buster
+                }
+            },
+            digest_algorithms: settings.digest.algorithms(&mut buckconfig)?,
+            source_digest_algorithm: settings.digest.source_algorithm(&mut buckconfig)?,
             paranoid,
-            materializations: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "materializations",
-                })
-                .map(ToOwned::to_owned),
-            materializer: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "materializer",
-                })
-                .map(ToOwned::to_owned),
-            http: HttpConfig::from_config(config)?,
-            resource_control: ResourceControlConfig::from_config(config)?,
+            materializations: settings.materializer.materializations(&mut buckconfig)?,
+            materializer_v2_version: config.parse(BuckconfigKeyRef {
+                section: "buck2",
+                property: "materializer_v2_version",
+            })?,
+            http: HttpConfig::from_settings(&settings.http, config)?,
+            resource_control: ResourceControlConfig::from_settings(
+                &settings.resource_control,
+                config,
+            )?,
             log_download_method,
-            health_check_config: HealthCheckConfig::from_config(config)?,
-            retained_event_logs: config
-                .get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "retained_event_logs",
-                })
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
             macos_qos_class: {
-                let from_config = config
-                    .get(BuckconfigKeyRef {
-                        section: "buck2",
-                        property: "macos_qos_class",
-                    })
-                    .map(ToOwned::to_owned);
                 if buck2_env!("BUCK2_DISABLE_MACOS_QOS", bool)? {
                     return Err(buck2_error::buck2_error!(
                         buck2_error::ErrorTag::Input,
                         "`BUCK2_DISABLE_MACOS_QOS` is not supported, set \
-                         `[buck2] macos_qos_class = skip_lowering` in buckconfig instead"
+                         `daemon.macos_qos_class = \"skip_lowering\"` in `.bucksettings.toml` instead"
                     ));
                 }
-                from_config
+                settings.daemon.macos_qos_class(&mut buckconfig)?
             },
-            daemon_idle_timeout_s: config.parse(BuckconfigKeyRef {
-                section: "buck2",
-                property: "daemon_idle_timeout_s",
-            })?,
+            daemon_idle_timeout_s: settings.daemon.idle_timeout_s(&mut buckconfig)?,
             hydration: HydrationConfig::from_settings(settings),
         };
         Ok(Self {
@@ -793,6 +639,7 @@ impl DaemonStartupConfig {
 
     pub fn testing_empty() -> Self {
         let startup_options = DaemonStartupOptions {
+            routing: DaemonRouting::Unshared,
             share_dice: false,
             num_tokio_workers: None,
             daemon_buster: None,
@@ -800,7 +647,7 @@ impl DaemonStartupConfig {
             source_digest_algorithm: None,
             paranoid: false,
             materializations: None,
-            materializer: None,
+            materializer_v2_version: None,
             http: HttpConfig::default(),
             resource_control: ResourceControlConfig::testing_default(),
             log_download_method: if cfg!(fbcode_build) {
@@ -808,8 +655,6 @@ impl DaemonStartupConfig {
             } else {
                 LogDownloadMethod::None
             },
-            health_check_config: HealthCheckConfig::default(),
-            retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
             hydration: None,
@@ -857,6 +702,22 @@ mod tests {
     }
 
     #[test]
+    fn daemon_routing_is_a_daemon_startup_option() -> buck2_error::Result<()> {
+        let empty = parse(&[("config", "")], "config")?;
+        let unshared = DaemonStartupConfig::new(&empty, &DaemonBuckSettings::default(), false)?;
+        assert_eq!(unshared.startup_options.routing, DaemonRouting::Unshared);
+        let configured = parse(&[("config", "[buck2]\nshare_daemon = true")], "config")?;
+        let shared = DaemonStartupConfig::new(&configured, &DaemonBuckSettings::default(), false)?;
+        if cfg!(target_os = "linux") {
+            assert_eq!(shared.startup_options.routing, DaemonRouting::Shared);
+            assert_ne!(unshared.startup_options, shared.startup_options);
+        }
+        let deserialized = DaemonStartupConfig::deserialize(&shared.serialize()?)?;
+        assert_eq!(deserialized.startup_options, shared.startup_options);
+        Ok(())
+    }
+
+    #[test]
     fn dice_sharing_is_a_daemon_startup_option() -> buck2_error::Result<()> {
         let empty = parse(&[("config", "")], "config")?;
         let control = DaemonStartupConfig::new(&empty, &DaemonBuckSettings::default(), false)?;
@@ -874,34 +735,72 @@ mod tests {
     }
 
     #[test]
-    fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {
-        let config = parse(&[("config", indoc!(r#""#))], "config")?;
-        let startup_config =
-            DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
-        assert_eq!(startup_config.startup_options.daemon_idle_timeout_s, None);
-        Ok(())
-    }
-
-    #[test]
-    fn test_daemon_idle_timeout_s_configured() -> buck2_error::Result<()> {
+    fn test_settings_win_over_buckconfig_fallbacks() -> buck2_error::Result<()> {
         let config = parse(
             &[(
                 "config",
                 indoc!(
                     r#"
                     [buck2]
-                    daemon_idle_timeout_s = 10800
+                    daemon_buster = buckconfig
+                    digest_algorithms = SHA1
+                    source_digest_algorithm = SHA1
+                    macos_qos_class = background
+                    daemon_idle_timeout_s = 100
+                    [build]
+                    num_tokio_workers = 4
+                    [http]
+                    http2 = false
+                    [buck2_resource_control]
+                    memory_max = 50%
                     "#
                 ),
             )],
             "config",
         )?;
-        let startup_config =
-            DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        let fallback = DaemonStartupConfig::new(&config, &DaemonBuckSettings::default(), false)?;
+        let options = &fallback.startup_options;
+        assert_eq!(options.daemon_buster.as_deref(), Some("buckconfig"));
+        assert_eq!(options.digest_algorithms.as_deref(), Some("SHA1"));
+        assert_eq!(options.source_digest_algorithm.as_deref(), Some("SHA1"));
+        assert_eq!(options.macos_qos_class, Some(MacosQosClass::Background));
+        assert_eq!(options.daemon_idle_timeout_s, Some(100));
+        assert_eq!(options.num_tokio_workers, Some(4));
+        assert!(!options.http.http2);
+        assert_eq!(options.resource_control.memory_max.as_deref(), Some("50%"));
+
+        let settings = resolve_setting_flags(vec![table(indoc!(
+            r#"
+            [daemon]
+            buster = "settings"
+            idle_timeout_s = 60
+            num_tokio_workers = 8
+            macos_qos_class = "skip_lowering"
+            [digest]
+            algorithms = "BLAKE3-KEYED,SHA1"
+            source_algorithm = "BLAKE3-KEYED"
+            [http]
+            http2 = true
+            [resource_control]
+            memory_max = "60%"
+            "#
+        ))])?;
+        let from_settings = DaemonStartupConfig::new(&config, &settings.daemon, false)?;
+        let options = &from_settings.startup_options;
+        assert_eq!(options.daemon_buster.as_deref(), Some("settings"));
         assert_eq!(
-            startup_config.startup_options.daemon_idle_timeout_s,
-            Some(10800)
+            options.digest_algorithms.as_deref(),
+            Some("BLAKE3-KEYED,SHA1")
         );
+        assert_eq!(
+            options.source_digest_algorithm.as_deref(),
+            Some("BLAKE3-KEYED")
+        );
+        assert_eq!(options.macos_qos_class, Some(MacosQosClass::SkipLowering));
+        assert_eq!(options.daemon_idle_timeout_s, Some(60));
+        assert_eq!(options.num_tokio_workers, Some(8));
+        assert!(options.http.http2);
+        assert_eq!(options.resource_control.memory_max.as_deref(), Some("60%"));
         Ok(())
     }
 

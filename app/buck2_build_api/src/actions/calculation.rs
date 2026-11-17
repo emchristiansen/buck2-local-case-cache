@@ -46,7 +46,6 @@ use buck2_node::rule_type::RuleType;
 use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
-use dice::DiceTrackedInvalidationPath;
 use dice::EqualityBehavior;
 use dice::Key;
 use dice::OkPagableValueSerialize;
@@ -84,8 +83,8 @@ use crate::deferred::calculation::ActionLookup;
 use crate::deferred::calculation::lookup_deferred_holder;
 use crate::keep_going::KeepGoing;
 use crate::materialize::invocation_re_use_case;
+use crate::starlark::values::StarlarkTypeExpr;
 use crate::starlark::values::UnpackValue;
-use crate::starlark::values::type_repr::StarlarkTypeRepr;
 
 pub struct ActionCalculation;
 
@@ -402,21 +401,13 @@ async fn build_action_inner(
         .unwrap_or_default();
 
     let invalidation_info = if executor.invalidation_tracking_enabled() {
-        fn to_proto(
-            invalidation_path: &DiceTrackedInvalidationPath,
-        ) -> Option<buck2_data::command_invalidation_info::InvalidationSource> {
-            match invalidation_path {
-                dice::DiceTrackedInvalidationPath::Clean
-                | dice::DiceTrackedInvalidationPath::Unknown => None,
-                dice::DiceTrackedInvalidationPath::Invalidated(_) => {
-                    Some(buck2_data::command_invalidation_info::InvalidationSource {})
-                }
-            }
-        }
-        let invalidation_paths = ctx.get_invalidation_paths();
+        let to_proto = |changed: bool| {
+            changed.then_some(buck2_data::command_invalidation_info::InvalidationSource {})
+        };
+        let sources = ctx.get_invalidation_sources();
         Some(buck2_data::CommandInvalidationInfo {
-            changed_any: to_proto(&invalidation_paths.normal_priority_path),
-            changed_file: to_proto(&invalidation_paths.high_priority_path),
+            changed_any: to_proto(sources.normal_priority().is_some()),
+            changed_file: to_proto(sources.high_priority().is_some()),
         })
     } else {
         None
@@ -621,15 +612,17 @@ fn try_run_error_handler(
 
                         let error_handler_result = eval.eval_function(
                             error_handler.as_ref().add_to_heap(heap),
-                            &[heap.alloc(error_handler_ctx)],
+                            &[heap.alloc(error_handler_ctx).to_value()],
                             &[],
                         );
 
                         let data = match error_handler_result {
-                            Ok(result) => match ActionSubErrorResult::unpack_value_err(result) {
-                                Ok(result) => Data::SubErrors(ActionSubErrors {
-                                    sub_errors: result
-                                        .items
+                            Ok(result) => match ActionSubErrorResult::unpack_value_err(result)
+                                .and_then(|result| {
+                                    result.iter().collect::<starlark::Result<Vec<_>>>()
+                                }) {
+                                Ok(sub_errors) => Data::SubErrors(ActionSubErrors {
+                                    sub_errors: sub_errors
                                         .into_iter()
                                         .map(|s| s.to_proto())
                                         .collect(),
@@ -637,7 +630,7 @@ fn try_run_error_handler(
                                 Err(_) => Data::HandlerInvocationError(format!(
                                     "{}",
                                     ActionErrorHandlerError::TypeError(
-                                        ActionSubErrorResult::starlark_type_repr(),
+                                        <ActionSubErrorResult as UnpackValue>::Type::starlark_type_repr(),
                                         result.get_type().to_owned()
                                     )
                                 )),

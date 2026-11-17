@@ -47,6 +47,7 @@ rust_library(
         "//buck2/app/buck2_fs:buck2_fs",
         "//buck2/app/buck2_resource_control:buck2_resource_control",
         "//buck2/app/buck2_server:buck2_server",
+        "//buck2/app/buck2_settings:buck2_settings",
         "//buck2/app/buck2_util:buck2_util",
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
         "//buck2/dice/dice:dice",
@@ -59,6 +60,7 @@ rust_library(
             "fbsource//third-party/rust:nix",
             # @oss-disable[end= ]: "//bpfjailer/client:bpfjailer_client_rs",
             # @oss-disable[end= ]: "//bpfjailer/client:bpfjailer_handler_polyglot-rs_bindings",
+            "//buck2/app/buck2_tenant_proxy:buck2_tenant_proxy",
             # @oss-disable[end= ]: "//buck2/facebook/mem_frag:mem_frag",
         ],
         "ovr_config//os:macos": [

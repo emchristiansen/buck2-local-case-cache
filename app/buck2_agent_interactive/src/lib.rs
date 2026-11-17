@@ -19,7 +19,62 @@ pub struct Invocation<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildLanguage {
+    Rust,
+    Cxx,
+}
+
+impl BuildLanguage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Cxx => "cxx",
+        }
+    }
+
+    fn from_rule_type(rule_type: &str) -> Option<Self> {
+        if rule_type.starts_with("rust_") {
+            Some(Self::Rust)
+        } else if rule_type.starts_with("cxx_") {
+            Some(Self::Cxx)
+        } else {
+            None
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Rust => {
+                "The direct build of this Rust target was blocked.\n\n\
+                 If your goal is to verify Rust type correctness, use \
+                 `arc rust-check <target>`.\n\n\
+                 If your goal is to run tests, use `buck2 test` directly on the relevant \
+                 test targets. It builds the tests and their dependencies before running \
+                 them, so a separate build step is unnecessary.\n\n\
+                 If this build is needed, retry with \
+                 `--agent-context advice_ack=build` and \
+                 `--agent-context reason=\"<why this Rust build is needed>\"`. \
+                 This guard does not require user confirmation."
+            }
+            Self::Cxx => {
+                "The direct build of this C++ target was blocked.\n\n\
+                 If your goal is to verify C++ syntax and type correctness, use \
+                 `arc cpp-check <target>`.\n\n\
+                 If your goal is to run tests, use `buck2 test` directly on the relevant \
+                 test targets. It builds the tests and their dependencies before running \
+                 them, so a separate build step is unnecessary.\n\n\
+                 If this build is needed, retry with \
+                 `--agent-context advice_ack=build` and \
+                 `--agent-context reason=\"<why this C++ build is needed>\"`. \
+                 This guard does not require user confirmation."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Advice {
+    Build(BuildLanguage),
     Killall,
     Clean,
     NewIsolationDir,
@@ -33,6 +88,25 @@ pub enum Advice {
 /// such changes; the tag measures how often agents make them.
 pub const CONFIG_CHANGE_EXPLICIT_TAG: &str = "agent_interactive.config_change.explicit";
 
+/// Tags recording whether the config change guard was on for a direct agent call. Every direct
+/// call that reaches the guard gets exactly one, so an A/B analysis can assign every command to an
+/// arm, including the commands the guard never acts on.
+pub const CONFIG_CHANGE_ENABLED_TAG: &str = "agent_interactive.config_change.enabled";
+pub const CONFIG_CHANGE_DISABLED_TAG: &str = "agent_interactive.config_change.disabled";
+
+/// Tag for a config change the command did not ask for: it drops config args the daemon's
+/// configuration uses, which changes a resolved value. This is what the config change guard acts
+/// on, and it is recorded in both arms of the guard's A/B test; `CONFIG_CHANGE_ENABLED_TAG` or
+/// `CONFIG_CHANGE_DISABLED_TAG` on the same command says which arm.
+pub const CONFIG_CHANGE_IMPLICIT_TAG: &str = "agent_interactive.config_change.implicit";
+
+/// Tags recording whether the `agent_interactive` guards (killall, clean, new isolation directory)
+/// were on for a direct agent call that reached the daemon. Those guards run in the client and tag
+/// only the operations they guard, so these let an A/B analysis assign every other command to an
+/// arm as well.
+pub const AGENT_INTERACTIVE_ENABLED_TAG: &str = "agent_interactive.enabled";
+pub const AGENT_INTERACTIVE_DISABLED_TAG: &str = "agent_interactive.disabled";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Inactive,
@@ -41,14 +115,28 @@ pub enum Decision {
 }
 
 impl Advice {
+    pub fn for_build_rule(rule_type: &str) -> Option<Self> {
+        BuildLanguage::from_rule_type(rule_type).map(Self::Build)
+    }
+
     /// Stable identifier used for acknowledgements and telemetry.
     pub fn id(self) -> &'static str {
         match self {
+            Self::Build(_) => "build",
             Self::Killall => "killall",
             Self::Clean => "clean",
             Self::NewIsolationDir => "new_isolation_dir",
             Self::ConfigChange => "config_change",
         }
+    }
+
+    /// Tag recording that this guard's operation is about to happen in a direct agent call, and
+    /// whether the guard is on. Callers record it after the same eligibility checks in both arms of
+    /// the guard's A/B test, so the operations of the control arm can be compared with those the
+    /// guard acted on. The build guard records the same names.
+    pub fn state_tag(self, enabled: bool) -> String {
+        let state = if enabled { "enabled" } else { "disabled" };
+        format!("agent_interactive.{}.{state}", self.id())
     }
 
     /// `acknowledged` must refer to this advice ID in the current invocation.
@@ -69,6 +157,7 @@ impl Advice {
 
     pub fn message(self) -> &'static str {
         match self {
+            Self::Build(language) => language.message(),
             Self::Clean => {
                 "No build state or outputs have been removed.\n\n\
                  `buck2 clean` stops the daemon and removes reusable build state and outputs, \
@@ -121,6 +210,8 @@ impl Decision {
     pub fn tag(&self) -> Option<&'static str> {
         match self {
             Self::Inactive => None,
+            Self::Acknowledged(Advice::Build(_)) => Some("agent_interactive.build.ack"),
+            Self::Block(Advice::Build(_)) => Some("agent_interactive.build.block"),
             Self::Acknowledged(Advice::Killall) => Some("agent_interactive.killall.ack"),
             Self::Block(Advice::Killall) => Some("agent_interactive.killall.block"),
             Self::Acknowledged(Advice::Clean) => Some("agent_interactive.clean.ack"),
@@ -141,12 +232,36 @@ impl Decision {
 mod tests {
     use super::*;
 
-    const ALL_ADVICE: [Advice; 4] = [
+    const ALL_ADVICE: [Advice; 6] = [
+        Advice::Build(BuildLanguage::Rust),
+        Advice::Build(BuildLanguage::Cxx),
         Advice::Killall,
         Advice::Clean,
         Advice::NewIsolationDir,
         Advice::ConfigChange,
     ];
+
+    #[test]
+    fn build_advice_depends_on_rule_type() {
+        for (rule_type, expected) in [
+            ("rust_library", Some(Advice::Build(BuildLanguage::Rust))),
+            ("rust_binary", Some(Advice::Build(BuildLanguage::Rust))),
+            ("cxx_library", Some(Advice::Build(BuildLanguage::Cxx))),
+            ("cxx_binary", Some(Advice::Build(BuildLanguage::Cxx))),
+            ("rust_test", Some(Advice::Build(BuildLanguage::Rust))),
+            ("cxx_test", Some(Advice::Build(BuildLanguage::Cxx))),
+            ("rust_custom", Some(Advice::Build(BuildLanguage::Rust))),
+            ("cxx_custom", Some(Advice::Build(BuildLanguage::Cxx))),
+            ("rust", None),
+            ("cxx", None),
+            ("custom_rust_binary", None),
+            ("custom_cxx_binary", None),
+            ("genrule", None),
+            ("custom_test", None),
+        ] {
+            assert_eq!(Advice::for_build_rule(rule_type), expected, "{rule_type}");
+        }
+    }
 
     #[test]
     fn only_enabled_direct_calls_are_guarded() {
@@ -160,6 +275,23 @@ mod tests {
                 assert_eq!(advice.evaluate(&invocation, false), Decision::Inactive);
             }
         }
+    }
+
+    #[test]
+    fn state_tags_name_the_guard_and_its_state() {
+        assert_eq!(
+            Advice::Killall.state_tag(true),
+            "agent_interactive.killall.enabled"
+        );
+        assert_eq!(
+            Advice::NewIsolationDir.state_tag(false),
+            "agent_interactive.new_isolation_dir.disabled"
+        );
+        // Matches the names the build guard records for every language.
+        assert_eq!(
+            Advice::Build(BuildLanguage::Rust).state_tag(false),
+            "agent_interactive.build.disabled"
+        );
     }
 
     #[test]

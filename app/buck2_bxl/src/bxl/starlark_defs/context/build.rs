@@ -83,7 +83,10 @@ impl<'v> StarlarkValue<'v> for StarlarkProvidersArtifactIterable<'v> {
     fn iterate_collect(&self, heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         Ok(self
             .iter()
-            .map(|artifact| heap.alloc(StarlarkArtifact::new(artifact.dupe())))
+            .map(|artifact| {
+                heap.alloc(StarlarkArtifact::new(artifact.dupe()))
+                    .to_value()
+            })
             .collect())
     }
 
@@ -91,7 +94,9 @@ impl<'v> StarlarkValue<'v> for StarlarkProvidersArtifactIterable<'v> {
         let i = i32::unpack_value_err(index)?;
         if let Ok(i) = usize::try_from(i) {
             if let Some(artifact) = self.iter().nth(i) {
-                return Ok(heap.alloc(StarlarkArtifact::new(artifact.dupe())));
+                return Ok(heap
+                    .alloc(StarlarkArtifact::new(artifact.dupe()))
+                    .to_value());
             }
         }
         Err(ValueError::IndexOutOfBound(i).into())
@@ -134,14 +139,17 @@ impl<'v> StarlarkFailedArtifactIterable<'v> {
 #[starlark_value(type = "bxl.FailedArtifactsIterable")]
 impl<'v> StarlarkValue<'v> for StarlarkFailedArtifactIterable<'v> {
     fn iterate_collect(&self, heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
-        Ok(self.iter().map(|e| heap.alloc(format!("{e}"))).collect())
+        Ok(self
+            .iter()
+            .map(|e| heap.alloc(format!("{e}")).to_value())
+            .collect())
     }
 
     fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let i = i32::unpack_value_err(index)?;
         if let Ok(i) = usize::try_from(i) {
             if let Some(e) = self.iter().nth(i) {
-                return Ok(heap.alloc(format!("{e}")));
+                return Ok(heap.alloc(format!("{e}")).to_value());
             }
         }
         Err(ValueError::IndexOutOfBound(i).into())
@@ -243,14 +251,16 @@ pub(crate) fn build<'v>(
         .map(|(target, result)| {
             (
                 eval.heap()
-                    .alloc_typed(StarlarkConfiguredProvidersLabel::new(target.clone()))
+                    .alloc(StarlarkConfiguredProvidersLabel::new(target.clone()))
+                    .get()
                     .hashed()
                     .unwrap(),
                 eval.heap()
-                    .alloc_typed(StarlarkBxlBuildResult(BxlBuildResult::new(
+                    .alloc(StarlarkBxlBuildResult(BxlBuildResult::new(
                         target.clone(),
                         result,
-                    ))),
+                    )))
+                    .get(),
             )
         })
         .collect())

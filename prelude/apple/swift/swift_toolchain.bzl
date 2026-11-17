@@ -128,15 +128,13 @@ def swift_toolchain_impl(ctx):
             supports_incremental_file_hashing = ctx.attrs.supports_incremental_file_hashing,
             supports_modularization_dependency_graph = ctx.attrs.supports_modularization_dependency_graph,
             supports_modulemaps_with_hmaps = ctx.attrs.supports_modulemaps_with_hmaps,
+            supports_pch_base_dir_is_cwd = ctx.attrs.supports_pch_base_dir_is_cwd,
             supports_relative_resource_dir = ctx.attrs.supports_relative_resource_dir,
             swift_ide_test_tool = ctx.attrs.swift_ide_test_tool[RunInfo] if ctx.attrs.swift_ide_test_tool else None,
             swift_stdlib_tool = ctx.attrs.swift_stdlib_tool[RunInfo],
             swift_stdlib_tool_flags = ctx.attrs.swift_stdlib_tool_flags,
             swift_experimental_features = ctx.attrs.swift_experimental_features,
             swift_upcoming_features = ctx.attrs.swift_upcoming_features,
-            symbolgraph_extractor = cmd_args(ctx.attrs._swiftc_wrapper[RunInfo]).add(ctx.attrs.swift_symbolgraph_extract[RunInfo])
-            if ctx.attrs.swift_symbolgraph_extract
-            else None,
             uncompiled_clang_sdk_modules_deps = uncompiled_clang_sdk_modules_deps,
             uncompiled_swift_sdk_modules_deps = uncompiled_swift_sdk_modules_deps,
             enforce_dedupe_eligibility = ctx.attrs.enforce_dedupe_eligibility,

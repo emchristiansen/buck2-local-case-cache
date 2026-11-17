@@ -64,6 +64,12 @@ message KillRequest {
   repeated string callers = 4;
 }
 
+message RestartRequest {
+  string reason = 1;
+}
+
+message RestartResponse {}
+
 message KillResponse {}
 
 message StatusRequest {
@@ -91,6 +97,8 @@ message StatusResponse {
   optional TokioRuntimeMetrics tokio_runtime_metrics = 17;
   optional string allprocs_cgroup_path = 18;
   repeated buck.subscription.ActiveCommand active_commands = 19;
+  // Set by a tenant proxy: the generation of the tenant it represents.
+  optional uint64 tenant_generation = 20;
 }
 
 message TokioRuntimeMetrics {
@@ -134,6 +142,7 @@ message TenantIdentity {
 }
 
 message ClientContext {
+  optional uint64 tenant_generation = 1001;
   reserved 5, 21;
   // `AbsNormPath`.
   string working_dir = 1;
@@ -216,6 +225,13 @@ message ClientContext {
   // JSON containing only InvocationBuckSettings. Missing overrides use the
   // setting's defaults for this command.
   optional string invocation_settings = 29;
+
+  // JSON containing only DiceBuckSettings, the per-invocation sections the
+  // daemon injects into DICE. Missing overrides use the setting's defaults.
+  optional string dice_settings = 30;
+
+  // The client's `CODING_AGENT_METADATA`, inherited by its local tests.
+  optional string coding_agent_metadata = 31;
 }
 
 message TargetsRequest {
@@ -547,6 +563,10 @@ message BuildRequest {
 
   // Set by `buck2 run` when extra args are passed without `--` separator.
   bool run_args_missing_separator = 13;
+
+  // Emit streaming build report snapshots only when a requested target
+  // finishes, except for the error that stops a fail-fast build.
+  bool streaming_build_report_final_only = 14;
 }
 
 message TestSessionOptions {
@@ -889,8 +909,21 @@ message UnstableListTenantsResponse {
   repeated UnstableTenantInfo tenants = 1;
 }
 
+message UnstableRegisterTenantRequest {
+  ClientContext context = 1;
+  optional string reject_materializer_state = 2;
+}
+
+message UnstableRegisterTenantResponse {
+  uint64 generation = 1;
+  optional string materializer_state_identity = 2;
+}
+
 message EvictTenantRequest {
   ClientContext context = 1;
+  optional uint64 expected_generation = 2;
+  optional uint64 eviction_timeout_ms = 3;
+  optional bool wait_for_completion = 4;
 }
 
 message EvictTenantResponse {
@@ -1029,6 +1062,8 @@ message CleanStaleRequest {
   // Resolve the cleanup TTL and low-disk behavior from the daemon's clean-stale
   // buckconfig. Explicit cleanup policy fields above are ignored when set.
   bool use_configured_policy = 8;
+  // What issued the request; logged on the resulting `CleanStaleResult`.
+  buck.data.CleanStaleResult.Origin origin = 9;
 }
 
 message CleanStaleResponse {
@@ -1129,6 +1164,7 @@ message TraceIoResponse {
 // src/lib.rs need to be updated to derive common things for buck's cli package.
 service DaemonApi {
   rpc Kill(KillRequest) returns (CommandResult);
+  rpc Restart(RestartRequest) returns (RestartResponse);
   rpc Status(StatusRequest) returns (CommandResult);
   rpc Ping(PingRequest) returns (CommandResult);
   rpc FlushDepFiles(FlushDepFilesRequest) returns (CommandResult);
@@ -1175,6 +1211,8 @@ service DaemonApi {
       returns (UnstableAllocatorStatsResponse);
   rpc Unstable_ListTenants(UnstableListTenantsRequest)
       returns (UnstableListTenantsResponse);
+  rpc Unstable_RegisterTenant(UnstableRegisterTenantRequest)
+      returns (UnstableRegisterTenantResponse);
   rpc EvictTenant(EvictTenantRequest) returns (EvictTenantResponse);
   rpc EvictProjectTenants(EvictProjectTenantsRequest)
       returns (EvictProjectTenantsResponse);

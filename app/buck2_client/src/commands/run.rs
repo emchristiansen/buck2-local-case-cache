@@ -157,6 +157,7 @@ impl StreamingCommand for RunCommand {
                     target_universe: self.target_cfg.target_universe,
                     timeout: None, // TODO: maybe it shouild be supported here?
                     run_args_missing_separator,
+                    streaming_build_report_final_only: false,
                 },
                 events_ctx,
                 ctx.console_interaction_stream(&self.common_opts.console_opts),
@@ -243,7 +244,14 @@ impl StreamingCommand for RunCommand {
             }
         }
 
-        let chdir = self.chdir.map(|chdir| chdir.resolve(&ctx.working_dir));
+        // Under --no-buckd the in-process daemon owns this process' working directory and
+        // moves it into buck-out, so the exec'd target would start there instead of where the
+        // user invoked `buck run`: hand it the invocation directory, which was captured before
+        // any daemon ran. An explicit --chdir wins.
+        let chdir = Some(match self.chdir {
+            Some(chdir) => chdir.resolve(&ctx.working_dir),
+            None => ctx.working_dir.path().to_buf().into_abs_path_buf(),
+        });
 
         ExitResult::exec(
             run_args[0].clone().into(),

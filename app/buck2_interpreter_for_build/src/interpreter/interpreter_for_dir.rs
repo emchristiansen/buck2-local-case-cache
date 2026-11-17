@@ -341,9 +341,13 @@ impl InterpreterForDir {
             }
         }
 
-        env.set_extra_value_no_overwrite(env.heap().alloc(StarlarkAnyComplex {
-            value: InterpreterExtraValue::default(),
-        }))
+        env.set_extra_value_no_overwrite(
+            StarlarkAnyComplex {
+                value: InterpreterExtraValue::default(),
+            }
+            .alloc_retyped_by_freeze(env.heap())
+            .to_value(),
+        )
         .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Interpreter))?;
 
         Ok(env)

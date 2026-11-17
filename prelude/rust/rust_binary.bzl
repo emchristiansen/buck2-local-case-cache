@@ -1122,6 +1122,7 @@ rust_binary = prelude_rule(
             "_generated_build_info_enabled": attrs.bool(default = False),
             "_generated_build_info_mode": attrs.enum(["full", "stable"], default = "stable"),
             "_generated_build_info_spec": BUILD_INFO_ATTR,
+            "_pgo_profile": attrs.option(attrs.dep(), default = None),
         }
     ),
     uses_plugins = [RustProcMacroPlugin],
@@ -1198,7 +1199,7 @@ rust_test = prelude_rule(
                 same command-line parameters and produce the same output as the test framework.
             """,
             ),
-            "supports_test_execution_caching": attrs.bool(default = False),
+            "supports_test_execution_caching": attrs.bool(default = True),
         }
         | miri_interpreted_attr()
         | re_test_common.test_args()

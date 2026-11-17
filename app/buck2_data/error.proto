@@ -95,6 +95,9 @@ enum ErrorTag {
   EXIT_STATUS = 517;
   EXIT_STATUS_UNKNOWN = 519;
   DAEMON_LAUNCH_FAILED = 508;
+  // The client gave up waiting for the daemon launcher process to complete
+  // and killed it.
+  DAEMON_LAUNCH_TIMEOUT = 522;
   DAEMON_NESTED_CONSTRAINTS_MISMATCH = 509;
   DAEMON_CONSTRAINTS_WRONG_AFTER_START = 510;
   DAEMON_DIR_CLEANUP_FAILED = 511;
@@ -418,6 +421,8 @@ enum ErrorTag {
   DISPATCHER_UNAVAILABLE = 912;
   CSV_PARSE = 917;
   CAS_BLOB_COUNT_MISMATCH = 918;
+  // A target label carries a buck1 `#flavor` suffix.
+  BUCK1_FLAVOR = 919;
 
   CLEAN_OUTPUTS = 8017;
   COPY_OUTPUTS = 8029;

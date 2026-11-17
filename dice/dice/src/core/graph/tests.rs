@@ -23,6 +23,7 @@ use pagable::pagable_typetag;
 
 use crate::DiceKeyDyn;
 use crate::api::computations::DiceComputations;
+use crate::api::invalidation_tracking::InvalidationSources;
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::key::Key;
 use crate::api::key::NoValueSerialize;
@@ -45,7 +46,6 @@ use crate::value::DiceKeyValue;
 use crate::value::DiceValidValue;
 use crate::value::MaybeResident;
 use crate::value::MaybeResidentComputedValue;
-use crate::value::TrackedInvalidationPaths;
 use crate::versions::VersionNumber;
 
 #[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
@@ -147,26 +147,43 @@ fn dirty(graph: &mut VersionedGraph, root: BranchId, k: DiceKey) -> VersionNumbe
     version
 }
 
-/// The deps a compute of a key over `key(0)` records at `v`.
-fn deps_on_leaf(graph: &VersionedGraph, v: VersionNumber) -> SeriesParallelDeps {
-    let revision = graph
-        .get(VersionedGraphKey::new(v, key(0)))
-        .unpack_match()
-        .expect("the leaf is injected")
-        .revision()
-        .expect("an injected value is valid");
-    SeriesParallelDeps::serial_from_edges(vec![DepEdge::new(key(0), revision)])
+/// The sources a transaction at `v` folds for `k` from reading `deps`: those of each dep,
+/// starting from `k`'s own dirty.
+fn sources_of(
+    graph: &VersionedGraph,
+    k: DiceKey,
+    v: VersionNumber,
+    deps: impl Iterator<Item = DiceKey>,
+) -> InvalidationSources {
+    let mut sources = graph.core.untracked(k, v).1;
+    for dep in deps {
+        let dep = graph.get(VersionedGraphKey::new(v, dep));
+        sources.update(
+            dep.unpack_match()
+                .expect("a dep was valid when read")
+                .invalidation_sources(),
+        );
+    }
+    sources
 }
 
-/// A computed write of `value` for `k`, stamped as a transaction at `v` would stamp it.
+/// A computed write of `value` for `k` over `key(0)`, stamped as a transaction at `v` would
+/// stamp it.
 fn compute(
     graph: &mut VersionedGraph,
     k: DiceKey,
     v: VersionNumber,
     value: DiceValidValue,
 ) -> MaybeResidentComputedValue {
-    let deps = deps_on_leaf(graph, v);
+    let revision = graph
+        .get(VersionedGraphKey::new(v, key(0)))
+        .unpack_match()
+        .expect("the leaf is injected")
+        .revision()
+        .expect("an injected value is valid");
+    let deps = SeriesParallelDeps::serial_from_edges(vec![DepEdge::new(key(0), revision)]);
     let epsilon = graph.core.epsilon(k, v);
+    let sources = sources_of(graph, k, v, deps.iter_keys());
     let out = graph.update_computed(
         VersionedGraphKey::new(v, k),
         ComputedValueUpdate {
@@ -174,7 +191,7 @@ fn compute(
             deps,
             epsilon,
         },
-        TrackedInvalidationPaths::clean(),
+        sources,
     );
     graph.assert_consistent();
     out.into_computed()
@@ -186,11 +203,8 @@ fn revalidate(
     v: VersionNumber,
     candidate: Candidate,
 ) -> MaybeResidentComputedValue {
-    let out = graph.revalidate(
-        VersionedGraphKey::new(v, k),
-        candidate,
-        TrackedInvalidationPaths::clean(),
-    );
+    let sources = sources_of(graph, k, v, candidate.cert.deps.iter_keys());
+    let out = graph.revalidate(VersionedGraphKey::new(v, k), candidate, sources);
     graph.assert_consistent();
     out
 }
@@ -356,7 +370,7 @@ fn a_dep_less_recompute_under_the_same_epsilon_adopts_the_stored_revision() {
     let root = graph.new_root();
     let v1 = graph.head(root);
     let compute_without_deps = |graph: &mut VersionedGraph, v: VersionNumber, n: usize| {
-        let epsilon = graph.core.epsilon(key(1), v);
+        let (epsilon, sources) = graph.core.untracked(key(1), v);
         let out = graph.update_computed(
             VersionedGraphKey::new(v, key(1)),
             ComputedValueUpdate {
@@ -364,7 +378,7 @@ fn a_dep_less_recompute_under_the_same_epsilon_adopts_the_stored_revision() {
                 deps: SeriesParallelDeps::None,
                 epsilon,
             },
-            TrackedInvalidationPaths::clean(),
+            sources,
         );
         graph.assert_consistent();
         out.into_computed()
@@ -456,6 +470,7 @@ fn a_dirtied_key_offers_a_stale_candidate() {
         VersionedGraphResult::Unknown {
             candidate: Some(candidate),
             epsilon,
+            ..
         } => assert_ne!(candidate.cert.epsilon, epsilon),
         other => panic!("expected a stale candidate, got {other:?}"),
     }
@@ -502,7 +517,8 @@ fn backed_counts(
 }
 
 fn evict_backed(graph: &mut VersionedGraph) -> u64 {
-    let evicted = graph.evict_backed(usize::MAX);
+    let snapshot = graph.backed_snapshot();
+    let evicted = graph.evict_backed(&snapshot.keys, snapshot.cutoff);
     graph.assert_consistent();
     evicted
 }
@@ -613,6 +629,29 @@ fn rehydrated_value_is_backed_by_its_row() {
         Some(DataKey::testing_new(0x1234))
     );
     assert_eq!(evict_backed(&mut graph), 0);
+}
+
+/// An eviction leaves values backed after its snapshot: a value read back again while the
+/// eviction runs is in use.
+#[test]
+fn eviction_leaves_values_backed_after_its_snapshot() {
+    let (mut graph, root) = with_leaf_under(PageOutPolicy::OncePerValue);
+    let v2 = graph.head(root);
+    compute(&mut graph, key(1), v2, value(7));
+    page_out(&mut graph, key(1), 0x1);
+    graph.rehydrate(key(1), DataKey::testing_new(0x1), value(7), READ_BACK_BYTES);
+    let snapshot = graph.backed_snapshot();
+    assert_eq!(snapshot.keys, [key(1)]);
+
+    assert_eq!(graph.evict_backed(&snapshot.keys, snapshot.cutoff), 1);
+    graph.rehydrate(key(1), DataKey::testing_new(0x1), value(7), READ_BACK_BYTES);
+    assert_eq!(
+        graph.evict_backed(&snapshot.keys, snapshot.cutoff),
+        0,
+        "read back after the snapshot"
+    );
+    graph.assert_consistent();
+    assert_eq!(evict_backed(&mut graph), 1, "a later snapshot includes it");
 }
 
 /// A computed key whose values are asserted (`changed_to` on a `Key`, which buck2 does for its
@@ -782,7 +821,7 @@ fn deleting_a_branch_releases_its_values_and_retains_nothing_written_from_it() {
                 deps: SeriesParallelDeps::None,
                 epsilon: EpsilonToken::INITIAL,
             },
-            TrackedInvalidationPaths::clean(),
+            InvalidationSources::NONE,
         )
         .into_computed();
     graph.assert_consistent();

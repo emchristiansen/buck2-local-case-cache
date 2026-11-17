@@ -7,9 +7,10 @@
 # above-listed licenses.
 
 load("@prelude//:attrs_validators.bzl", "validation_common")
-load("@prelude//apple:apple_bundle_types.bzl", "AppleBundleResourceInfo", "AppleBundleTypeAttributeType")
+load("@prelude//apple:apple_bundle_types.bzl", "AppleBundleTypeAttributeType")
 load("@prelude//apple:apple_code_signing_types.bzl", "CodeSignConfiguration", "CodeSignType")
-load("@prelude//apple:apple_common.bzl", "apple_common")
+load("@prelude//apple:apple_common.bzl", "apple_common", "apple_hot_code_reload_enabled_select")
+load("@prelude//apple:apple_execution_groups.bzl", "AppleResources")
 load("@prelude//apple:apple_test_device_types.bzl", "AppleTestDeviceType")
 load("@prelude//apple:apple_toolchain_types.bzl", "AppleToolchainInfo")
 load("@prelude//apple:resource_groups.bzl", "RESOURCE_GROUP_MAP_ATTR")
@@ -26,16 +27,20 @@ load("@prelude//utils:clear_platform.bzl", "clear_platform_transition")
 AppleFrameworkBundleModuleMapType = ["auto"]
 
 def get_apple_bundle_toolchain_attr():
-    return attrs.toolchain_dep(default = "toolchains//:apple-bundle", providers = [AppleToolchainInfo])
+    return attrs.toolchain_dep(default = "toolchains//:apple-bundle", providers = [AppleToolchainInfo], exec_group = DefaultExecGroup)
 
-def get_apple_resources_toolchain_attr():
-    return attrs.toolchain_dep(default = "toolchains//:apple-resources", providers = [AppleToolchainInfo])
+def get_apple_resources_toolchain_attr(exec_group = None):
+    # Only macOS hosted toolchains, so resources are compiled directly on Mac RE.
+    return attrs.toolchain_dep(default = "toolchains//:apple-resources", providers = [AppleToolchainInfo], exec_group = exec_group)
 
 def get_apple_xctoolchain_attr():
-    return attrs.toolchain_dep(default = "toolchains//:apple-xctoolchain")
+    return attrs.toolchain_dep(default = "toolchains//:apple-xctoolchain", exec_group = DefaultExecGroup)
 
 def get_apple_xctoolchain_bundle_id_attr():
-    return attrs.toolchain_dep(default = "toolchains//:apple-xctoolchain-bundle-id")
+    return attrs.toolchain_dep(default = "toolchains//:apple-xctoolchain-bundle-id", exec_group = DefaultExecGroup)
+
+def get_apple_xctoolchain_full_attr():
+    return attrs.toolchain_dep(default = "toolchains//:apple-xctoolchain-full", exec_group = DefaultExecGroup)
 
 def get_enable_library_evolution():
     return attrs.bool(
@@ -44,29 +49,6 @@ def get_enable_library_evolution():
             "config//features/apple:swift_library_evolution_enabled": True,
         })
     )
-
-def swift_dynamic_replacement_select(enabled, disabled):
-    """`enabled` or `disabled`, as the configuration decides Swift dynamic
-    replacement. The `swift_dynamic_replacement` constraint decides when it is
-    set, to `enabled` or `disabled`; the
-    `apple.swift_dynamic_replacement_override_enabled` buckconfig is only the
-    fallback for a configuration that leaves the constraint unspecified, so a
-    platform or a mode's modifier pins the decision and a buckconfig alone
-    cannot override a platform that pins `disabled`. No target can decide it."""
-    return select({
-        "DEFAULT": select({
-            "DEFAULT": disabled,
-            "config//features/apple:swift_dynamic_replacement_override_enabled": enabled,
-        }),
-        "config//features/apple/constraints:swift_dynamic_replacement[disabled]": disabled,
-        "config//features/apple/constraints:swift_dynamic_replacement[enabled]": enabled,
-    })
-
-def get_swift_dynamic_replacement_enabled():
-    """Whether the configuration compiles Swift for dynamic replacement, as
-    `swift_dynamic_replacement_select` decides; `default_only` because no
-    target may decide it."""
-    return attrs.default_only(attrs.bool(default = swift_dynamic_replacement_select(True, False)))
 
 def _strict_provisioning_profile_search_default_attr():
     default_value = read_root_config("apple", "strict_provisioning_profile_search", "true").lower() == "true"
@@ -184,12 +166,13 @@ def _apple_bundle_like_common_attrs():
         "versioned_macos_bundle": get_versioned_macos_bundle_attr(),
         "_apple_xctoolchain": get_apple_xctoolchain_attr(),
         "_apple_xctoolchain_bundle_id": get_apple_xctoolchain_bundle_id_attr(),
+        "_apple_xctoolchain_full": get_apple_xctoolchain_full_attr(),
         "_bundling_cache_buster": attrs.option(attrs.string(), default = None),
         "_bundling_log_file_enabled": attrs.bool(default = False),
         "_bundling_log_file_level": attrs.option(attrs.string(), default = None),
         "_code_signing_configuration": attrs.option(attrs.enum(CodeSignConfiguration.values()), default = None),
-        "_codesign_command_override": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
-        "_codesign_identities_command_override": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+        "_codesign_command_override": attrs.option(attrs.exec_dep(providers = [RunInfo], exec_group = DefaultExecGroup), default = None),
+        "_codesign_identities_command_override": attrs.option(attrs.exec_dep(providers = [RunInfo], exec_group = DefaultExecGroup), default = None),
         "_codesign_type": attrs.option(attrs.enum(CodeSignType.values()), default = None),
         "_compile_resources_locally_override": attrs.option(attrs.bool(), default = None),
         "_fast_adhoc_signing_enabled_default": _fast_adhoc_signing_enabled_default_attr(),
@@ -199,13 +182,9 @@ def _apple_bundle_like_common_attrs():
         "_no_check_certificates": attrs.bool(default = False),
         "_profile_bundling_enabled": attrs.bool(default = False),
         "_provisioning_profile_sources": attrs.dep(default = "fbsource//xplat/buck2/platform/apple:provisioning_profile_sources"),
-        "_resource_bundle": attrs.option(attrs.dep(providers = [AppleBundleResourceInfo]), default = None),
         "_skip_adhoc_resigning_scrubbed_frameworks_default": _skip_adhoc_resigning_scrubbed_frameworks_default_attr(),
         "_skip_adhoc_resigning_scrubbed_frameworks_override": attrs.option(attrs.bool(), default = None),
         "_strict_provisioning_profile_search_default": _strict_provisioning_profile_search_default_attr(),
-        # Whether the configuration compiles Swift for dynamic replacement, the
-        # same attribute `apple_library` has; recorded in `BuildInfo.json`.
-        "_swift_dynamic_replacement_enabled": get_swift_dynamic_replacement_enabled(),
         APPLE_USE_ENTITLEMENTS_WHEN_ADHOC_CODE_SIGNING_CONFIG_OVERRIDE_ATTR_NAME: attrs.option(attrs.bool(), default = None),
         APPLE_USE_ENTITLEMENTS_WHEN_ADHOC_CODE_SIGNING_ATTR_NAME: attrs.bool(default = False),
         APPLE_EMBED_PROVISIONING_PROFILE_WHEN_ADHOC_CODE_SIGNING_CONFIG_OVERRIDE_ATTR_NAME: attrs.option(attrs.bool(), default = None),
@@ -276,6 +255,7 @@ def apple_test_extra_attrs():
     attribs.update(apple_common.apple_toolchain_arg())
     attribs.update(apple_common.minimum_os_version_arg())
     attribs.update(_apple_bundle_like_common_attrs())
+    attribs.update(_apple_resources_toolchain_attrs())
     attribs.update(get_swift_incremental_file_hashing_attrs())
     attribs.update(get_swift_incremental_logging_attrs())
     attribs.update(get_skip_swift_incremental_outputs_attrs())
@@ -312,6 +292,10 @@ def _embed_xctest_frameworks_default_value():
         "config//marker/apple/constraints:embed_xctest_frameworks[enabled]": True,
     })
 
+def _apple_resources_toolchain_attrs():
+    # `apple_bundle()` and `apple_test()` compile resources in the `AppleResources` execution group.
+    return {"_apple_resources_toolchain": get_apple_resources_toolchain_attr(exec_group = AppleResources)}
+
 def apple_bundle_extra_attrs():
     attribs = {
         "binary": attrs.option(attrs.split_transition_dep(cfg = cpu_split_transition), default = None),
@@ -329,8 +313,15 @@ def apple_bundle_extra_attrs():
         "_codesign_entitlements": attrs.option(attrs.source(), default = None),
     }
     attribs.update(_apple_bundle_like_common_attrs())
+    attribs.update(_apple_resources_toolchain_attrs())
     attribs.update(apple_common.entitlements_suffixed_key_map_arg())
     attribs.update(apple_common.entitlements_removed_keys_arg())
     attribs.update(apple_common.entitlements_removed_values_map_arg())
     attribs.update(apple_common.minimum_os_version_arg())
+    # Only `apple_bundle`: `apple_test` shares the bundle-like attributes but
+    # test code is never compiled for replacement.
+    attribs.update(apple_common.swift_dynamic_replacement_enabled_arg())
+    # Whether this is a hot code reload build, recorded in `BuildInfo.json`;
+    # test bundles take no part in hot reload.
+    attribs["_hot_code_reload_enabled"] = attrs.default_only(attrs.bool(default = apple_hot_code_reload_enabled_select(True, False)))
     return attribs

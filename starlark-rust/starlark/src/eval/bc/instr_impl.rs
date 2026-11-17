@@ -71,7 +71,6 @@ use crate::eval::runtime::profile::instant::ProfilerInstant;
 use crate::eval::runtime::slots::LocalCapturedSlotId;
 use crate::eval::runtime::slots::LocalSlotId;
 use crate::values::Heap;
-use crate::values::StarlarkValue;
 use crate::values::StringValue;
 use crate::values::Value;
 use crate::values::ValueTyped;
@@ -520,7 +519,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrEqIntImpl {
         let r = if let Some(a) = a.unpack_int_value() {
             a.as_ref() == b.as_ref()
         } else {
-            b.equals(a)?
+            b.to_value().equals(a)?
         };
         frame.set_bc_slot(*target, Value::new_bool(r));
         Ok(())
@@ -908,7 +907,7 @@ pub(crate) type InstrLen = InstrUnOp<InstrLenImpl>;
 impl InstrUnOpImpl for InstrLenImpl {
     #[inline(always)]
     fn eval<'v>(v: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
-        Ok(heap.alloc(v.length()?))
+        Ok(heap.alloc(v.length()?).to_value())
     }
 }
 
@@ -990,7 +989,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrDictOfConstsImpl {
         _: BcPtrAddr,
         (values, target): &(SmallMap<Value<'v>, Value<'v>>, BcSlotOut),
     ) -> crate::Result<()> {
-        let dict = eval.heap().alloc_dict(values.clone());
+        let dict = eval.heap().alloc(Dict::new(values.clone())).to_value();
         frame.set_bc_slot(*target, dict);
         Ok(())
     }
@@ -1028,7 +1027,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrDictNPopImpl {
                 return Err(add_span_to_expr_error(e, span, eval).into_error());
             }
         }
-        let dict = eval.heap().alloc_dict(dict);
+        let dict = eval.heap().alloc(Dict::new(dict)).to_value();
         frame.set_bc_slot(*target, dict);
         Ok(())
     }
@@ -1049,7 +1048,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrDictConstKeysImpl {
             let prev = dict.insert_hashed(*k, *v);
             debug_assert!(prev.is_none());
         }
-        let dict = eval.heap().alloc_dict(dict);
+        let dict = eval.heap().alloc(Dict::new(dict)).to_value();
         frame.set_bc_slot(*target, dict);
         Ok(())
     }
@@ -1082,7 +1081,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrDictNewImpl {
         target: &BcSlotOut,
     ) -> crate::Result<()> {
         let dict = eval.heap().alloc(Dict::default());
-        frame.set_bc_slot(*target, dict);
+        frame.set_bc_slot(*target, dict.to_value());
         Ok(())
     }
 }
@@ -1438,7 +1437,7 @@ impl<'v> InstrNoFlowImpl<'v> for InstrDefImpl {
             def_data.info,
             eval,
         )?);
-        frame.set_bc_slot(*target, def);
+        frame.set_bc_slot(*target, def.to_value());
         Ok(())
     }
 }
