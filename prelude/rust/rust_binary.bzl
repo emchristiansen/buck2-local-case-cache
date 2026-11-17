@@ -855,8 +855,8 @@ def _rust_test_runtime(ctx, toolchain_info, remote):
     environment = ctx.attrs.env | ctx.attrs.run_env
     names = []
     for name in ctx.attrs.path_run_env:
-        if name not in ctx.attrs.run_env:
-            fail("{}: path_run_env names {}, which run_env does not set".format(ctx.label, name))
+        if name not in environment:
+            fail("{}: path_run_env names {}, which neither env nor run_env sets".format(ctx.label, name))
         if name in names:
             fail("{}: path_run_env names {} twice".format(ctx.label, name))
         names.append(name)

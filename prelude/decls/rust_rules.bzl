@@ -346,10 +346,13 @@ rust_test = prelude_rule(
                 after any test process runner's own arguments.
             """),
             "path_run_env": attrs.list(attrs.string(), default = [], doc = """
-                Names of run_env variables whose values are paths relative to the
-                project root. The libtest process runner makes each absolute
-                against the directory the test actually runs in, so the value
-                names the same input locally and on a remote worker.
+                Names of test environment variables (env or run_env) whose values
+                are paths relative to the project root. The libtest process runner
+                makes each absolute against the directory the test actually runs
+                in, so the value names the same input locally and on a remote
+                worker. Naming an env entry, such as the compile-time
+                CARGO_MANIFEST_DIR of the crate root, gives the test that same
+                directory at run time.
             """),
             "framework": attrs.bool(
                 default = True,
