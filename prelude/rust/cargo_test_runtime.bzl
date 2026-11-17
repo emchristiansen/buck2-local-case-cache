@@ -25,6 +25,10 @@ From these, this module writes the test's runtime entries:
 | `INSTA_UPDATE`              | `no`                     | value |
 | `CARGO_BIN_EXE_<name>`      | the binary's output      | path  |
 
+A test that runs remotely also gets worker-local `HOME` and `TMPDIR`, both `.`
+(paths), so neither external listing nor the runner's own listing nor any test
+reads or writes a home or temporary directory outside its action.
+
 Each path entry is project-relative in the test's environment and is named once
 by a leading `--project-relative-env NAME` runner option. The per-test process
 runner (`RustToolchainInfo.test_process_runner`) makes it absolute against the
@@ -34,7 +38,8 @@ libtest test (`framework = True`) that runs under that runner.
 
 No other writer may set them: a target that names any of them in `run_env`, any
 `CARGO_BIN_EXE_*` in `env`, or any of them in a `--project-relative-env` of its
-`args`, fails analysis. `env` may still carry a compile-time
+`args`, fails analysis. On a remote test the same holds for `HOME` and `TMPDIR`,
+in `env` as well as `run_env`. `env` may still carry a compile-time
 `CARGO_MANIFEST_DIR` for rustc; the runtime value above replaces it in the
 test's environment.
 
@@ -49,6 +54,7 @@ CARGO_BIN_EXE_PREFIX = "CARGO_BIN_EXE_"
 
 _FIXED_PATHS = ["CARGO_MANIFEST_DIR", "INSTA_WORKSPACE_ROOT", "METACORTEX_WORKSPACE_ROOT"]
 _FIXED_VALUES = {"INSTA_UPDATE": "no"}
+_REMOTE_PATHS = ["HOME", "TMPDIR"]
 _BIN_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 
 def cargo_test_runtime_attrs() -> dict[str, Attr]:
@@ -115,11 +121,16 @@ def cargo_bin_exe_compile_env(ctx: AnalysisContext) -> dict[str, cmd_args]:
         env[CARGO_BIN_EXE_PREFIX + name] = cmd_args(outputs[0], ignore_artifacts = True)
     return env
 
-def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool) -> (dict[str, typing.Any], list[str]):
+def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool) -> (dict[str, typing.Any], list[str]):
     """The test's runtime entries and the runner options naming its path entries.
 
-    Fails when another writer already declares one of them.
+    `remote` says the test may run on a worker; the caller has already
+    required the runner for such a test. Fails when another writer already
+    declares one of the entries.
     """
+    if remote and not runner_applies:
+        fail("{}: a remote rust_test needs the libtest process runner".format(ctx.label))
+    remote_paths = _REMOTE_PATHS if remote else []
     label = ctx.label
     for key in ctx.attrs.env:
         if key.startswith(CARGO_BIN_EXE_PREFIX):
@@ -128,7 +139,10 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool) -> (dict[str,
     for name, dep in ctx.attrs.cargo_bin_exes.items():
         _check_bin_name(label, name)
         bins[CARGO_BIN_EXE_PREFIX + name] = _bin_output(label, name, dep)
-    owned = _FIXED_PATHS + list(_FIXED_VALUES.keys()) + bins.keys()
+    owned = _FIXED_PATHS + list(_FIXED_VALUES.keys()) + bins.keys() + remote_paths
+    for key in remote_paths:
+        if key in ctx.attrs.env:
+            fail("{}: env must not set {} on a remote test; the prelude writes it".format(label, key))
     for key in ctx.attrs.run_env:
         if key in owned or key.startswith(CARGO_BIN_EXE_PREFIX):
             fail("{}: run_env must not set {}; the prelude writes it".format(label, key))
@@ -152,8 +166,8 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool) -> (dict[str,
         "CARGO_MANIFEST_DIR": _normalized_project_path(label, manifest_dir),
         "INSTA_WORKSPACE_ROOT": ".",
         "METACORTEX_WORKSPACE_ROOT": ".",
-    } | _FIXED_VALUES | bins
+    } | _FIXED_VALUES | bins | {name: "." for name in remote_paths}
     runner_args = []
-    for name in sorted(_FIXED_PATHS + bins.keys()):
+    for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
     return env, runner_args
