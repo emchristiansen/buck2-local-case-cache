@@ -124,3 +124,52 @@ class EnvTransportFixedTest(EnvTransportTest):
             "trailing\\",
         ]:
             self.assertEqual(self.rustc_env_for(argfile_value), argfile_value)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "/proc/self/cwd is Linux only")
+class StableActionRootPathTest(EnvTransportTest):
+    """FA-2: a path value under the action root reaches rustc as /proc/self/cwd/<relative path>, the
+    same string in every execution; a value outside it is unchanged."""
+
+    def rustc_env_with(self, flag: str, cwd: pathlib.Path) -> str:
+        """`--path-env` is a rustc_action option; `--env-set` is a compiler argument (after the separator)."""
+        dump = self.tmp / "env.json"
+        dump.unlink(missing_ok=True)
+        compiler_args = [flag] if flag.startswith("--env-set=") else []
+        args = [
+            f"--env=FAKE_DUMP_ENV={dump}",
+            *([] if compiler_args else [flag]),
+            f"--diag-json={self.tmp / 'diag.json'}",
+            f"--diag-txt={self.tmp / 'diag.txt'}",
+            sys.executable,
+            "-c",
+            FAKE_RUSTC,
+            "--rustc-action-separator",
+            *compiler_args,
+        ]
+        argfile = self.tmp / "rustc.args"
+        argfile.write_text("".join(arg + "\n" for arg in args), encoding="utf-8")
+        with mock.patch("os.getcwd", return_value=str(cwd)):
+            self.assertEqual(run_rustc_action(argfile), 0)
+        return json.loads(dump.read_text())["K"]
+
+    def test_path_env_under_the_root_is_stable(self) -> None:
+        root = self.tmp / "work" / "0f3c"
+        self.assertEqual(
+            self.rustc_env_with(f"--path-env=K={root}/buck-out/pkg", root),
+            "/proc/self/cwd/buck-out/pkg",
+        )
+        self.assertEqual(self.rustc_env_with(f"--path-env=K={root}", root), "/proc/self/cwd")
+
+    def test_env_set_under_the_root_is_stable(self) -> None:
+        root = self.tmp / "work" / "0f3c"
+        self.assertEqual(
+            self.rustc_env_with(f"--env-set=K={root}/out/gen.rs", root),
+            "/proc/self/cwd/out/gen.rs",
+        )
+
+    def test_values_outside_the_root_are_unchanged(self) -> None:
+        root = self.tmp / "work" / "0f3c"
+        self.assertEqual(self.rustc_env_with(f"--env-set=K={root}x/gen.rs", root), f"{root}x/gen.rs")
+        self.assertEqual(self.rustc_env_with("--env-set=K=1.2.3", root), "1.2.3")
+        self.assertEqual(self.rustc_env_with(f"--path-env=K={self.tmp}/other", root), f"{self.tmp}/other")

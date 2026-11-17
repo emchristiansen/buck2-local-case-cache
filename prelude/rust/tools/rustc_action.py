@@ -37,6 +37,27 @@ OUT_DIR_SENTINEL: str = "${__BUILDSCRIPT_OUT_DIR__}"
 
 DEBUG = False
 
+# FA-2: on Linux, an environment value that names a path in the action root is given to rustc as
+# /proc/self/cwd/<path relative to the action root>. rustc and the proc macros it loads run with the
+# action root as their working directory, so the path opens the same file, but the string is the
+# same in every execution, where the absolute path contains the executor's per-execution directory
+# (e.g. a NativeLink work/<uuid>). env!("CARGO_MANIFEST_DIR"), env!("OUT_DIR") and the build-script
+# values set with --env-set are embedded in the crate, so the crate's bytes then no longer depend on
+# where it was compiled. Other platforms have no /proc/self/cwd and keep the absolute path.
+STABLE_CWD: str = "/proc/self/cwd"
+
+
+def stable_env_path(value: str) -> str:
+    """The FA-2 form of an absolute path under the working directory; any other value unchanged."""
+    if not sys.platform.startswith("linux"):
+        return value
+    root = os.getcwd()
+    if value == root:
+        return STABLE_CWD
+    if value.startswith(root + os.sep):
+        return STABLE_CWD + value[len(root) :]
+    return value
+
 INHERITED_ENV = [
     "RUSTC_LOG",
     "RUST_BACKTRACE",
@@ -492,7 +513,7 @@ async def main() -> int:  # noqa: C901
     if args.env:
         env.update({k: arg_eval(unescape_env_value(v)) for k, v in args.env})
     if args.path_env:
-        env.update({k: os.path.abspath(v) for k, v in args.path_env})
+        env.update({k: stable_env_path(os.path.abspath(v)) for k, v in args.path_env})
 
     crate_map = dict(args.crate_map) if args.crate_map else {}
 
@@ -540,7 +561,7 @@ async def main() -> int:  # noqa: C901
         # Tracking issue: https://github.com/rust-lang/rust/issues/118372
         if arg.startswith("--env-set="):
             flag, key, value = arg.split("=", 2)
-            env[key] = value
+            env[key] = stable_env_path(value)
             continue
 
         rustc_args.append(arg)
