@@ -95,13 +95,15 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
             """,
         ),
         "extra_resources": attrs.list(
-            attrs.source(),
+            attrs.source(allow_directory = True),
             default = [],
             doc = """
                 Files outside the target's package that the test reads at run
                 time, as labels. Each is an input of the test action at its
-                own path: a source file (e.g. an `export_file` with
-                `mode = "reference"`) at its project path.
+                own path: a source file or directory (e.g. an `export_file`
+                with `mode = "reference"`) at its project path. A directory
+                brings its whole content, which a test that lists it or
+                asserts that it exists needs.
             """,
         ),
         "cargo_manifest_dir": attrs.option(
