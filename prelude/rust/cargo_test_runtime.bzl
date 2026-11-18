@@ -126,6 +126,21 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
                 asserts that it exists needs.
             """,
         ),
+        "source_resource_sets": attrs.list(
+            attrs.dep(),
+            default = [],
+            doc = """
+                Sets of source files outside the target's package that the test
+                reads at run time, each a target whose default outputs are all
+                source artifacts (for example `export_file` with
+                `mode = "reference"`, or a rule returning its `attrs.source`
+                inputs unchanged). Every file is an input of the test action at
+                its own project path, as `extra_resources` are; a set lets one
+                label bring many files, such as a Cargo workspace's read set. A
+                set with any built output fails analysis, since a built output
+                lies under buck-out, not at a project path.
+            """,
+        ),
         "cargo_manifest_dir": attrs.option(
             attrs.string(),
             default = None,
@@ -185,9 +200,19 @@ def _runner_applies(ctx: AnalysisContext) -> bool:
     toolchain = getattr(ctx.attrs, "_rust_toolchain", None)
     return toolchain != None and toolchain[RustToolchainInfo].test_process_runner != None
 
+def _source_resource_files(ctx: AnalysisContext) -> list[Artifact]:
+    """Every file of `source_resource_sets`, refusing a set with a built output."""
+    files = []
+    for dep in ctx.attrs.source_resource_sets:
+        for output in dep[DefaultInfo].default_outputs:
+            if not output.is_source:
+                fail("{}: source_resource_sets {} has the built output {}; only source artifacts lie at their project paths".format(ctx.label, dep.label, output))
+            files.append(output)
+    return files
+
 def _source_inputs(ctx: AnalysisContext) -> cmd_args:
     """The target's source files and extra resources as hidden inputs of its test command."""
-    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ctx.attrs.extra_resources)
+    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ctx.attrs.extra_resources + _source_resource_files(ctx))
 
 def _runtime_tools_dir(ctx: AnalysisContext, nix_manifest: Artifact | None) -> cmd_args:
     """The test's PATH: its runtime tools directory, bound to the toolchain's manifest."""
