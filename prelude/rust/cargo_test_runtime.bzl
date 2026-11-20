@@ -30,8 +30,9 @@ A test that runs remotely also gets a worker-local `TMPDIR`, `.` (a path), and a
 passwd home (`<pw_dir>/.l/XXXXXXXX`), named by `--account-home-dir-env HOME` and
 removed when the run ends. That `HOME` is outside the action, on purpose: a
 project-relative one is the action's work directory, too long for a Unix socket a
-fixture binds beneath `HOME` to fit `sun_path`. The runner's own listing does not
-receive it.
+fixture binds beneath `HOME` to fit `sun_path`. A runner invocation with `--list`
+makes no such `HOME`; the listing the runner makes to select a run's tests receives
+it, as the tests do.
 
 Each path entry is project-relative in the test's environment and is named once
 by a leading `--project-relative-env NAME` runner option. The per-test process
