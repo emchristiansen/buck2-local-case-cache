@@ -84,7 +84,14 @@ CARGO_TARGET_TMPDIR = "CARGO_TARGET_TMPDIR"
 CARGO_TARGET_TMPDIR_PATH = "buck-out/cargo-target-tmp"
 PROJECT_RELATIVE_DIR = "--project-relative-dir"
 _FIXED_VALUES = {"INSTA_UPDATE": "no"}
-_REMOTE_PATHS = ["HOME", "TMPDIR"]
+_REMOTE_PATHS = ["TMPDIR"]
+
+# A remote test's HOME: one private directory per run beneath the account's passwd home
+# (`<pw_dir>/.l/XXXXXXXX`), which the runner makes and removes. A project-relative HOME
+# would be the action's work directory, too long for a Unix socket a fixture binds beneath
+# HOME to fit sun_path's 107 bytes.
+_REMOTE_ACCOUNT_HOME = ["HOME"]
+ACCOUNT_HOME_DIR_ENV = "--account-home-dir-env"
 _BIN_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 
 def cargo_test_runtime_attrs() -> dict[str, Attr]:
@@ -231,6 +238,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     if remote and not runner_applies:
         fail("{}: a remote rust_test needs the libtest process runner".format(ctx.label))
     remote_paths = _REMOTE_PATHS if remote else []
+    account_homes = _REMOTE_ACCOUNT_HOME if remote else []
     label = ctx.label
     for key in ctx.attrs.env:
         if key.startswith(CARGO_BIN_EXE_PREFIX):
@@ -243,11 +251,11 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
         _check_bin_name(label, name)
         bins[CARGO_BIN_EXE_PREFIX + name] = _bin_output(label, name, dep)
     tool_paths = ["PATH"] if ctx.attrs.runtime_tools != None else []
-    owned = _FIXED_PATHS + list(_FIXED_VALUES.keys()) + bins.keys() + remote_paths + tool_paths
+    owned = _FIXED_PATHS + list(_FIXED_VALUES.keys()) + bins.keys() + remote_paths + account_homes + tool_paths
     for key in tool_paths:
         if key in ctx.attrs.env:
             fail("{}: env must not set PATH with runtime_tools; the prelude writes it".format(label))
-    for key in remote_paths:
+    for key in remote_paths + account_homes:
         if key in ctx.attrs.env:
             fail("{}: env must not set {} on a remote test; the prelude writes it".format(label, key))
     for key in ctx.attrs.run_env:
@@ -286,4 +294,6 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths + tool_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
     runner_args.extend([PROJECT_RELATIVE_DIR, CARGO_TARGET_TMPDIR_PATH])
+    for name in account_homes:
+        runner_args.extend([ACCOUNT_HOME_DIR_ENV, name])
     return env, runner_args
