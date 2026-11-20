@@ -93,7 +93,9 @@ _REMOTE_PATHS = ["TMPDIR"]
 # A remote test's HOME: one private directory per run beneath the account's passwd home
 # (`<pw_dir>/.l/XXXXXXXX`), which the runner makes and removes. A project-relative HOME
 # would be the action's work directory, too long for a Unix socket a fixture binds beneath
-# HOME to fit sun_path's 107 bytes.
+# HOME to fit sun_path's 107 bytes. The test runtime contract (linux-unprivileged-v2)
+# does not yet promise that such a directory can be made there or that the passwd home is
+# short; until a version that does, the runner's named refusal is the enforcement.
 _REMOTE_ACCOUNT_HOME = ["HOME"]
 ACCOUNT_HOME_DIR_ENV = "--account-home-dir-env"
 _BIN_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
