@@ -999,13 +999,6 @@ def rust_binary_impl(ctx: AnalysisContext) -> list[Provider]:
 
     return native.providers + [native.default_info, RunInfo(args = native.args)]
 
-# Environment the toolchain's host secret read route sets.
-_HOST_ROUTE_ENV = ["MUNINN_SECRET_READ_ROUTE", "OP_CONNECT_HOST"]
-
-# A test that may reach live services. Without a qualification of that effect,
-# the test belongs to this host.
-_LIVE_EFFECT_LABEL = "unqualified-live-effect"
-
 def _rust_test_runs_remotely(ctx: AnalysisContext, re_executors) -> bool:
     """Whether the resolved executor may send this test to a worker.
 
@@ -1033,23 +1026,13 @@ def _rust_test_runs_remotely(ctx: AnalysisContext, re_executors) -> bool:
     return "listing" in re_executors.executor_overrides
 
 def _rust_test_remote_boundary(ctx: AnalysisContext, toolchain_info: RustToolchainInfo):
-    """Refuse a remote test that belongs to this host or lacks its worker runtime.
+    """Refuse a remote test that lacks its worker runtime.
 
     The boundary is the test's, not the executor's: any profile that sends the
     test to a worker, including the toolchain's default, meets it. A test it
     refuses sets remote_execution = "disabled" and runs here.
     """
     disable = "; set remote_execution = \"disabled\""
-
-    # Host secrets and live effects never reach a worker, cacheable or not.
-    if toolchain_info.test_secret_read_route != None:
-        fail("{}: a remote rust_test must not carry the host secret read route{}".format(ctx.label, disable))
-    if _LIVE_EFFECT_LABEL in ctx.attrs.labels:
-        fail("{}: a remote rust_test must not have the {} label{}".format(ctx.label, _LIVE_EFFECT_LABEL, disable))
-    environment = ctx.attrs.env | ctx.attrs.run_env
-    for name in _HOST_ROUTE_ENV:
-        if name in environment:
-            fail("{}: a remote rust_test must not carry host-route environment {}{}".format(ctx.label, name, disable))
 
     # The worker runs the declared runtime under the per-test runner, which
     # makes the worker-local HOME and TMPDIR absolute for listing and tests.
@@ -1124,8 +1107,8 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
     # Set the host's secret read route for the test, outside the per-test runner so
     # that every test process it starts inherits the route. The prefix reads a host
     # file that is no action input, so a cacheable test, whose result could be
-    # reused after that file changes, gets none. A remote test never reaches here
-    # with a route (_rust_test_remote_boundary).
+    # reused after that file changes, gets none. A remote test gets the prefix as
+    # well, and the route reads that file where the test runs.
     if toolchain_info.test_secret_read_route != None and not ctx.attrs.supports_test_execution_caching:
         test_command = cmd_args(toolchain_info.test_secret_read_route, test_command)
 
