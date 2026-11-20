@@ -125,7 +125,18 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
                 exactly that directory; the directory and the manifest are
                 inputs of the test action. Without it, the prelude sets no PATH.
                 It requires the libtest process runner; a test without the
-                runner that names it fails analysis.
+                runner that names it fails analysis. A runner test that names
+                none, and sets no PATH itself, gets `_default_runtime_tools`.
+            """,
+        ),
+        "_default_runtime_tools": attrs.dep(
+            providers = [RuntimeToolsInfo],
+            default = "toolchains//:default_test_path",
+            doc = """
+                The tools directory a runner test gets on PATH when it names no
+                `runtime_tools` and sets no PATH in `env` or `run_env`: the
+                repository's common devshell programs, so a test that runs `git`
+                or `jj` by name finds the pinned one locally and on a worker.
             """,
         ),
         "extra_resources": attrs.list(
@@ -228,11 +239,11 @@ def _source_inputs(ctx: AnalysisContext) -> cmd_args:
     """The target's source files and extra resources as hidden inputs of its test command."""
     return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ctx.attrs.extra_resources + _source_resource_files(ctx))
 
-def _runtime_tools_dir(ctx: AnalysisContext, nix_manifest: Artifact | None) -> cmd_args:
+def _runtime_tools_dir(ctx: AnalysisContext, tools: Dependency, nix_manifest: Artifact | None) -> cmd_args:
     """The test's PATH: its runtime tools directory, bound to the toolchain's manifest."""
-    info = ctx.attrs.runtime_tools[RuntimeToolsInfo]
+    info = tools[RuntimeToolsInfo]
     if nix_manifest == None or info.nix_manifest != nix_manifest:
-        fail("{}: runtime_tools {} is not bound to the rust toolchain's declared runtime manifest".format(ctx.label, ctx.attrs.runtime_tools.label))
+        fail("{}: runtime_tools {} is not bound to the rust toolchain's declared runtime manifest".format(ctx.label, tools.label))
     return cmd_args(info.directory, hidden = [info.nix_manifest])
 
 def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool, nix_manifest: Artifact | None = None) -> (dict[str, typing.Any], list[typing.Any]):
@@ -257,7 +268,11 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     for name, dep in ctx.attrs.cargo_bin_exes.items():
         _check_bin_name(label, name)
         bins[CARGO_BIN_EXE_PREFIX + name] = _bin_output(label, name, dep)
-    tool_paths = ["PATH"] if ctx.attrs.runtime_tools != None else []
+    tools = ctx.attrs.runtime_tools
+    if (tools == None and runner_applies and nix_manifest != None and
+        "PATH" not in ctx.attrs.env and "PATH" not in ctx.attrs.run_env):
+        tools = ctx.attrs._default_runtime_tools
+    tool_paths = ["PATH"] if tools != None else []
     owned = _FIXED_PATHS + list(_FIXED_VALUES.keys()) + bins.keys() + remote_paths + account_homes + tool_paths
     for key in tool_paths:
         if key in ctx.attrs.env:
@@ -296,7 +311,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
         "METACORTEX_WORKSPACE_ROOT": ".",
     } | _FIXED_VALUES | bins | {name: "." for name in remote_paths}
     if tool_paths:
-        env["PATH"] = _runtime_tools_dir(ctx, nix_manifest)
+        env["PATH"] = _runtime_tools_dir(ctx, tools, nix_manifest)
     runner_args = [_source_inputs(ctx)]
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths + tool_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
