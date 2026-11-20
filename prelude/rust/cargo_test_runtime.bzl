@@ -129,6 +129,16 @@ def cargo_test_runtime_attrs() -> dict[str, Attr]:
                 none, and sets no PATH itself, gets `_default_runtime_tools`.
             """,
         ),
+        "_workspace_manifest": attrs.source(
+            default = "root//:workspace_manifest",
+            doc = """
+                The repository's root manifest, an input of every runner test at
+                its project path, so a test that finds the workspace root by its
+                `Cargo.toml` (as METACORTEX_WORKSPACE_ROOT = "." expects) finds it
+                on a worker too. The target must give the source file itself
+                (`export_file` with `mode = "reference"`).
+            """,
+        ),
         "_default_runtime_tools": attrs.dep(
             providers = [RuntimeToolsInfo],
             default = "toolchains//:default_test_path",
@@ -312,7 +322,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     } | _FIXED_VALUES | bins | {name: "." for name in remote_paths}
     if tool_paths:
         env["PATH"] = _runtime_tools_dir(ctx, tools, nix_manifest)
-    runner_args = [_source_inputs(ctx)]
+    runner_args = [_source_inputs(ctx), cmd_args(hidden = [ctx.attrs._workspace_manifest])]
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths + tool_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
     runner_args.extend([PROJECT_RELATIVE_DIR, CARGO_TARGET_TMPDIR_PATH])
