@@ -25,9 +25,13 @@ From these, this module writes the test's runtime entries:
 | `INSTA_UPDATE`              | `no`                     | value |
 | `CARGO_BIN_EXE_<name>`      | the binary's output      | path  |
 
-A test that runs remotely also gets worker-local `HOME` and `TMPDIR`, both `.`
-(paths), so neither external listing nor the runner's own listing nor any test
-reads or writes a home or temporary directory outside its action.
+A test that runs remotely also gets a worker-local `TMPDIR`, `.` (a path), and a
+`HOME` the runner makes: one private directory per run beneath the account's
+passwd home (`<pw_dir>/.l/XXXXXXXX`), named by `--account-home-dir-env HOME` and
+removed when the run ends. That `HOME` is outside the action, on purpose: a
+project-relative one is the action's work directory, too long for a Unix socket a
+fixture binds beneath `HOME` to fit `sun_path`. The runner's own listing does not
+receive it.
 
 Each path entry is project-relative in the test's environment and is named once
 by a leading `--project-relative-env NAME` runner option. The per-test process

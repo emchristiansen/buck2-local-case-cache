@@ -1035,7 +1035,8 @@ def _rust_test_remote_boundary(ctx: AnalysisContext, toolchain_info: RustToolcha
     disable = "; set remote_execution = \"disabled\""
 
     # The worker runs the declared runtime under the per-test runner, which
-    # makes the worker-local HOME and TMPDIR absolute for listing and tests.
+    # makes the worker-local TMPDIR absolute for listing and tests and gives
+    # the tests a private HOME beneath the account's passwd home.
     if not ctx.attrs.framework or toolchain_info.test_process_runner == None:
         fail("{}: a remote rust_test needs the libtest process runner (framework = True){}".format(ctx.label, disable))
     if toolchain_info.trial_nix_manifest == None:
