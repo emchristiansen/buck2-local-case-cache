@@ -1102,7 +1102,7 @@ def rust_test_impl(ctx: AnalysisContext) -> list[Provider]:
 
     # The prelude alone writes the Cargo-style runtime path entries; the runner
     # makes each absolute before any test or listing sees it.
-    runtime_env, runtime_runner_args = cargo_test_runtime(ctx, runner_applies, remote, toolchain_info.trial_nix_manifest)
+    runtime_env, runtime_runner_args = cargo_test_runtime(ctx, runner_applies, remote, toolchain_info.trial_nix_manifest, compile_ctx.symlinked_srcs)
     test_command = cmd_args(test_command, runtime_runner_args)
 
     # Set the host's secret read route for the test, outside the per-test runner so

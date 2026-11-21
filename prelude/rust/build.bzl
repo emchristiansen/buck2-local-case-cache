@@ -2386,6 +2386,10 @@ _DIRECTORY_ENV = [
     "OUT_DIR",
 ]
 
+# The running process's working directory as an absolute path prefix; every
+# action and test runs from the project root.
+_CWD_ROOT = "/proc/self/cwd/"
+
 # Separate env settings into "plain" and "with path". Path env vars are often
 # used in Rust `include!()` and similar directives, which always interpret the
 # path relative to the source file containing the directive. Since paths in env
@@ -2459,12 +2463,22 @@ def process_env(
     # and proc macros using std::fs to read thing like .pest grammars, which
     # would need paths relative to the directory that rustc got invoked in
     # (which is the repo root in Buck builds).
+    #
+    # CARGO_MANIFEST_DIR is made absolute through `/proc/self/cwd`, not the
+    # action's work directory: a value baked in by `env!` then names the same
+    # sources in every action that runs from the project root and has them at
+    # the same project-relative path. A test action has them
+    # (cargo_test_runtime.bzl), so a test that reads its package's files under
+    # the compile-time value finds them on a worker, whose compile work
+    # directory is gone when the test runs. The value is also the same on every
+    # worker, so the compiled output no longer depends on the work directory.
     for key in _DIRECTORY_ENV:
         value = plain_env.pop(key, None)
         if value != None:
             # Relative to the package, which lies at its project path in the sources.
             package = compile_ctx.symlinked_srcs.owner.package
             path_env[key] = cmd_args(
+                _CWD_ROOT if key == "CARGO_MANIFEST_DIR" else "",
                 compile_ctx.symlinked_srcs,
                 compile_ctx.path_sep,
                 cmd_args(package, compile_ctx.path_sep, delimiter = "") if package else "",
