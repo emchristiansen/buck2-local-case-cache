@@ -56,6 +56,16 @@ a path a test builds from `file!()`, such as insta's
 the declared resources it names. No directory is fabricated: one exists in the
 action only because a declared input lies under it.
 
+The sources directory the test binary was compiled from (`__srcs`, at its
+`buck-out` path) is an input of the test action too. The compile-time
+`CARGO_MANIFEST_DIR` is `/proc/self/cwd/<that directory>/<package>`
+(build.bzl), so a test that reads `env!("CARGO_MANIFEST_DIR")`-relative files,
+its `testdata/` or `tests/fixtures/`, finds them where it runs. Its content is
+the target's own `srcs` and `mapped_srcs`, so it adds no input that a change
+elsewhere in the repository would alter. The path resolves through the reading
+process's working directory: a child started in another directory must be given
+a path made absolute first (for example with `canonicalize`).
+
 At compile time, a test under the runner also gets `CARGO_TARGET_TMPDIR`, the
 project-relative `buck-out/cargo-target-tmp`, which the runner creates (one
 `--project-relative-dir`) before any test runs. Cargo sets it only for
@@ -245,9 +255,9 @@ def _source_resource_files(ctx: AnalysisContext) -> list[Artifact]:
             files.append(output)
     return files
 
-def _source_inputs(ctx: AnalysisContext) -> cmd_args:
-    """The target's source files and extra resources as hidden inputs of its test command."""
-    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ctx.attrs.extra_resources + _source_resource_files(ctx))
+def _source_inputs(ctx: AnalysisContext, compile_srcs: Artifact | None) -> cmd_args:
+    """The target's source files, compile sources and extra resources as hidden inputs of its test command."""
+    return cmd_args(hidden = [src for src in ctx.attrs.srcs if src.is_source] + ([compile_srcs] if compile_srcs != None else []) + ctx.attrs.extra_resources + _source_resource_files(ctx))
 
 def _runtime_tools_dir(ctx: AnalysisContext, tools: Dependency, nix_manifest: Artifact | None) -> cmd_args:
     """The test's PATH: its runtime tools directory, bound to the toolchain's manifest."""
@@ -256,12 +266,13 @@ def _runtime_tools_dir(ctx: AnalysisContext, tools: Dependency, nix_manifest: Ar
         fail("{}: runtime_tools {} is not bound to the rust toolchain's declared runtime manifest".format(ctx.label, tools.label))
     return cmd_args(info.directory, hidden = [info.nix_manifest])
 
-def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool, nix_manifest: Artifact | None = None) -> (dict[str, typing.Any], list[typing.Any]):
+def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool, nix_manifest: Artifact | None = None, compile_srcs: Artifact | None = None) -> (dict[str, typing.Any], list[typing.Any]):
     """The test's runtime entries and the runner options naming its path entries.
 
     `remote` says the test may run on a worker; the caller has already
-    required the runner for such a test. Fails when another writer already
-    declares one of the entries.
+    required the runner for such a test. `compile_srcs` is the sources
+    directory the test binary was compiled from; it becomes an input of the
+    test action. Fails when another writer already declares one of the entries.
     """
     if remote and not runner_applies:
         fail("{}: a remote rust_test needs the libtest process runner".format(ctx.label))
@@ -310,7 +321,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
         # declared tools would silently give way to the host's.
         if ctx.attrs.runtime_tools != None:
             fail("{}: runtime_tools needs the libtest process runner (framework = True and a toolchain test_process_runner); without it PATH would not be the declared tools".format(label))
-        return {}, [_source_inputs(ctx)]
+        return {}, [_source_inputs(ctx, compile_srcs)]
 
     manifest_dir = ctx.attrs.cargo_manifest_dir
     if manifest_dir == None:
@@ -322,7 +333,7 @@ def cargo_test_runtime(ctx: AnalysisContext, runner_applies: bool, remote: bool,
     } | _FIXED_VALUES | bins | {name: "." for name in remote_paths}
     if tool_paths:
         env["PATH"] = _runtime_tools_dir(ctx, tools, nix_manifest)
-    runner_args = [_source_inputs(ctx), cmd_args(hidden = [ctx.attrs._workspace_manifest])]
+    runner_args = [_source_inputs(ctx, compile_srcs), cmd_args(hidden = [ctx.attrs._workspace_manifest])]
     for name in sorted(_FIXED_PATHS + bins.keys() + remote_paths + tool_paths):
         runner_args.extend([PROJECT_RELATIVE_ENV, name])
     runner_args.extend([PROJECT_RELATIVE_DIR, CARGO_TARGET_TMPDIR_PATH])
