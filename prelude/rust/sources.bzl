@@ -114,29 +114,44 @@ def repository_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
                 fail("{}: source path {} lies under {}, which is a source file".format(ctx.label, repr(path), repr(parent)))
     return srcs
 
-def _test_resource_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
-    """A test's run-time resources from outside its package, at their project paths.
+# Project path -> source file, for a set of run-time resources whose files lie in
+# several packages. A source artifact's `short_path` is relative to its own
+# package, so a set that gathers files from many packages says where each lies.
+SourceResourcesInfo = provider(fields = {
+    "files": provider_field(dict[str, Artifact]),
+})
 
-    `extra_resources` and the files of `source_resource_sets` (rust tests,
-    `cargo_test_runtime.bzl`) are inputs of the test action at their project
-    paths. They are also placed in the test's sources directory at the same
-    paths, so a test that reads them through its compile-time
-    `CARGO_MANIFEST_DIR` (`<__srcs>/<package>/../../<path>`) finds them as one
-    that reads them at the project root does. Only source artifacts take part;
-    a path the target's own sources hold, or one beneath another resource, is
-    left to that entry. The crate root is still inferred from `srcs` and
+def _test_resource_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
+    """A test's `source_resource_sets` files from outside its package, at their project paths.
+
+    The prelude makes them inputs of the test action at their project paths
+    (`cargo_test_runtime.bzl`). They are also placed in the test's sources
+    directory at the same paths, so a test that reads them through its
+    compile-time `CARGO_MANIFEST_DIR` (`<__srcs>/<package>/../../<path>`) finds
+    them as one that reads them at the project root does. A set names its files'
+    project paths with `SourceResourcesInfo`; without it, a root-cell set's
+    outputs lie in the set's own package. Only source artifacts take part; a
+    path the target's own sources hold, or one beneath another resource, is left
+    to that entry. `extra_resources` are not placed: a source label carries no
+    package to place it by. The crate root is still inferred from `srcs` and
     `mapped_srcs` alone.
     """
-    resources = list(getattr(ctx.attrs, "extra_resources", []))
-    for dep in getattr(ctx.attrs, "source_resource_sets", []):
-        resources.extend(dep[DefaultInfo].default_outputs)
-    if not resources:
+    sets = getattr(ctx.attrs, "source_resource_sets", [])
+    if not sets:
         return {}
     own = repository_sources(ctx)
     found = {}
-    for artifact in resources:
-        if artifact.is_source and artifact.short_path not in own:
-            found[artifact.short_path] = artifact
+    for dep in sets:
+        if SourceResourcesInfo in dep:
+            files = dep[SourceResourcesInfo].files
+        elif dep.label.cell == "root":
+            prefix = dep.label.package + "/" if dep.label.package else ""
+            files = {prefix + output.short_path: output for output in dep[DefaultInfo].default_outputs}
+        else:
+            files = {}
+        for path, artifact in files.items():
+            if artifact.is_source and path not in own:
+                found[path] = artifact
     placed = {}
     for path, artifact in found.items():
         components = path.split("/")

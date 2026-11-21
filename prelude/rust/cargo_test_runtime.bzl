@@ -61,10 +61,10 @@ The sources directory the test binary was compiled from (`__srcs`, at its
 `CARGO_MANIFEST_DIR` is `/proc/self/cwd/<that directory>/<package>`
 (build.bzl), so a test that reads `env!("CARGO_MANIFEST_DIR")`-relative files,
 its `testdata/` or `tests/fixtures/`, finds them where it runs. Its content is
-the target's own `srcs` and `mapped_srcs`, and its `extra_resources` and
-`source_resource_sets` files at their project paths (`sources.bzl`), so a
-declared resource outside the package is found both at the project root and
-through `<CARGO_MANIFEST_DIR>/../..`; nothing else a change elsewhere in the
+the target's own `srcs` and `mapped_srcs`, and its `source_resource_sets`
+files at their project paths (`sources.bzl`), so a declared set's file outside
+the package is found both at the project root and through
+`<CARGO_MANIFEST_DIR>/../..`; nothing else a change elsewhere in the
 repository would alter is in it. The path resolves through the reading
 process's working directory: a child started in another directory must be given
 a path made absolute first (for example with `canonicalize`).
