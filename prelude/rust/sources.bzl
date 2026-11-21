@@ -114,6 +114,36 @@ def repository_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
                 fail("{}: source path {} lies under {}, which is a source file".format(ctx.label, repr(path), repr(parent)))
     return srcs
 
+def _test_resource_sources(ctx: AnalysisContext) -> dict[str, Artifact]:
+    """A test's run-time resources from outside its package, at their project paths.
+
+    `extra_resources` and the files of `source_resource_sets` (rust tests,
+    `cargo_test_runtime.bzl`) are inputs of the test action at their project
+    paths. They are also placed in the test's sources directory at the same
+    paths, so a test that reads them through its compile-time
+    `CARGO_MANIFEST_DIR` (`<__srcs>/<package>/../../<path>`) finds them as one
+    that reads them at the project root does. Only source artifacts take part;
+    a path the target's own sources hold, or one beneath another resource, is
+    left to that entry. The crate root is still inferred from `srcs` and
+    `mapped_srcs` alone.
+    """
+    resources = list(getattr(ctx.attrs, "extra_resources", []))
+    for dep in getattr(ctx.attrs, "source_resource_sets", []):
+        resources.extend(dep[DefaultInfo].default_outputs)
+    if not resources:
+        return {}
+    own = repository_sources(ctx)
+    found = {}
+    for artifact in resources:
+        if artifact.is_source and artifact.short_path not in own:
+            found[artifact.short_path] = artifact
+    placed = {}
+    for path, artifact in found.items():
+        components = path.split("/")
+        if not any(["/".join(components[:i]) in found or "/".join(components[:i]) in own for i in range(1, len(components))]):
+            placed[path] = artifact
+    return placed
+
 def symlinked_srcs(ctx: AnalysisContext) -> Artifact:
     srcs_filegroup = getattr(ctx.attrs, "srcs_filegroup", None)
     if srcs_filegroup:
@@ -128,7 +158,7 @@ def symlinked_srcs(ctx: AnalysisContext) -> Artifact:
     if not ctx.attrs.srcs and not ctx.attrs.mapped_srcs:
         fail("crate has no srcs, mapped_srcs, or srcs_filegroup")
 
-    srcs = repository_sources(ctx)
+    srcs = repository_sources(ctx) | _test_resource_sources(ctx)
 
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
 
