@@ -340,6 +340,14 @@ def _rust_binary_common(
 
     simple_crate = attr_simple_crate_for_filenames(ctx)
 
+    # Cargo names a binary's file after its bin target, `focused-agent`, not after
+    # the crate rustc compiles it as, `focused_agent`; a program that prints its
+    # argv[0] (clap's usage line) shows the file's name. A rule named so that it
+    # differs from its crate only by `-` for `_` is that bin target, and its
+    # executable takes that name.
+    if ctx.label.name != simple_crate and ctx.label.name.replace("-", "_") == simple_crate:
+        simple_crate = ctx.label.name
+
     link_strategy = LinkStrategy(ctx.attrs.link_style) if ctx.attrs.link_style else DEFAULT_STATIC_LINK_STRATEGY
     link_strategy = process_link_strategy_for_pic_behavior(link_strategy, compile_ctx.cxx_toolchain_info.pic_behavior)
 
