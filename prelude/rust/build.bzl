@@ -170,6 +170,7 @@ def generate_rustdoc(
     params: BuildParams,
     default_roots: list[str],
     document_private_items: bool,
+    json: bool = False,
 ) -> Artifact:
     toolchain_info = compile_ctx.toolchain_info
 
@@ -188,7 +189,7 @@ def generate_rustdoc(
         profile_mode = None,
     )
 
-    subdir = common_args.subdir + "-rustdoc"
+    subdir = common_args.subdir + ("-rustdoc-json" if json else "-rustdoc")
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
     output = ctx.actions.declare_output(subdir, has_content_based_path = use_cbp)
 
@@ -198,6 +199,10 @@ def generate_rustdoc(
     # The toolchain's `rustdoc_flags` may rely on unstable functionality, e.g.
     # `--generate-link-to-definition`.
     if toolchain_info.nightly_features and "RUSTC_BOOTSTRAP" not in plain_env:
+        plain_env["RUSTC_BOOTSTRAP"] = cmd_args("1")
+
+    # JSON output is unstable: `-Zunstable-options --output-format=json`.
+    if json:
         plain_env["RUSTC_BOOTSTRAP"] = cmd_args("1")
 
     if toolchain_info.rust_target_path != None:
@@ -214,6 +219,8 @@ def generate_rustdoc(
 
     if document_private_items:
         rustdoc_args.add("--document-private-items")
+    if json:
+        rustdoc_args.add("-Zunstable-options", "--output-format=json", "--document-hidden-items")
 
     rustdoc_common = cmd_args(
         [cmd_args("--env=", k, "=", v, delimiter = "") for k, v in plain_env.items()],
@@ -257,7 +264,7 @@ def generate_rustdoc(
             arch_commands = arch_commands,
         )
 
-    ctx.actions.run(rustdoc_cmd, category = "rustdoc")
+    ctx.actions.run(rustdoc_cmd, category = "rustdoc_json" if json else "rustdoc")
 
     return output
 
