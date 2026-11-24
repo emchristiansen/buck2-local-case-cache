@@ -361,6 +361,7 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
         default_roots = _DEFAULT_ROOTS,
         document_private_items = True,
         json = True,
+        features_override = ctx.attrs.rustdoc_json_features,
     ).project(attr_crate(ctx).simple + ".json")
 
     if toolchain_info.nightly_features and compile_ctx.arch_toolchain_info == None:
@@ -1378,6 +1379,12 @@ rust_library = prelude_rule(
                 Use the link output as full metadata. Nondeterministic proc-macro
                 expansion can otherwise produce different SVHs across pipelined
                 metadata-full and link invocations, causing E0460 in dependents.
+            """),
+            "rustdoc_json_features": attrs.option(attrs.list(attrs.string()), default = None, doc = """
+                The features the `[rustdoc-json]` sub-target documents the crate
+                with, instead of `features`: for example the package's own
+                feature set when `features` is unified across a workspace.
+                Dependencies are unchanged. Unset, it uses `features`.
             """),
             "supports_python_dlopen": attrs.option(attrs.bool(), default = None),
         }
