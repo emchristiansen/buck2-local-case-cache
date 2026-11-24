@@ -352,6 +352,17 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
         document_private_items = False,
     )
 
+    # Rustdoc JSON of every item, private and `#[doc(hidden)]` ones included:
+    # the one `<crate>.json` file the out-dir holds.
+    rustdoc_json = generate_rustdoc(
+        ctx = ctx,
+        compile_ctx = compile_ctx,
+        params = static_library_params,
+        default_roots = _DEFAULT_ROOTS,
+        document_private_items = True,
+        json = True,
+    ).project(attr_crate(ctx).simple + ".json")
+
     if toolchain_info.nightly_features and compile_ctx.arch_toolchain_info == None:
         rustdoc_coverage = generate_rustdoc_coverage(
             ctx = ctx,
@@ -505,6 +516,7 @@ def rust_library_impl(ctx: AnalysisContext) -> list[Provider]:
         linked_object = linked_object,
         remarks_artifact = remarks_artifact,
         rustdoc = rustdoc,
+        rustdoc_json = rustdoc_json,
         rustdoc_test = rustdoc_test,
         doctests_enabled = doctests_enabled,
         doc_supports_test_execution_caching = ctx.attrs.doc_supports_test_execution_caching,
@@ -793,6 +805,7 @@ def _default_providers(
     linked_object: LinkedObject | None,
     remarks_artifact: RustcOutput,
     rustdoc: Artifact,
+    rustdoc_json: Artifact,
     rustdoc_test: cmd_args | None,
     doctests_enabled: bool,
     doc_supports_test_execution_caching: bool,
@@ -811,6 +824,7 @@ def _default_providers(
     if expand != None:
         targets["expand"] = expand
     targets["doc"] = rustdoc
+    targets["rustdoc-json"] = rustdoc_json
     if rustdoc_coverage != None:
         targets["doc-coverage"] = rustdoc_coverage
     targets["remarks.txt"] = remarks_artifact.compile_output.remarks_txt
