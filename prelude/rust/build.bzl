@@ -171,6 +171,9 @@ def generate_rustdoc(
     default_roots: list[str],
     document_private_items: bool,
     json: bool = False,
+    # The `--cfg feature=` set to document with instead of the target's own;
+    # dependencies are unchanged.
+    features_override: list[str] | None = None,
 ) -> Artifact:
     toolchain_info = compile_ctx.toolchain_info
 
@@ -187,6 +190,7 @@ def generate_rustdoc(
         incremental_enabled = False,
         is_rustdoc_test = False,
         profile_mode = None,
+        features_override = features_override,
     )
 
     subdir = common_args.subdir + ("-rustdoc-json" if json else "-rustdoc")
@@ -1531,10 +1535,15 @@ def _compute_common_args(
     profile_mode: ProfileMode | None,
     # The args feed `miri_command`, run at test time through `rustc_action.py`.
     is_miri_run: bool = False,
+    # Replaces `ctx.attrs.features` in the `--cfg feature=` flags; only rustdoc
+    # JSON passes it.
+    features_override: list[str] | None = None,
 ) -> CommonArgsInfo:
     crate_type = params.crate_type
 
     args_key = (crate_type, emit, params.dep_link_strategy, is_rustdoc_test, is_miri_run, infallible_diagnostics, incremental_enabled, profile_mode)
+    if features_override != None:
+        args_key = args_key + (tuple(features_override),)
     if args_key in compile_ctx.common_args:
         return compile_ctx.common_args[args_key]
 
@@ -1759,7 +1768,7 @@ def _compute_common_args(
         _rustc_flags(toolchain_info.rustc_coverage_flags, toolchain_info) if ctx.attrs.coverage else [],
         _rustc_flags(ctx.attrs.rustc_flags, toolchain_info),
         _rustc_flags(toolchain_info.extra_rustc_flags, toolchain_info),
-        cmd_args(ctx.attrs.features, format = '--cfg=feature="{}"'),
+        cmd_args(ctx.attrs.features if features_override == None else features_override, format = '--cfg=feature="{}"'),
         dep_args,
     )
 
